@@ -1,7 +1,7 @@
 # tropnn
-`tropnn` is a minimal teaching-oriented tropical neural layer library.
+`tropnn` is a minimal teaching-oriented routed neural layer library.
 
-It exposes one basic building block, `TropLinear`, for tropical min-face networks in the role that `nn.Linear` plays for dense networks.
+It exposes two sibling routed building blocks, `TropLinear` and `PairwiseLinear`, plus a small dense baseline path in the EMNIST example for matched-budget comparisons.
 
 The scope is narrow: hard chamber selection at inference, a local min-face surrogate during training, a readable reference path, and an optional Triton score kernel for the hottest routing step. Examples and benchmarking stay outside the core layer.
 
@@ -44,11 +44,13 @@ Inference remains fully hard. Only the training path uses the local surrogate.
 - `backends/triton_scores.py`: optional Triton score kernel
 - `layers/base.py`: shared shell for routed linear layers
 - `layers/tropical.py`: `TropLinear` concrete implementation
+- `layers/pairwise.py`: `PairwiseLinear` concrete implementation
+- `layers/surrogate.py`: tiny shared STE helper for discrete families
 - `module.py`: compatibility re-export for `TropLinear`
 - `examples/emnist.py`: self-contained EMNIST training example
 - `tools/benchmark.py`: benchmarking helper and CLI
 
-The reference implementation lives in `layers/base.py` and `layers/tropical.py`. `backend.py` is the only place that chooses between reference and accelerated paths. Triton is optional and should be treated as an optimization layer, not the source of truth.
+The reference implementation lives in `layers/base.py`, `layers/tropical.py`, and `layers/pairwise.py`. `layers/surrogate.py` only holds the tiny shared STE helper for discrete routing. `backend.py` is the only place that chooses between reference and accelerated paths. Triton is optional and only affects the tropical score path.
 
 ## Quick Start
 
@@ -68,7 +70,7 @@ Basic usage:
 
 ```python
 import torch
-from tropnn import TropLinear
+from tropnn import PairwiseLinear, TropLinear
 
 layer = TropLinear(
     256,
@@ -82,19 +84,23 @@ layer = TropLinear(
 x = torch.randn(8, 256)
 y = layer(x)
 print(y.shape)
+
+pairwise = PairwiseLinear(256, 512, tables=16, comparisons=6)
+print(pairwise(x).shape)
 ```
 
 Because `TropLinear` behaves like a basic neural layer, collaborators can stack it directly into MLPs, residual blocks, or recurrent modules.
 
 ## EMNIST Example
 
-The package includes a small example that reproduces the `trop_minface` EMNIST experiment used in the parent `lutflow` repository.
+The package includes a small example that can train `tropical`, `pairwise`, or a dense `linear` baseline on the local EMNIST digits split.
 
 Run:
 
 ```bash
 uv run python -m tropnn.examples.emnist \
   --root /path/to/emnist \
+  --family tropical \
   --split digits \
   --epochs 3 \
   --batch-size 512 \
@@ -111,6 +117,8 @@ uv run python -m tropnn.examples.emnist \
   --seed 0
 ```
 
+Pairwise uses the same script with `--family pairwise --comparisons 6`. A dense baseline uses `--family linear --activation gelu`.
+
 On the same setup used in the original experiment path, this reproduces:
 
 - epoch 1: `test_loss=0.5054`, `test_acc=0.8468`
@@ -126,12 +134,12 @@ On the same setup used in the original experiment path, this reproduces:
 
 ## Reading Order
 
-For collaborators, the recommended reading order is `layers/base.py`, `layers/tropical.py`, `backend.py`, `examples/emnist.py`, `backends/triton_scores.py`, then `tools/benchmark.py`.
+For collaborators, the recommended reading order is `layers/base.py`, `layers/pairwise.py`, `layers/tropical.py`, `backend.py`, `examples/emnist.py`, `backends/triton_scores.py`, then `tools/benchmark.py`.
 
 ## Scope
 This package is deliberately minimal. It does not attempt to include:
 
-- pairwise or sparse comparators,
+- sparse comparators,
 - experiment naming or benchmark orchestration,
 - multiple surrogate families,
 - large training frameworks.

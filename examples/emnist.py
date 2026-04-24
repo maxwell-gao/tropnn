@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import math
 import struct
 import time
 from pathlib import Path
@@ -17,7 +18,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..layers import TropLinear
+from ..layers import PairwiseLinear, TropLinear
 
 IDX_DTYPES = {
     0x08: np.uint8,
@@ -81,10 +82,41 @@ def load_emnist_split(
     return x, y
 
 
-class EmnistTropClassifier(nn.Module):
+def _make_layer(
+    family: str,
+    d_in: int,
+    d_out: int,
+    *,
+    tables: int,
+    groups: int,
+    cells: int,
+    rank: int,
+    comparisons: int,
+    backend: str,
+    seed: int,
+    activation: str,
+    apply_activation: bool,
+) -> nn.Module:
+    if family == "tropical":
+        return TropLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
+    if family == "linear":
+        layer = nn.Linear(d_in, d_out)
+        nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+        if layer.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(layer.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(layer.bias, -bound, bound)
+        if not apply_activation:
+            return layer
+        return nn.Sequential(layer, nn.GELU()) if activation == "gelu" else nn.Sequential(layer, nn.ReLU())
+    return PairwiseLinear(d_in, d_out, tables=tables, comparisons=comparisons, backend="torch", seed=seed)
+
+
+class EmnistRoutedClassifier(nn.Module):
     def __init__(
         self,
         *,
+        family: str,
         input_dim: int,
         hidden_dim: int,
         num_classes: int,
@@ -93,10 +125,13 @@ class EmnistTropClassifier(nn.Module):
         groups: int,
         cells: int,
         rank: int,
+        comparisons: int,
         backend: str,
         seed: int,
+        activation: str = "gelu",
     ) -> None:
         super().__init__()
+        self.family = family
         dims = [input_dim]
         if depth == 1:
             dims.append(num_classes)
@@ -105,7 +140,20 @@ class EmnistTropClassifier(nn.Module):
             dims.append(num_classes)
         self.layers = nn.ModuleList(
             [
-                TropLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed + idx)
+                _make_layer(
+                    family,
+                    d_in,
+                    d_out,
+                    tables=tables,
+                    groups=groups,
+                    cells=cells,
+                    rank=rank,
+                    comparisons=comparisons,
+                    backend=backend,
+                    seed=seed + idx,
+                    activation=activation,
+                    apply_activation=idx < len(dims) - 2,
+                )
                 for idx, (d_in, d_out) in enumerate(zip(dims[:-1], dims[1:]))
             ]
         )
@@ -116,6 +164,21 @@ class EmnistTropClassifier(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x.squeeze(1)
+
+
+class EmnistTropClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="tropical", comparisons=4, **kwargs)
+
+
+class EmnistPairwiseClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="pairwise", groups=1, cells=2, rank=1, backend="torch", **kwargs)
+
+
+class EmnistLinearClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="linear", tables=1, groups=1, cells=2, rank=1, comparisons=1, backend="torch", **kwargs)
 
 
 def _run_epoch(
@@ -158,6 +221,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--split", choices=EMNIST_SPLITS, default="digits")
+    parser.add_argument("--family", choices=("tropical", "pairwise", "linear"), default="tropical")
     for name, arg_type, default in (
         ("--epochs", int, 10),
         ("--batch-size", int, 256),
@@ -168,8 +232,10 @@ def main() -> None:
         ("--groups", int, 2),
         ("--cells", int, 4),
         ("--rank", int, 32),
+        ("--comparisons", int, 6),
     ):
         parser.add_argument(name, type=arg_type, default=default)
+    parser.add_argument("--activation", choices=("gelu", "relu"), default="gelu")
     parser.add_argument("--backend", choices=("torch", "auto", "triton"), default="torch")
     parser.add_argument("--max-train", type=int, default=None)
     parser.add_argument("--max-test", type=int, default=None)
@@ -201,7 +267,8 @@ def main() -> None:
         permute_seed=args.permute_seed,
     )
     num_classes = int(max(y_train.max().item(), y_test.max().item()) + 1)
-    model = EmnistTropClassifier(
+    model = EmnistRoutedClassifier(
+        family=args.family,
         input_dim=x_train.shape[1],
         hidden_dim=args.hidden_dim,
         num_classes=num_classes,
@@ -210,8 +277,10 @@ def main() -> None:
         groups=args.groups,
         cells=args.cells,
         rank=args.rank,
+        comparisons=args.comparisons,
         backend=args.backend,
         seed=args.seed,
+        activation=args.activation,
     ).to(device)
     train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(TensorDataset(x_test, y_test), batch_size=args.batch_size, shuffle=False)
@@ -219,14 +288,16 @@ def main() -> None:
     config_lines = {
         "root": args.root,
         "split": args.split,
-        "layer": "trop_minface",
+        "family": args.family,
         "depth": args.depth,
         "hidden_dim": args.hidden_dim,
-        "tables": args.tables,
-        "groups": args.groups,
-        "cells": args.cells,
-        "rank": args.rank,
-        "backend": args.backend,
+        "tables": args.tables if args.family != "linear" else "-",
+        "groups": args.groups if args.family == "tropical" else "-",
+        "cells": args.cells if args.family == "tropical" else "-",
+        "rank": args.rank if args.family == "tropical" else "-",
+        "comparisons": args.comparisons if args.family == "pairwise" else "-",
+        "activation": args.activation if args.family == "linear" else "-",
+        "backend": args.backend if args.family == "tropical" else "torch",
         "train/test": f"{len(x_train)}/{len(x_test)}",
         "device": device.type,
         "params": sum(param.numel() for param in model.parameters()),
@@ -243,7 +314,7 @@ def main() -> None:
         print(f"epoch {epoch:>3d} | train_loss={train_loss:.4f} train_acc={train_acc:.4f} | test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
 
     repo_root = Path(__file__).resolve().parents[4]
-    out_path = repo_root / "results" / "experiments" / "tropnn_emnist" / f"{args.split}_trop_minface_{int(time.time())}.csv"
+    out_path = repo_root / "results" / "experiments" / "tropnn_emnist" / f"{args.split}_{args.family}_{int(time.time())}.csv"
     _write_metrics(rows, out_path)
     print(f"\nDone in {time.perf_counter() - t0:.1f}s; metrics -> {out_path}")
 

@@ -1,3 +1,3 @@
-from .layers import RoutedLinearBase, TropLinear
+from .layers import PairwiseLinear, RoutedLinearBase, TropLinear
 
-__all__ = ["RoutedLinearBase", "TropLinear"]
+__all__ = ["RoutedLinearBase", "PairwiseLinear", "TropLinear"]

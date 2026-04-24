@@ -85,7 +85,9 @@ def trop_scores_triton(z: Tensor, router_weight: Tensor, router_bias: Tensor) ->
     b_flat = router_bias.reshape(flat_cols).contiguous().to(torch.float32)
     out = torch.empty((batch * steps, flat_cols), device=z.device, dtype=torch.float32)
 
-    grid = lambda meta: (triton.cdiv(batch * steps, meta["BLOCK_M"]), triton.cdiv(flat_cols, meta["BLOCK_N"]))
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
+        return triton.cdiv(batch * steps, meta["BLOCK_M"]), triton.cdiv(flat_cols, meta["BLOCK_N"])
+
     _scores_kernel[grid](
         z_flat,
         w_flat,

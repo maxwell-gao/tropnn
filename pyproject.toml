@@ -21,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=2.2.6",
+    "tilelang>=0.1.9",
     "torch>=2.9.1",
 ]
 
