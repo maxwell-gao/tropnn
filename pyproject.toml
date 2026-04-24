@@ -37,6 +37,7 @@ dev = [
 [project.scripts]
 tropnn-emnist = "tropnn.examples.emnist:main"
 tropnn-benchmark = "tropnn.tools.benchmark:main"
+tropnn-profile = "tropnn.tools.profile:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

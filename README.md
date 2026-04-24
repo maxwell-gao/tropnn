@@ -49,6 +49,7 @@ Inference remains fully hard. Only the training path uses the local surrogate.
 - `module.py`: compatibility re-export for `TropLinear`
 - `examples/emnist.py`: self-contained EMNIST training example
 - `tools/benchmark.py`: benchmarking helper and CLI
+- `tools/profile.py`: forward profiler for tropical/pairwise/linear family comparisons
 
 The reference implementation lives in `layers/base.py`, `layers/tropical.py`, and `layers/pairwise.py`. `layers/surrogate.py` only holds the tiny shared STE helper for discrete routing. `backend.py` is the only place that chooses between reference and accelerated paths. Triton is optional and only affects the tropical score path.
 
@@ -131,6 +132,28 @@ On the same setup used in the original experiment path, this reproduces:
 - `backend="torch"`: correctness and teaching
 - `backend="auto"`: practical CUDA inference
 - `backend="triton"`: only when launcher compilation is known to work
+
+## Profiling
+
+Use the forward profiler to compare tropical, pairwise, and linear family runs by wall time, peak device memory, and top operator time and memory contributors.
+
+```bash
+uv run tropnn-profile \
+  --device cuda \
+  --batch-size 512 \
+  --tropical-hidden 128 \
+  --tropical-tables 32 \
+  --tropical-groups 2 \
+  --tropical-cells 4 \
+  --tropical-rank 32 \
+  --pairwise-hidden 128 \
+  --pairwise-tables 136 \
+  --pairwise-comparisons 6 \
+  --linear-hidden 1561 \
+  --output results/experiments/tropnn_profile/profile.json
+```
+
+The profiler uses `torch.profiler` and reports per-family top ops with CPU/CUDA time plus memory-usage columns. On CUDA this gives a practical proxy for which path is most memory-traffic heavy, even though it is not a hardware-level DRAM read/write counter.
 
 ## Reading Order
 
