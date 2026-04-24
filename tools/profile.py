@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from ..examples.emnist import TROPICAL_FAMILIES, EmnistRoutedClassifier
+from ..examples.emnist import EmnistRoutedClassifier
 
 
 def _sync_if_cuda(device: torch.device) -> None:
@@ -24,12 +24,11 @@ def _build_model(
     hidden_dim: int,
     out_features: int,
     depth: int,
-    tables: int,
-    groups: int,
+    heads: int,
     cells: int,
-    rank: int,
+    code_dim: int,
+    pairwise_tables: int,
     comparisons: int,
-    activation: str,
     backend: str,
     seed: int,
     device: torch.device,
@@ -40,16 +39,13 @@ def _build_model(
         hidden_dim=hidden_dim,
         num_classes=out_features,
         depth=depth,
-        tables=tables,
-        groups=groups,
+        heads=heads,
         cells=cells,
-        rank=rank,
-        heads=tables * groups,
-        code_dim=rank,
+        code_dim=code_dim,
+        pairwise_tables=pairwise_tables,
         comparisons=comparisons,
-        backend=backend,
+        backend=backend if family == "tropical" else "torch",
         seed=seed,
-        activation=activation,
     ).to(device)
 
 
@@ -83,12 +79,11 @@ def profile_family_forward(
     hidden_dim: int = 128,
     out_features: int = 10,
     depth: int = 2,
-    tables: int = 16,
-    groups: int = 2,
+    heads: int = 32,
     cells: int = 4,
-    rank: int = 32,
+    code_dim: int = 32,
+    pairwise_tables: int = 72,
     comparisons: int = 6,
-    activation: str = "gelu",
     backend: str = "torch",
     warmup: int = 5,
     seed: int = 0,
@@ -105,13 +100,12 @@ def profile_family_forward(
         hidden_dim=hidden_dim,
         out_features=out_features,
         depth=depth,
-        tables=tables,
-        groups=groups,
+        heads=heads,
         cells=cells,
-        rank=rank,
+        code_dim=code_dim,
+        pairwise_tables=pairwise_tables,
         comparisons=comparisons,
-        activation=activation,
-        backend=backend if family in TROPICAL_FAMILIES else "torch",
+        backend=backend,
         seed=seed,
         device=dev,
     )
@@ -135,7 +129,6 @@ def profile_family_forward(
         _sync_if_cuda(dev)
         wall_ms = (time.perf_counter() - t0) * 1000.0
 
-    events = list(prof.key_averages())
     return {
         "family": family,
         "device": dev.type,
@@ -145,19 +138,16 @@ def profile_family_forward(
         "hidden_dim": hidden_dim,
         "out_features": out_features,
         "depth": depth,
-        "tables": tables if family != "linear" else None,
-        "groups": groups if family in TROPICAL_FAMILIES else None,
-        "cells": cells if family in TROPICAL_FAMILIES else None,
-        "rank": rank if family in TROPICAL_FAMILIES else None,
-        "heads": tables * groups if family == "trop_code" else None,
-        "code_dim": rank if family == "trop_code" else None,
+        "heads": heads if family == "tropical" else None,
+        "cells": cells if family == "tropical" else None,
+        "code_dim": code_dim if family == "tropical" else None,
+        "pairwise_tables": pairwise_tables if family == "pairwise" else None,
         "comparisons": comparisons if family == "pairwise" else None,
-        "activation": activation if family == "linear" else None,
-        "backend": backend if family in TROPICAL_FAMILIES else "torch",
+        "backend": backend if family == "tropical" else "torch",
         "params": int(sum(param.numel() for param in model.parameters())),
         "wall_ms": wall_ms,
         "peak_device_memory_bytes": int(torch.cuda.max_memory_allocated(dev)) if use_cuda else 0,
-        "top_ops": _event_rows(events, use_cuda=use_cuda, limit=top_ops),
+        "top_ops": _event_rows(list(prof.key_averages()), use_cuda=use_cuda, limit=top_ops),
     }
 
 
@@ -168,16 +158,13 @@ def profile_family_set(
     out_features: int = 10,
     depth: int = 2,
     tropical_hidden: int = 128,
-    tropical_tables: int = 16,
-    tropical_groups: int = 2,
+    tropical_heads: int = 32,
     tropical_cells: int = 4,
-    tropical_rank: int = 32,
+    tropical_code_dim: int = 32,
     tropical_backend: str = "torch",
     pairwise_hidden: int = 128,
     pairwise_tables: int = 72,
     pairwise_comparisons: int = 6,
-    linear_hidden: int = 781,
-    linear_activation: str = "gelu",
     warmup: int = 5,
     seed: int = 0,
     dtype: str = "float32",
@@ -192,83 +179,9 @@ def profile_family_set(
             hidden_dim=tropical_hidden,
             out_features=out_features,
             depth=depth,
-            tables=tropical_tables,
-            groups=tropical_groups,
+            heads=tropical_heads,
             cells=tropical_cells,
-            rank=tropical_rank,
-            backend=tropical_backend,
-            warmup=warmup,
-            seed=seed,
-            dtype=dtype,
-            device=device,
-            top_ops=top_ops,
-        ),
-        "trop_lut": profile_family_forward(
-            "trop_lut",
-            batch_size=batch_size,
-            input_dim=input_dim,
-            hidden_dim=tropical_hidden,
-            out_features=out_features,
-            depth=depth,
-            tables=tropical_tables,
-            groups=tropical_groups,
-            cells=tropical_cells,
-            rank=tropical_rank,
-            backend=tropical_backend,
-            warmup=warmup,
-            seed=seed,
-            dtype=dtype,
-            device=device,
-            top_ops=top_ops,
-        ),
-        "trop_binary_additive": profile_family_forward(
-            "trop_binary_additive",
-            batch_size=batch_size,
-            input_dim=input_dim,
-            hidden_dim=tropical_hidden,
-            out_features=out_features,
-            depth=depth,
-            tables=tropical_tables,
-            groups=tropical_groups,
-            cells=tropical_cells,
-            rank=tropical_rank,
-            comparisons=pairwise_comparisons,
-            backend=tropical_backend,
-            warmup=warmup,
-            seed=seed,
-            dtype=dtype,
-            device=device,
-            top_ops=top_ops,
-        ),
-        "trop_code": profile_family_forward(
-            "trop_code",
-            batch_size=batch_size,
-            input_dim=input_dim,
-            hidden_dim=tropical_hidden,
-            out_features=out_features,
-            depth=depth,
-            tables=tropical_tables,
-            groups=tropical_groups,
-            cells=tropical_cells,
-            rank=tropical_rank,
-            backend=tropical_backend,
-            warmup=warmup,
-            seed=seed,
-            dtype=dtype,
-            device=device,
-            top_ops=top_ops,
-        ),
-        "trop_gated": profile_family_forward(
-            "trop_gated",
-            batch_size=batch_size,
-            input_dim=input_dim,
-            hidden_dim=tropical_hidden,
-            out_features=out_features,
-            depth=depth,
-            tables=tropical_tables,
-            groups=tropical_groups,
-            cells=tropical_cells,
-            rank=tropical_rank,
+            code_dim=tropical_code_dim,
             backend=tropical_backend,
             warmup=warmup,
             seed=seed,
@@ -283,22 +196,8 @@ def profile_family_set(
             hidden_dim=pairwise_hidden,
             out_features=out_features,
             depth=depth,
-            tables=pairwise_tables,
+            pairwise_tables=pairwise_tables,
             comparisons=pairwise_comparisons,
-            warmup=warmup,
-            seed=seed,
-            dtype=dtype,
-            device=device,
-            top_ops=top_ops,
-        ),
-        "linear": profile_family_forward(
-            "linear",
-            batch_size=batch_size,
-            input_dim=input_dim,
-            hidden_dim=linear_hidden,
-            out_features=out_features,
-            depth=depth,
-            activation=linear_activation,
             warmup=warmup,
             seed=seed,
             dtype=dtype,
@@ -319,7 +218,7 @@ def _print_summary(results: dict[str, Any]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Profile tropical, pairwise, and linear forward paths with torch.profiler.")
+    parser = argparse.ArgumentParser(description="Profile tropical and pairwise forward paths with torch.profiler.")
     for name, default in (
         ("--batch-size", 512),
         ("--input-dim", 28 * 28),
@@ -333,16 +232,13 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="float32")
     parser.add_argument("--tropical-hidden", type=int, default=128)
-    parser.add_argument("--tropical-tables", type=int, default=16)
-    parser.add_argument("--tropical-groups", type=int, default=2)
+    parser.add_argument("--tropical-heads", type=int, default=32)
     parser.add_argument("--tropical-cells", type=int, default=4)
-    parser.add_argument("--tropical-rank", type=int, default=32)
+    parser.add_argument("--tropical-code-dim", type=int, default=32)
     parser.add_argument("--tropical-backend", choices=("torch", "auto", "triton"), default="torch")
     parser.add_argument("--pairwise-hidden", type=int, default=128)
     parser.add_argument("--pairwise-tables", type=int, default=72)
     parser.add_argument("--pairwise-comparisons", type=int, default=6)
-    parser.add_argument("--linear-hidden", type=int, default=781)
-    parser.add_argument("--linear-activation", choices=("gelu", "relu"), default="gelu")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
@@ -352,16 +248,13 @@ def main() -> None:
         out_features=args.out_features,
         depth=args.depth,
         tropical_hidden=args.tropical_hidden,
-        tropical_tables=args.tropical_tables,
-        tropical_groups=args.tropical_groups,
+        tropical_heads=args.tropical_heads,
         tropical_cells=args.tropical_cells,
-        tropical_rank=args.tropical_rank,
+        tropical_code_dim=args.tropical_code_dim,
         tropical_backend=args.tropical_backend,
         pairwise_hidden=args.pairwise_hidden,
         pairwise_tables=args.pairwise_tables,
         pairwise_comparisons=args.pairwise_comparisons,
-        linear_hidden=args.linear_hidden,
-        linear_activation=args.linear_activation,
         warmup=args.warmup,
         seed=args.seed,
         dtype=args.dtype,

@@ -19,7 +19,7 @@ def has_triton() -> bool:
 
 
 def trop_scores_reference(z: Tensor, router_weight: Tensor, router_bias: Tensor) -> Tensor:
-    return torch.einsum("bsr,tgkr->bstgk", z, router_weight) + router_bias.unsqueeze(0).unsqueeze(0)
+    return torch.einsum("bsr,hkr->bshk", z, router_weight) + router_bias.unsqueeze(0).unsqueeze(0)
 
 
 def trop_scores(z: Tensor, router_weight: Tensor, router_bias: Tensor, backend: Backend = "torch") -> Tensor:

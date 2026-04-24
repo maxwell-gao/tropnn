@@ -1,184 +1,101 @@
 # tropnn
-`tropnn` is a minimal teaching-oriented routed neural layer library.
 
-It exposes routed building blocks for tropical and pairwise comparisons, plus a small dense baseline path in the EMNIST example for matched-budget comparisons.
+`tropnn` is a minimal routed neural layer library with two public layers:
 
-The scope is narrow: hard chamber selection at inference, a local min-face surrogate during training, a readable reference path, and an optional Triton score kernel for the hottest routing step. Examples and benchmarking stay outside the core layer.
+- `TropLinear`: multi-head tropical routing with compact selected codes and a shared output projection.
+- `PairwiseLinear`: classic pairwise-comparator LUT baseline.
+
+Historical chamber-affine and payload-ablation implementations live in the experiment branch history. `main` keeps only the selected tropical form and the pairwise comparison path.
 
 ## Core Idea
 
-For each tropical group, the layer computes affine scores
+`TropLinear` projects the input to a code space, routes each tropical head through a Power-diagram style argmax, reads one compact code per head, and decodes the summed code with a shared output map:
 
 $$
-i_g(x) = \arg\max_k s_{gk}(Px),
+i_h(x)=\arg\max_{k\le K}\langle w_{hk}, Px\rangle+b_{hk},
 $$
 
-The original `TropLinear` selects one chamber-affine branch per group and sums them:
-
 $$
-y(x) = \sum_{t,g} \bigl(A_{tg,i_g(x)} Px + b_{tg,i_g(x)}\bigr).
+z(x)=Px+\frac{1}{\sqrt H}\sum_h c_{h,i_h(x)},\qquad y=Wz+\beta.
 $$
 
-Training uses a local min-face surrogate against the runner-up branch,
+Training uses a local min-face surrogate against the runner-up cell:
 
 $$
-\tilde y_g(x)
+\tilde c_h(x)
 =
-F_{g,i_g}(x)
-+ U\bigl(s_{g,i_g}(x) - s_{g,j_g}(x)\bigr)
-\bigl(F_{g,j_g}(x) - F_{g,i_g}(x)\bigr),
+c_{h,i_h(x)}
++ U(s_{h,i_h}(x)-s_{h,j_h}(x))
+(c_{h,j_h(x)}-c_{h,i_h(x)}),
+\qquad
+U(m)=\frac{0.5}{1+|m|}.
 $$
 
-with
-
-$$
-U(m) = \frac{0.5}{1 + |m|}.
-$$
-
-Inference remains fully hard. Only the training path uses the local surrogate.
-
-The package also includes two simple tropical payload ablations:
-
-- `TropLUTLinear`: pure selected-vector payload, `sum v[t,g,i_g]`.
-- `TropBinaryAdditiveLUT`: the `cells=2` bit-additive bridge to pairwise routing.
-- `TropCodeLinear`: merged `heads/cells/code_dim` form; selected compact codes are aggregated and decoded by a shared output projection.
-- `TropGatedLinear`: cell-local scalar-gated vector payload, avoiding a full per-chamber `rank x out_features` matrix.
+Inference remains fully hard.
 
 ## Package Layout
 
-- `__init__.py`: public API
-- `backend.py`: backend selection and score dispatch boundary
-- `backends/triton_scores.py`: optional Triton score kernel
-- `layers/base.py`: shared shell for routed linear layers
-- `layers/tropical.py`: `TropLinear` and tropical payload variant implementations
-- `layers/pairwise.py`: `PairwiseLinear` concrete implementation
-- `layers/surrogate.py`: tiny shared STE helper for discrete families
-- `module.py`: compatibility re-export for `TropLinear`
-- `examples/emnist.py`: self-contained EMNIST training example
-- `tools/benchmark.py`: benchmarking helper and CLI
-- `tools/profile.py`: forward profiler for tropical/pairwise/linear family comparisons
-
-The reference implementation lives in `layers/base.py`, `layers/tropical.py`, and `layers/pairwise.py`. `layers/surrogate.py` only holds the tiny shared STE helper for discrete routing. `backend.py` is the only place that chooses between reference and accelerated paths. Triton is optional and only affects the tropical score path.
+- `layers/tropical.py`: `TropLinear`
+- `layers/pairwise.py`: `PairwiseLinear`
+- `layers/base.py`: shared routed-layer shell
+- `backend.py` and `backends/triton_scores.py`: tropical score backend dispatch
+- `examples/emnist.py`: EMNIST training example for `tropical` and `pairwise`
+- `tools/benchmark.py`: backend benchmark for `TropLinear`
+- `tools/profile.py`: forward profiler for `tropical` and `pairwise`
 
 ## Quick Start
 
-Install the core library from this directory:
-
-```bash
-uv pip install -e .
-```
-
-Install with Triton acceleration enabled:
-
-```bash
-uv pip install -e ".[triton]"
-```
-
-Basic usage:
-
 ```python
 import torch
-from tropnn import PairwiseLinear, TropBinaryAdditiveLUT, TropCodeLinear, TropGatedLinear, TropLinear, TropLUTLinear
-
-layer = TropLinear(
-    256,
-    512,
-    tables=16,
-    groups=2,
-    cells=4,
-    rank=32,
-)
+from tropnn import PairwiseLinear, TropLinear
 
 x = torch.randn(8, 256)
-y = layer(x)
-print(y.shape)
+
+tropical = TropLinear(256, 512, heads=32, cells=4, code_dim=32)
+print(tropical(x).shape)
 
 pairwise = PairwiseLinear(256, 512, tables=16, comparisons=6)
 print(pairwise(x).shape)
-
-for cls in (TropLUTLinear, TropGatedLinear):
-    print(cls(256, 512, tables=16, groups=2, cells=4, rank=32)(x).shape)
-
-binary = TropBinaryAdditiveLUT(256, 512, tables=16, groups=6, rank=32)
-print(binary(x).shape)
-
-code = TropCodeLinear(256, 512, heads=32, cells=4, code_dim=32)
-print(code(x).shape)
 ```
 
-Because `TropLinear` behaves like a basic neural layer, collaborators can stack it directly into MLPs, residual blocks, or recurrent modules.
-
 ## EMNIST Example
-
-The package includes a small example that can train `tropical`, `pairwise`, or a dense `linear` baseline on the local EMNIST digits split.
-
-Run:
 
 ```bash
 uv run python -m tropnn.examples.emnist \
   --root /path/to/emnist \
   --family tropical \
   --split digits \
-  --epochs 3 \
+  --epochs 10 \
   --batch-size 512 \
   --lr 1e-3 \
-  --tables 16 \
   --hidden-dim 128 \
   --depth 2 \
-  --groups 2 \
-  --cells 4 \
-  --rank 32 \
+  --heads 256 \
+  --cells 16 \
+  --code-dim 64 \
   --max-train 20000 \
   --max-test 4000 \
   --device cuda \
   --seed 0
 ```
 
-Pairwise uses the same script with `--family pairwise --comparisons 6`. A dense baseline uses `--family linear --activation gelu`. Tropical payload ablations use `--family trop_lut`, `--family trop_binary_additive`, `--family trop_code`, or `--family trop_gated`. `trop_code` uses `--heads` and `--code-dim`; when omitted they default to `tables * groups` and `rank`.
-
-On the same setup used in the original experiment path, this reproduces:
-
-- epoch 1: `test_loss=0.5054`, `test_acc=0.8468`
-- epoch 2: `test_loss=0.3343`, `test_acc=0.8975`
-- epoch 3: `test_loss=0.2641`, `test_acc=0.9223`
-
-## Triton
-`backends/triton_scores.py` contains an optional score kernel for the grouped affine routing scores. If Triton is not available, or if the environment cannot compile Triton launchers, the package falls back to the pure PyTorch reference path.
-
-- `backend="torch"`: correctness and teaching
-- `backend="auto"`: practical CUDA inference
-- `backend="triton"`: only when launcher compilation is known to work
+Pairwise uses the same script with `--family pairwise --pairwise-tables 136 --comparisons 6`.
 
 ## Profiling
 
-Use the forward profiler to compare tropical, pairwise, and linear family runs by wall time, peak device memory, and top operator time and memory contributors.
-
 ```bash
-uv run tropnn-profile \
+uv run python -m tropnn.tools.profile \
   --device cuda \
   --batch-size 512 \
   --tropical-hidden 128 \
-  --tropical-tables 32 \
-  --tropical-groups 2 \
-  --tropical-cells 4 \
-  --tropical-rank 32 \
+  --tropical-heads 256 \
+  --tropical-cells 16 \
+  --tropical-code-dim 64 \
   --pairwise-hidden 128 \
   --pairwise-tables 136 \
-  --pairwise-comparisons 6 \
-  --linear-hidden 1561 \
-  --output results/experiments/tropnn_profile/profile.json
+  --pairwise-comparisons 6
 ```
 
-The profiler uses `torch.profiler` and reports per-family top ops with CPU/CUDA time plus memory-usage columns. On CUDA this gives a practical proxy for which path is most memory-traffic heavy, even though it is not a hardware-level DRAM read/write counter.
-
-## Reading Order
-
-For collaborators, the recommended reading order is `layers/base.py`, `layers/pairwise.py`, `layers/tropical.py`, `backend.py`, `examples/emnist.py`, `backends/triton_scores.py`, then `tools/benchmark.py`.
-
 ## Scope
-This package is deliberately minimal. It does not attempt to include:
 
-- sparse comparators,
-- experiment naming or benchmark orchestration,
-- multiple surrogate families,
-- large training frameworks.
+This package is deliberately minimal. It does not include the old chamber-affine payload, tropical payload ablations, sparse comparator variants, or experiment orchestration.

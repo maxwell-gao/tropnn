@@ -15,8 +15,10 @@ def _copy_weights(dst: TropLinear, src: TropLinear) -> None:
         dst.proj.weight.copy_(src.proj.weight)
         dst.router_weight.copy_(src.router_weight)
         dst.router_bias.copy_(src.router_bias)
-        dst.affine_weight.copy_(src.affine_weight)
-        dst.affine_bias.copy_(src.affine_bias)
+        dst.code.copy_(src.code)
+        dst.output_proj.weight.copy_(src.output_proj.weight)
+        if src.output_proj.bias is not None and dst.output_proj.bias is not None:
+            dst.output_proj.bias.copy_(src.output_proj.bias)
 
 
 def _sync_if_cuda(device: torch.device) -> None:
@@ -75,10 +77,9 @@ def benchmark_trop_linear_auto(
     batch_size: int = 512,
     in_features: int = 28 * 28,
     out_features: int = 128,
-    tables: int = 16,
-    groups: int = 2,
     cells: int = 4,
-    rank: int = 32,
+    heads: int = 32,
+    code_dim: int = 32,
     warmup: int = 20,
     steps: int = 100,
     device: str = "cuda",
@@ -89,20 +90,18 @@ def benchmark_trop_linear_auto(
     torch_layer = TropLinear(
         in_features,
         out_features,
-        tables=tables,
-        groups=groups,
+        heads=heads,
         cells=cells,
-        rank=rank,
+        code_dim=code_dim,
         backend="torch",
         seed=seed,
     ).to(dev)
     auto_layer = TropLinear(
         in_features,
         out_features,
-        tables=tables,
-        groups=groups,
+        heads=heads,
         cells=cells,
-        rank=rank,
+        code_dim=code_dim,
         backend="auto",
         seed=seed,
     ).to(dev)
@@ -132,10 +131,9 @@ def main() -> None:
         ("--batch-size", 512),
         ("--in-features", 28 * 28),
         ("--out-features", 128),
-        ("--tables", 16),
-        ("--groups", 2),
+        ("--heads", 32),
         ("--cells", 4),
-        ("--rank", 32),
+        ("--code-dim", 32),
         ("--warmup", 20),
         ("--steps", 100),
     ):
@@ -149,10 +147,9 @@ def main() -> None:
         batch_size=args.batch_size,
         in_features=args.in_features,
         out_features=args.out_features,
-        tables=args.tables,
-        groups=args.groups,
+        heads=args.heads,
         cells=args.cells,
-        rank=args.rank,
+        code_dim=args.code_dim,
         warmup=args.warmup,
         steps=args.steps,
         device=args.device,

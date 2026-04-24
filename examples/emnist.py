@@ -1,11 +1,10 @@
-"""Train a minimal trop_minface classifier on a local EMNIST split."""
+"""Train a minimal tropnn classifier on a local EMNIST split."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import gzip
-import math
 import struct
 import time
 from pathlib import Path
@@ -18,7 +17,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..layers import PairwiseLinear, TropBinaryAdditiveLUT, TropCodeLinear, TropGatedLinear, TropLinear, TropLUTLinear
+from ..layers import PairwiseLinear, TropLinear
 
 IDX_DTYPES = {
     0x08: np.uint8,
@@ -29,8 +28,7 @@ IDX_DTYPES = {
     0x0E: np.dtype(">f8"),
 }
 EMNIST_SPLITS = ("byclass", "bymerge", "balanced", "letters", "digits", "mnist")
-TROPICAL_FAMILIES = ("tropical", "trop_lut", "trop_binary_additive", "trop_code", "trop_gated")
-ROUTED_FAMILIES = (*TROPICAL_FAMILIES, "pairwise", "linear")
+ROUTED_FAMILIES = ("tropical", "pairwise")
 
 
 def _read_idx(path: Path) -> np.ndarray:
@@ -89,39 +87,17 @@ def _make_layer(
     d_in: int,
     d_out: int,
     *,
-    tables: int,
-    groups: int,
-    cells: int,
-    rank: int,
     heads: int,
+    cells: int,
     code_dim: int,
     comparisons: int,
+    pairwise_tables: int,
     backend: str,
     seed: int,
-    activation: str,
-    apply_activation: bool,
 ) -> nn.Module:
     if family == "tropical":
-        return TropLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
-    if family == "trop_lut":
-        return TropLUTLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
-    if family == "trop_binary_additive":
-        return TropBinaryAdditiveLUT(d_in, d_out, tables=tables, groups=comparisons, rank=rank, backend=backend, seed=seed)
-    if family == "trop_code":
-        return TropCodeLinear(d_in, d_out, heads=heads, cells=cells, code_dim=code_dim, backend=backend, seed=seed)
-    if family == "trop_gated":
-        return TropGatedLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
-    if family == "linear":
-        layer = nn.Linear(d_in, d_out)
-        nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
-        if layer.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(layer.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(layer.bias, -bound, bound)
-        if not apply_activation:
-            return layer
-        return nn.Sequential(layer, nn.GELU()) if activation == "gelu" else nn.Sequential(layer, nn.ReLU())
-    return PairwiseLinear(d_in, d_out, tables=tables, comparisons=comparisons, backend="torch", seed=seed)
+        return TropLinear(d_in, d_out, heads=heads, cells=cells, code_dim=code_dim, backend=backend, seed=seed)
+    return PairwiseLinear(d_in, d_out, tables=pairwise_tables, comparisons=comparisons, backend="torch", seed=seed)
 
 
 class EmnistRoutedClassifier(nn.Module):
@@ -133,16 +109,13 @@ class EmnistRoutedClassifier(nn.Module):
         hidden_dim: int,
         num_classes: int,
         depth: int,
-        tables: int,
-        groups: int,
-        cells: int,
-        rank: int,
         heads: int,
+        cells: int,
         code_dim: int,
         comparisons: int,
+        pairwise_tables: int,
         backend: str,
         seed: int,
-        activation: str = "gelu",
     ) -> None:
         super().__init__()
         self.family = family
@@ -158,17 +131,13 @@ class EmnistRoutedClassifier(nn.Module):
                     family,
                     d_in,
                     d_out,
-                    tables=tables,
-                    groups=groups,
-                    cells=cells,
-                    rank=rank,
                     heads=heads,
+                    cells=cells,
                     code_dim=code_dim,
                     comparisons=comparisons,
+                    pairwise_tables=pairwise_tables,
                     backend=backend,
                     seed=seed + idx,
-                    activation=activation,
-                    apply_activation=idx < len(dims) - 2,
                 )
                 for idx, (d_in, d_out) in enumerate(zip(dims[:-1], dims[1:]))
             ]
@@ -184,37 +153,12 @@ class EmnistRoutedClassifier(nn.Module):
 
 class EmnistTropClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="tropical", comparisons=4, **kwargs)
-
-
-class EmnistTropLUTClassifier(EmnistRoutedClassifier):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(family="trop_lut", comparisons=4, **kwargs)
-
-
-class EmnistTropBinaryAdditiveClassifier(EmnistRoutedClassifier):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(family="trop_binary_additive", groups=1, cells=2, **kwargs)
-
-
-class EmnistTropCodeClassifier(EmnistRoutedClassifier):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(family="trop_code", tables=1, groups=1, rank=1, comparisons=4, **kwargs)
-
-
-class EmnistTropGatedClassifier(EmnistRoutedClassifier):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(family="trop_gated", comparisons=4, **kwargs)
+        super().__init__(family="tropical", **kwargs)
 
 
 class EmnistPairwiseClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="pairwise", groups=1, cells=2, rank=1, backend="torch", **kwargs)
-
-
-class EmnistLinearClassifier(EmnistRoutedClassifier):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(family="linear", tables=1, groups=1, cells=2, rank=1, comparisons=1, backend="torch", **kwargs)
+        super().__init__(family="pairwise", backend="torch", **kwargs)
 
 
 def _run_epoch(
@@ -262,18 +206,15 @@ def main() -> None:
         ("--epochs", int, 10),
         ("--batch-size", int, 256),
         ("--lr", float, 3e-3),
-        ("--tables", int, 16),
         ("--hidden-dim", int, 256),
         ("--depth", int, 2),
-        ("--groups", int, 2),
+        ("--heads", int, 32),
         ("--cells", int, 4),
-        ("--rank", int, 32),
-        ("--heads", int, 0),
-        ("--code-dim", int, 0),
+        ("--code-dim", int, 32),
+        ("--pairwise-tables", int, 72),
         ("--comparisons", int, 6),
     ):
         parser.add_argument(name, type=arg_type, default=default)
-    parser.add_argument("--activation", choices=("gelu", "relu"), default="gelu")
     parser.add_argument("--backend", choices=("torch", "auto", "triton"), default="torch")
     parser.add_argument("--max-train", type=int, default=None)
     parser.add_argument("--max-test", type=int, default=None)
@@ -311,44 +252,34 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         num_classes=num_classes,
         depth=args.depth,
-        tables=args.tables,
-        groups=args.groups,
+        heads=args.heads,
         cells=args.cells,
-        rank=args.rank,
-        heads=args.heads if args.heads > 0 else args.tables * args.groups,
-        code_dim=args.code_dim if args.code_dim > 0 else args.rank,
+        code_dim=args.code_dim,
         comparisons=args.comparisons,
+        pairwise_tables=args.pairwise_tables,
         backend=args.backend,
         seed=args.seed,
-        activation=args.activation,
     ).to(device)
     train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(TensorDataset(x_test, y_test), batch_size=args.batch_size, shuffle=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
-    display_heads = args.heads if args.heads > 0 else args.tables * args.groups
-    display_code_dim = args.code_dim if args.code_dim > 0 else args.rank
-    display_groups = args.comparisons if args.family == "trop_binary_additive" else args.groups
-    display_cells = 2 if args.family == "trop_binary_additive" else args.cells
     config_lines = {
         "root": args.root,
         "split": args.split,
         "family": args.family,
         "depth": args.depth,
         "hidden_dim": args.hidden_dim,
-        "tables": args.tables if args.family != "linear" else "-",
-        "groups": display_groups if args.family in TROPICAL_FAMILIES else "-",
-        "heads": display_heads if args.family == "trop_code" else "-",
-        "cells": display_cells if args.family in TROPICAL_FAMILIES else "-",
-        "rank": args.rank if args.family in TROPICAL_FAMILIES else "-",
-        "code_dim": display_code_dim if args.family == "trop_code" else "-",
-        "comparisons": args.comparisons if args.family in {"pairwise", "trop_binary_additive"} else "-",
-        "activation": args.activation if args.family == "linear" else "-",
-        "backend": args.backend if args.family in TROPICAL_FAMILIES else "torch",
+        "heads": args.heads if args.family == "tropical" else "-",
+        "cells": args.cells if args.family == "tropical" else "-",
+        "code_dim": args.code_dim if args.family == "tropical" else "-",
+        "pairwise_tables": args.pairwise_tables if args.family == "pairwise" else "-",
+        "comparisons": args.comparisons if args.family == "pairwise" else "-",
+        "backend": args.backend if args.family == "tropical" else "torch",
         "train/test": f"{len(x_train)}/{len(x_test)}",
         "device": device.type,
         "params": sum(param.numel() for param in model.parameters()),
     }
-    config_text = "\n".join(f"  {key:<10} : {value}" for key, value in config_lines.items())
+    config_text = "\n".join(f"  {key:<15} : {value}" for key, value in config_lines.items())
     print(f"EMNIST tropnn\n{config_text}\n")
 
     rows: list[dict] = []

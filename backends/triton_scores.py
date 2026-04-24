@@ -77,6 +77,12 @@ def trop_scores_triton(z: Tensor, router_weight: Tensor, router_bias: Tensor) ->
         raise RuntimeError("Triton is not available")
     if not z.is_cuda:
         raise ValueError("trop_scores_triton requires CUDA tensors")
+    if router_weight.ndim != 3:
+        raise ValueError(f"router_weight must have shape [heads, cells, rank], got {tuple(router_weight.shape)}")
+    if router_bias.shape != router_weight.shape[:2]:
+        raise ValueError(
+            f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}"
+        )
 
     batch, steps, rank = z.shape
     flat_cols = router_bias.numel()
