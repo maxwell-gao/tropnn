@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tropnn import TropDeltaLinear, TropLUTLinear, TropSharedLowRankLinear
+from tropnn import TropBinaryAdditiveLUT, TropCodeLinear, TropGatedLinear, TropLUTLinear
 
-VARIANT_CLASSES = (TropLUTLinear, TropDeltaLinear, TropSharedLowRankLinear)
+VARIANT_CLASSES = (TropLUTLinear, TropCodeLinear, TropGatedLinear)
+ALL_VARIANT_CLASSES = (TropLUTLinear, TropBinaryAdditiveLUT, TropCodeLinear, TropGatedLinear)
 
 
-@pytest.mark.parametrize("layer_cls", VARIANT_CLASSES)
+@pytest.mark.parametrize("layer_cls", ALL_VARIANT_CLASSES)
 def test_payload_variant_shapes_for_2d_and_3d_inputs(layer_cls: type[torch.nn.Module]) -> None:
-    layer = layer_cls(5, 3, tables=2, groups=2, cells=3, rank=4, seed=0)
+    if layer_cls is TropCodeLinear:
+        kwargs = {"heads": 4, "cells": 3, "code_dim": 4, "seed": 0}
+    else:
+        kwargs = {"tables": 2, "groups": 2, "rank": 4, "seed": 0}
+    if layer_cls not in {TropBinaryAdditiveLUT, TropCodeLinear}:
+        kwargs["cells"] = 3
+    layer = layer_cls(5, 3, **kwargs)
 
     y2 = layer(torch.randn(7, 5))
     y3 = layer(torch.randn(7, 2, 5))
@@ -49,9 +56,34 @@ def test_trop_lut_train_uses_minface_interpolation() -> None:
     assert torch.allclose(y, expected, atol=1e-6)
 
 
-@pytest.mark.parametrize("layer_cls", VARIANT_CLASSES)
+def test_trop_binary_additive_lut_is_binary_cells() -> None:
+    layer = TropBinaryAdditiveLUT(3, 2, tables=4, groups=6, rank=5, seed=0)
+
+    assert layer.cells == 2
+    assert layer.groups == 6
+    assert layer.lut.shape == (4, 6, 2, 2)
+
+
+def test_trop_code_linear_merges_heads_and_code_dim() -> None:
+    layer = TropCodeLinear(3, 2, heads=5, cells=4, code_dim=7, seed=0)
+
+    assert layer.heads == 5
+    assert layer.groups == 1
+    assert layer.tables == 5
+    assert layer.cells == 4
+    assert layer.rank == 7
+    assert layer.code.shape == (5, 4, 7)
+
+
+@pytest.mark.parametrize("layer_cls", ALL_VARIANT_CLASSES)
 def test_payload_variant_train_has_router_and_payload_gradients(layer_cls: type[torch.nn.Module]) -> None:
-    layer = layer_cls(6, 4, tables=3, groups=2, cells=4, rank=5, seed=0)
+    if layer_cls is TropCodeLinear:
+        kwargs = {"heads": 6, "cells": 4, "code_dim": 5, "seed": 0}
+    else:
+        kwargs = {"tables": 3, "groups": 2, "rank": 5, "seed": 0}
+    if layer_cls not in {TropBinaryAdditiveLUT, TropCodeLinear}:
+        kwargs["cells"] = 4
+    layer = layer_cls(6, 4, **kwargs)
     x = torch.randn(8, 2, 6, requires_grad=True)
 
     y = layer(x)
@@ -72,8 +104,8 @@ def test_payload_variant_train_has_router_and_payload_gradients(layer_cls: type[
     assert float(sum(payload_grads)) > 0.0
 
 
-def test_trop_shared_lowrank_eval_uses_selected_scalar_gated_vector() -> None:
-    layer = TropSharedLowRankLinear(1, 1, tables=1, groups=1, cells=2, rank=1, seed=0, use_output_scaling=False)
+def test_trop_gated_eval_uses_selected_scalar_gated_vector() -> None:
+    layer = TropGatedLinear(1, 1, tables=1, groups=1, cells=2, rank=1, seed=0, use_output_scaling=False)
     with torch.no_grad():
         layer.proj.weight.fill_(1.0)
         layer.router_weight[0, 0, :, 0] = torch.tensor([1.0, -1.0])

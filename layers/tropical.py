@@ -4,7 +4,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 
 from ..backend import Backend, trop_scores
@@ -170,8 +169,8 @@ class TropLUTLinear(_GroupedTropicalPayloadBase):
         return output, self._route_indices(winner_idx), margins
 
 
-class TropDeltaLinear(TropLUTLinear):
-    """Grouped tropical LUT residual plus one shared latent dense trunk."""
+class TropBinaryAdditiveLUT(TropLUTLinear):
+    """Binary tropical comparisons with group-additive LUT payloads."""
 
     def __init__(
         self,
@@ -179,8 +178,7 @@ class TropDeltaLinear(TropLUTLinear):
         out_features: int,
         *,
         tables: int = 16,
-        groups: int = 2,
-        cells: int = 4,
+        groups: int = 6,
         rank: int = 32,
         backend: Backend = "torch",
         seed: int = 0,
@@ -192,16 +190,98 @@ class TropDeltaLinear(TropLUTLinear):
             out_features,
             tables=tables,
             groups=groups,
-            cells=cells,
+            cells=2,
             rank=rank,
             backend=backend,
             seed=seed,
             lut_init_std=lut_init_std,
             use_output_scaling=use_output_scaling,
         )
-        self.trunk = nn.Linear(rank, out_features)
-        nn.init.normal_(self.trunk.weight, mean=0.0, std=1.0 / math.sqrt(max(1, rank)))
-        nn.init.zeros_(self.trunk.bias)
+
+
+class TropCodeLinear(RoutedLinearBase):
+    """Tropical heads with compact selected codes and a shared output map."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        heads: int = 32,
+        cells: int = 4,
+        code_dim: int = 32,
+        backend: Backend = "torch",
+        seed: int = 0,
+        code_init_std: float = 0.02,
+        use_output_scaling: bool = True,
+    ) -> None:
+        if heads < 1:
+            raise ValueError(f"heads must be >= 1, got {heads}")
+        if cells < 2:
+            raise ValueError(f"cells must be >= 2, got {cells}")
+        if code_dim < 1:
+            raise ValueError(f"code_dim must be >= 1, got {code_dim}")
+
+        super().__init__(in_features, out_features, backend=backend, output_scale=1.0)
+        self.heads = heads
+        self.cells = cells
+        self.code_dim = code_dim
+        self.code_scale = 1.0 / math.sqrt(heads) if use_output_scaling else 1.0
+
+        torch.manual_seed(seed)
+        self.proj = nn.Linear(in_features, code_dim, bias=False)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=1.0 / math.sqrt(max(1, in_features)))
+
+        router_std = 1.0 / math.sqrt(max(1, code_dim))
+        self.router_weight = nn.Parameter(torch.randn(heads, cells, code_dim) * router_std)
+        self.router_bias = nn.Parameter(torch.zeros(heads, cells))
+        self.code = nn.Parameter(torch.randn(heads, cells, code_dim) * code_init_std)
+        self.output_proj = nn.Linear(code_dim, out_features)
+        nn.init.kaiming_uniform_(self.output_proj.weight, a=math.sqrt(5))
+        if self.output_proj.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.output_proj.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.output_proj.bias, -bound, bound)
+
+    @property
+    def tables(self) -> int:
+        return self.heads
+
+    @property
+    def groups(self) -> int:
+        return 1
+
+    @property
+    def rank(self) -> int:
+        return self.code_dim
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, heads={self.heads}, "
+            f"cells={self.cells}, code_dim={self.code_dim}, backend={self.backend!r}"
+        )
+
+    def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
+        return self.proj(x).to(compute_dtype)
+
+    def _scores(self, latent: Tensor, *, input_device: torch.device, compute_dtype: torch.dtype) -> Tensor:
+        weight = self.router_weight.to(dtype=compute_dtype, device=input_device).unsqueeze(1)
+        bias = self.router_bias.to(dtype=compute_dtype, device=input_device).unsqueeze(1)
+        return trop_scores(latent, weight, bias, backend=self.backend).squeeze(3)
+
+    def _selected_codes(self, winner_idx: Tensor, *, input_device: torch.device, compute_dtype: torch.dtype) -> Tensor:
+        code = self.code.to(dtype=compute_dtype, device=input_device).unsqueeze(0).unsqueeze(0)
+        gather_idx = winner_idx.unsqueeze(-1).unsqueeze(-1).expand(*winner_idx.shape, 1, self.code_dim)
+        return code.expand(*winner_idx.shape[:2], -1, -1, -1).gather(-2, gather_idx).squeeze(-2)
+
+    def _output_from_codes(self, latent: Tensor, codes: Tensor, *, input_device: torch.device, compute_dtype: torch.dtype) -> Tensor:
+        hidden = latent + codes.sum(dim=2) * self.code_scale
+        weight = self.output_proj.weight.to(dtype=compute_dtype, device=input_device)
+        bias = self.output_proj.bias
+        output = torch.matmul(hidden, weight.t())
+        if bias is not None:
+            output = output + bias.to(dtype=compute_dtype, device=input_device)
+        return output
 
     def _route_output(
         self,
@@ -211,22 +291,19 @@ class TropDeltaLinear(TropLUTLinear):
         compute_dtype: torch.dtype,
         training: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        output, route_indices, margins = super()._route_output(
-            latent,
-            input_device=input_device,
-            compute_dtype=compute_dtype,
-            training=training,
-        )
-        trunk = F.linear(
-            latent,
-            self.trunk.weight.to(dtype=compute_dtype, device=input_device),
-            self.trunk.bias.to(dtype=compute_dtype, device=input_device),
-        )
-        return output + trunk, route_indices, margins
+        scores = self._scores(latent, input_device=input_device, compute_dtype=compute_dtype)
+        winner_idx, runner_idx, margins = _top2_indices(scores)
+        if training:
+            winner_codes = self._selected_codes(winner_idx, input_device=input_device, compute_dtype=compute_dtype)
+            runner_codes = self._selected_codes(runner_idx, input_device=input_device, compute_dtype=compute_dtype)
+            codes = _minface_mix(winner_codes, runner_codes, margins)
+        else:
+            codes = self._selected_codes(winner_idx, input_device=input_device, compute_dtype=compute_dtype)
+        return self._output_from_codes(latent, codes, input_device=input_device, compute_dtype=compute_dtype), winner_idx, margins
 
 
-class TropSharedLowRankLinear(_GroupedTropicalPayloadBase):
-    """Grouped tropical router with scalar-gated vector payloads."""
+class TropGatedLinear(_GroupedTropicalPayloadBase):
+    """Grouped tropical router with cell-local scalar-gated vector payloads."""
 
     def __init__(
         self,

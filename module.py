@@ -1,3 +1,3 @@
-from .layers import TropDeltaLinear, TropLinear, TropLUTLinear, TropSharedLowRankLinear
+from .layers import TropBinaryAdditiveLUT, TropCodeLinear, TropGatedLinear, TropLinear, TropLUTLinear
 
-__all__ = ["TropLinear", "TropLUTLinear", "TropDeltaLinear", "TropSharedLowRankLinear"]
+__all__ = ["TropLinear", "TropLUTLinear", "TropBinaryAdditiveLUT", "TropCodeLinear", "TropGatedLinear"]

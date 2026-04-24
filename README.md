@@ -37,11 +37,12 @@ $$
 
 Inference remains fully hard. Only the training path uses the local surrogate.
 
-The package also includes three sparse/shared tropical payload variants for ablations:
+The package also includes two simple tropical payload ablations:
 
 - `TropLUTLinear`: pure selected-vector payload, `sum v[t,g,i_g]`.
-- `TropDeltaLinear`: selected-vector payload plus one shared latent dense trunk.
-- `TropSharedLowRankLinear`: selected scalar-gated vector payload, avoiding a full per-chamber `rank x out_features` matrix.
+- `TropBinaryAdditiveLUT`: the `cells=2` bit-additive bridge to pairwise routing.
+- `TropCodeLinear`: merged `heads/cells/code_dim` form; selected compact codes are aggregated and decoded by a shared output projection.
+- `TropGatedLinear`: cell-local scalar-gated vector payload, avoiding a full per-chamber `rank x out_features` matrix.
 
 ## Package Layout
 
@@ -77,7 +78,7 @@ Basic usage:
 
 ```python
 import torch
-from tropnn import PairwiseLinear, TropDeltaLinear, TropLinear, TropLUTLinear, TropSharedLowRankLinear
+from tropnn import PairwiseLinear, TropBinaryAdditiveLUT, TropCodeLinear, TropGatedLinear, TropLinear, TropLUTLinear
 
 layer = TropLinear(
     256,
@@ -95,8 +96,14 @@ print(y.shape)
 pairwise = PairwiseLinear(256, 512, tables=16, comparisons=6)
 print(pairwise(x).shape)
 
-for cls in (TropLUTLinear, TropDeltaLinear, TropSharedLowRankLinear):
+for cls in (TropLUTLinear, TropGatedLinear):
     print(cls(256, 512, tables=16, groups=2, cells=4, rank=32)(x).shape)
+
+binary = TropBinaryAdditiveLUT(256, 512, tables=16, groups=6, rank=32)
+print(binary(x).shape)
+
+code = TropCodeLinear(256, 512, heads=32, cells=4, code_dim=32)
+print(code(x).shape)
 ```
 
 Because `TropLinear` behaves like a basic neural layer, collaborators can stack it directly into MLPs, residual blocks, or recurrent modules.
@@ -127,7 +134,7 @@ uv run python -m tropnn.examples.emnist \
   --seed 0
 ```
 
-Pairwise uses the same script with `--family pairwise --comparisons 6`. A dense baseline uses `--family linear --activation gelu`. Tropical payload ablations use `--family trop_lut`, `--family trop_delta`, or `--family trop_shared_lowrank`.
+Pairwise uses the same script with `--family pairwise --comparisons 6`. A dense baseline uses `--family linear --activation gelu`. Tropical payload ablations use `--family trop_lut`, `--family trop_binary_additive`, `--family trop_code`, or `--family trop_gated`. `trop_code` uses `--heads` and `--code-dim`; when omitted they default to `tables * groups` and `rank`.
 
 On the same setup used in the original experiment path, this reproduces:
 

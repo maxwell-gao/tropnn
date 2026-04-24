@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..layers import PairwiseLinear, TropDeltaLinear, TropLinear, TropLUTLinear, TropSharedLowRankLinear
+from ..layers import PairwiseLinear, TropBinaryAdditiveLUT, TropCodeLinear, TropGatedLinear, TropLinear, TropLUTLinear
 
 IDX_DTYPES = {
     0x08: np.uint8,
@@ -29,7 +29,7 @@ IDX_DTYPES = {
     0x0E: np.dtype(">f8"),
 }
 EMNIST_SPLITS = ("byclass", "bymerge", "balanced", "letters", "digits", "mnist")
-TROPICAL_FAMILIES = ("tropical", "trop_lut", "trop_delta", "trop_shared_lowrank")
+TROPICAL_FAMILIES = ("tropical", "trop_lut", "trop_binary_additive", "trop_code", "trop_gated")
 ROUTED_FAMILIES = (*TROPICAL_FAMILIES, "pairwise", "linear")
 
 
@@ -93,6 +93,8 @@ def _make_layer(
     groups: int,
     cells: int,
     rank: int,
+    heads: int,
+    code_dim: int,
     comparisons: int,
     backend: str,
     seed: int,
@@ -103,10 +105,12 @@ def _make_layer(
         return TropLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
     if family == "trop_lut":
         return TropLUTLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
-    if family == "trop_delta":
-        return TropDeltaLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
-    if family == "trop_shared_lowrank":
-        return TropSharedLowRankLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
+    if family == "trop_binary_additive":
+        return TropBinaryAdditiveLUT(d_in, d_out, tables=tables, groups=comparisons, rank=rank, backend=backend, seed=seed)
+    if family == "trop_code":
+        return TropCodeLinear(d_in, d_out, heads=heads, cells=cells, code_dim=code_dim, backend=backend, seed=seed)
+    if family == "trop_gated":
+        return TropGatedLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
     if family == "linear":
         layer = nn.Linear(d_in, d_out)
         nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
@@ -133,6 +137,8 @@ class EmnistRoutedClassifier(nn.Module):
         groups: int,
         cells: int,
         rank: int,
+        heads: int,
+        code_dim: int,
         comparisons: int,
         backend: str,
         seed: int,
@@ -156,6 +162,8 @@ class EmnistRoutedClassifier(nn.Module):
                     groups=groups,
                     cells=cells,
                     rank=rank,
+                    heads=heads,
+                    code_dim=code_dim,
                     comparisons=comparisons,
                     backend=backend,
                     seed=seed + idx,
@@ -184,14 +192,19 @@ class EmnistTropLUTClassifier(EmnistRoutedClassifier):
         super().__init__(family="trop_lut", comparisons=4, **kwargs)
 
 
-class EmnistTropDeltaClassifier(EmnistRoutedClassifier):
+class EmnistTropBinaryAdditiveClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="trop_delta", comparisons=4, **kwargs)
+        super().__init__(family="trop_binary_additive", groups=1, cells=2, **kwargs)
 
 
-class EmnistTropSharedLowRankClassifier(EmnistRoutedClassifier):
+class EmnistTropCodeClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="trop_shared_lowrank", comparisons=4, **kwargs)
+        super().__init__(family="trop_code", tables=1, groups=1, rank=1, comparisons=4, **kwargs)
+
+
+class EmnistTropGatedClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="trop_gated", comparisons=4, **kwargs)
 
 
 class EmnistPairwiseClassifier(EmnistRoutedClassifier):
@@ -255,6 +268,8 @@ def main() -> None:
         ("--groups", int, 2),
         ("--cells", int, 4),
         ("--rank", int, 32),
+        ("--heads", int, 0),
+        ("--code-dim", int, 0),
         ("--comparisons", int, 6),
     ):
         parser.add_argument(name, type=arg_type, default=default)
@@ -300,6 +315,8 @@ def main() -> None:
         groups=args.groups,
         cells=args.cells,
         rank=args.rank,
+        heads=args.heads if args.heads > 0 else args.tables * args.groups,
+        code_dim=args.code_dim if args.code_dim > 0 else args.rank,
         comparisons=args.comparisons,
         backend=args.backend,
         seed=args.seed,
@@ -308,6 +325,10 @@ def main() -> None:
     train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(TensorDataset(x_test, y_test), batch_size=args.batch_size, shuffle=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
+    display_heads = args.heads if args.heads > 0 else args.tables * args.groups
+    display_code_dim = args.code_dim if args.code_dim > 0 else args.rank
+    display_groups = args.comparisons if args.family == "trop_binary_additive" else args.groups
+    display_cells = 2 if args.family == "trop_binary_additive" else args.cells
     config_lines = {
         "root": args.root,
         "split": args.split,
@@ -315,10 +336,12 @@ def main() -> None:
         "depth": args.depth,
         "hidden_dim": args.hidden_dim,
         "tables": args.tables if args.family != "linear" else "-",
-        "groups": args.groups if args.family in TROPICAL_FAMILIES else "-",
-        "cells": args.cells if args.family in TROPICAL_FAMILIES else "-",
+        "groups": display_groups if args.family in TROPICAL_FAMILIES else "-",
+        "heads": display_heads if args.family == "trop_code" else "-",
+        "cells": display_cells if args.family in TROPICAL_FAMILIES else "-",
         "rank": args.rank if args.family in TROPICAL_FAMILIES else "-",
-        "comparisons": args.comparisons if args.family == "pairwise" else "-",
+        "code_dim": display_code_dim if args.family == "trop_code" else "-",
+        "comparisons": args.comparisons if args.family in {"pairwise", "trop_binary_additive"} else "-",
         "activation": args.activation if args.family == "linear" else "-",
         "backend": args.backend if args.family in TROPICAL_FAMILIES else "torch",
         "train/test": f"{len(x_train)}/{len(x_test)}",
@@ -337,7 +360,7 @@ def main() -> None:
         print(f"epoch {epoch:>3d} | train_loss={train_loss:.4f} train_acc={train_acc:.4f} | test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
 
     repo_root = Path(__file__).resolve().parents[4]
-    out_path = repo_root / "results" / "experiments" / "tropnn_emnist" / f"{args.split}_{args.family}_{int(time.time())}.csv"
+    out_path = repo_root / "results" / "experiments" / "tropnn_emnist" / f"{args.split}_{args.family}_{time.time_ns()}.csv"
     _write_metrics(rows, out_path)
     print(f"\nDone in {time.perf_counter() - t0:.1f}s; metrics -> {out_path}")
 
