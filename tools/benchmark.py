@@ -6,7 +6,7 @@ import time
 import torch
 from torch import Tensor
 
-from ..backend import has_triton, trop_scores, trop_scores_reference
+from ..backend import has_tilelang, has_triton, trop_scores, trop_scores_reference
 from ..layers import TropLinear
 
 
@@ -26,7 +26,7 @@ def _sync_if_cuda(device: torch.device) -> None:
         torch.cuda.synchronize(device=device)
 
 
-def _bench_forward(layer: TropLinear, x: Tensor, *, warmup: int, steps: int) -> tuple[Tensor, float]:
+def _bench_forward(layer: torch.nn.Module, x: Tensor, *, warmup: int, steps: int) -> tuple[Tensor, float]:
     with torch.no_grad():
         for _ in range(warmup):
             layer(x)
@@ -84,6 +84,7 @@ def benchmark_trop_linear_auto(
     steps: int = 100,
     device: str = "cuda",
     seed: int = 0,
+    compile_cpu: bool = False,
 ) -> dict[str, float]:
     dev = torch.device(device)
     torch.manual_seed(seed)
@@ -105,13 +106,38 @@ def benchmark_trop_linear_auto(
         backend="auto",
         seed=seed,
     ).to(dev)
+    tilelang_layer = TropLinear(
+        in_features,
+        out_features,
+        heads=heads,
+        cells=cells,
+        code_dim=code_dim,
+        backend="tilelang",
+        seed=seed,
+    ).to(dev)
     _copy_weights(auto_layer, torch_layer)
+    _copy_weights(tilelang_layer, torch_layer)
     torch_layer.eval()
     auto_layer.eval()
+    tilelang_layer.eval()
     x = torch.randn(batch_size, in_features, device=dev)
     score_torch_ms, score_auto_ms, score_max_diff = _bench_scores(torch_layer, x, warmup=warmup, steps=steps)
     torch_out, torch_ms = _bench_forward(torch_layer, x, warmup=warmup, steps=steps)
     auto_out, auto_ms = _bench_forward(auto_layer, x, warmup=warmup, steps=steps)
+    tilelang_ms = float("nan")
+    tilelang_max_diff = float("nan")
+    if has_tilelang() and dev.type == "cuda":
+        try:
+            tilelang_out, tilelang_ms = _bench_forward(tilelang_layer, x, warmup=warmup, steps=steps)
+            tilelang_max_diff = float((torch_out - tilelang_out).abs().max().item())
+        except RuntimeError as exc:
+            print(f"tilelang_unavailable={exc}")
+    compiled_cpu_ms = float("nan")
+    compiled_cpu_max_diff = float("nan")
+    if compile_cpu and dev.type == "cpu":
+        compiled_layer = torch.compile(torch_layer, mode="reduce-overhead")
+        compiled_out, compiled_cpu_ms = _bench_forward(compiled_layer, x, warmup=warmup, steps=steps)
+        compiled_cpu_max_diff = float((torch_out - compiled_out).abs().max().item())
     max_diff = float((torch_out - auto_out).abs().max().item())
     return {
         "score_torch_ms": score_torch_ms,
@@ -120,8 +146,14 @@ def benchmark_trop_linear_auto(
         "score_max_diff": score_max_diff,
         "torch_ms": torch_ms,
         "auto_ms": auto_ms,
+        "tilelang_ms": tilelang_ms,
         "speedup": torch_ms / auto_ms,
+        "tilelang_speedup": torch_ms / tilelang_ms,
+        "compiled_cpu_ms": compiled_cpu_ms,
+        "compiled_cpu_speedup": torch_ms / compiled_cpu_ms,
         "max_diff": max_diff,
+        "tilelang_max_diff": tilelang_max_diff,
+        "compiled_cpu_max_diff": compiled_cpu_max_diff,
     }
 
 
@@ -140,9 +172,13 @@ def main() -> None:
         parser.add_argument(name, type=int, default=default)
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--compile-cpu", action="store_true", help="Also benchmark torch.compile on CPU inference.")
+    parser.add_argument("--num-threads", type=int, default=0, help="Set torch CPU threads when > 0.")
     args = parser.parse_args()
 
-    print(f"cuda={torch.cuda.is_available()} has_triton={has_triton()} device={args.device}")
+    if args.num_threads > 0:
+        torch.set_num_threads(args.num_threads)
+    print(f"cuda={torch.cuda.is_available()} has_triton={has_triton()} has_tilelang={has_tilelang()} device={args.device}")
     result = benchmark_trop_linear_auto(
         batch_size=args.batch_size,
         in_features=args.in_features,
@@ -154,8 +190,24 @@ def main() -> None:
         steps=args.steps,
         device=args.device,
         seed=args.seed,
+        compile_cpu=args.compile_cpu,
     )
-    for key in ("score_torch_ms", "score_auto_ms", "score_speedup", "score_max_diff", "torch_ms", "auto_ms", "speedup", "max_diff"):
+    for key in (
+        "score_torch_ms",
+        "score_auto_ms",
+        "score_speedup",
+        "score_max_diff",
+        "torch_ms",
+        "auto_ms",
+        "tilelang_ms",
+        "speedup",
+        "tilelang_speedup",
+        "compiled_cpu_ms",
+        "compiled_cpu_speedup",
+        "max_diff",
+        "tilelang_max_diff",
+        "compiled_cpu_max_diff",
+    ):
         precision = 6 if "diff" in key else 4
         print(f"{key}={result[key]:.{precision}f}")
 

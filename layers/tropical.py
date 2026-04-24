@@ -84,6 +84,9 @@ class TropLinear(RoutedLinearBase):
 
     def _output_from_codes(self, latent: Tensor, codes: Tensor, *, input_device: torch.device, compute_dtype: torch.dtype) -> Tensor:
         hidden = latent + codes.sum(dim=2) * self.code_scale
+        return self._output_from_hidden(hidden, input_device=input_device, compute_dtype=compute_dtype)
+
+    def _output_from_hidden(self, hidden: Tensor, *, input_device: torch.device, compute_dtype: torch.dtype) -> Tensor:
         weight = self.output_proj.weight.to(dtype=compute_dtype, device=input_device)
         bias = self.output_proj.bias
         output = torch.matmul(hidden, weight.t())
@@ -99,7 +102,28 @@ class TropLinear(RoutedLinearBase):
         compute_dtype: torch.dtype,
         training: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        scores = self._scores(latent, input_device=input_device, compute_dtype=compute_dtype)
+        if self.backend == "tilelang" and not training:
+            from ..backends import trop_route_hidden_tilelang
+
+            weight = self.router_weight.to(dtype=compute_dtype, device=input_device)
+            bias = self.router_bias.to(dtype=compute_dtype, device=input_device)
+            code = self.code.to(dtype=compute_dtype, device=input_device)
+            hidden, winner_idx, margins = trop_route_hidden_tilelang(
+                latent,
+                weight,
+                bias,
+                code,
+                code_scale=self.code_scale,
+            )
+            return self._output_from_hidden(hidden, input_device=input_device, compute_dtype=compute_dtype), winner_idx, margins
+
+        score_backend = "torch" if self.backend == "tilelang" else self.backend
+        scores = trop_scores(
+            latent,
+            self.router_weight.to(dtype=compute_dtype, device=input_device),
+            self.router_bias.to(dtype=compute_dtype, device=input_device),
+            backend=score_backend,
+        )
         winner_idx, runner_idx, margins = _top2_indices(scores)
         if training:
             winner_codes = self._selected_codes(winner_idx, input_device=input_device, compute_dtype=compute_dtype)

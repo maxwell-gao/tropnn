@@ -39,6 +39,7 @@ Inference remains fully hard.
 - `layers/pairwise.py`: `PairwiseLinear`
 - `layers/base.py`: shared routed-layer shell
 - `backend.py` and `backends/triton_scores.py`: tropical score backend dispatch
+- `backends/tilelang_route.py`: optional fused TileLang inference route/code backend
 - `examples/emnist.py`: EMNIST training example for `tropical` and `pairwise`
 - `tools/benchmark.py`: backend benchmark for `TropLinear`
 - `tools/profile.py`: forward profiler for `tropical` and `pairwise`
@@ -53,6 +54,9 @@ x = torch.randn(8, 256)
 
 tropical = TropLinear(256, 512, heads=32, cells=4, code_dim=32)
 print(tropical(x).shape)
+
+tropical_tilelang = TropLinear(256, 512, heads=32, cells=4, code_dim=32, backend="tilelang")
+print(tropical_tilelang(x).shape)
 
 pairwise = PairwiseLinear(256, 512, tables=16, comparisons=6)
 print(pairwise(x).shape)
@@ -80,6 +84,10 @@ uv run python -m tropnn.examples.emnist \
 ```
 
 Pairwise uses the same script with `--family pairwise --pairwise-tables 136 --comparisons 6`.
+
+`backend="tilelang"` is an explicit inference backend for `TropLinear`. It fuses hard routing and selected-code accumulation without materializing the full score tensor. Training with `backend="tilelang"` falls back to the torch route path to preserve autograd. If TileLang compilation fails, ensure a CUDA toolkit compatible with the GPU is first on `PATH` and export `CC=/usr/bin/gcc CXX=/usr/bin/g++`.
+
+CPU inference currently uses the torch path. The TileLang wheel used here exposes CUDA compilation, but not LLVM CPU codegen; for CPU deployment, benchmark `torch.compile(layer.eval(), mode="reduce-overhead")` instead of `backend="tilelang"`.
 
 ## Profiling
 

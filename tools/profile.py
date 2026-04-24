@@ -235,7 +235,7 @@ def main() -> None:
     parser.add_argument("--tropical-heads", type=int, default=32)
     parser.add_argument("--tropical-cells", type=int, default=4)
     parser.add_argument("--tropical-code-dim", type=int, default=32)
-    parser.add_argument("--tropical-backend", choices=("torch", "auto", "triton"), default="torch")
+    parser.add_argument("--tropical-backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
     parser.add_argument("--pairwise-hidden", type=int, default=128)
     parser.add_argument("--pairwise-tables", type=int, default=72)
     parser.add_argument("--pairwise-comparisons", type=int, default=6)

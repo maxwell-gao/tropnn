@@ -215,7 +215,7 @@ def main() -> None:
         ("--comparisons", int, 6),
     ):
         parser.add_argument(name, type=arg_type, default=default)
-    parser.add_argument("--backend", choices=("torch", "auto", "triton"), default="torch")
+    parser.add_argument("--backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
     parser.add_argument("--max-train", type=int, default=None)
     parser.add_argument("--max-test", type=int, default=None)
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))

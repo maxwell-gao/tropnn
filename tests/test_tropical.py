@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from tropnn import TropLinear
-from tropnn.backend import trop_scores_reference
+from tropnn.backend import trop_scores, trop_scores_reference
 
 
 def test_trop_linear_shapes_for_2d_and_3d_inputs() -> None:
@@ -75,3 +76,26 @@ def test_trop_scores_reference_uses_native_head_cell_shape() -> None:
 
     assert scores.shape == (2, 3, 7, 4)
     assert torch.allclose(scores, torch.einsum("bsr,hkr->bshk", z, router_weight) + router_bias.view(1, 1, 7, 4))
+
+
+def test_tilelang_score_backend_is_fused_only() -> None:
+    z = torch.randn(2, 3, 5)
+    router_weight = torch.randn(7, 4, 5)
+    router_bias = torch.randn(7, 4)
+
+    with pytest.raises(RuntimeError, match="fused TropLinear inference backend"):
+        trop_scores(z, router_weight, router_bias, backend="tilelang")
+
+
+def test_trop_linear_tilelang_backend_trains_with_torch_fallback() -> None:
+    layer = TropLinear(6, 4, heads=3, cells=4, code_dim=5, backend="tilelang", seed=0)
+    x = torch.randn(8, 2, 6, requires_grad=True)
+
+    layer.train()
+    y = layer(x)
+    loss = y.square().mean()
+    loss.backward()
+
+    assert x.grad is not None
+    assert layer.router_weight.grad is not None
+    assert layer.code.grad is not None

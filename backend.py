@@ -5,7 +5,7 @@ from typing import Literal
 import torch
 from torch import Tensor
 
-Backend = Literal["auto", "torch", "triton"]
+Backend = Literal["auto", "torch", "triton", "tilelang"]
 
 
 def _requires_grad_path(*tensors: Tensor) -> bool:
@@ -18,11 +18,19 @@ def has_triton() -> bool:
     return _has_triton()
 
 
+def has_tilelang() -> bool:
+    from .backends import has_tilelang as _has_tilelang
+
+    return _has_tilelang()
+
+
 def trop_scores_reference(z: Tensor, router_weight: Tensor, router_bias: Tensor) -> Tensor:
     return torch.einsum("bsr,hkr->bshk", z, router_weight) + router_bias.unsqueeze(0).unsqueeze(0)
 
 
 def trop_scores(z: Tensor, router_weight: Tensor, router_bias: Tensor, backend: Backend = "torch") -> Tensor:
+    if backend == "tilelang":
+        raise RuntimeError("backend='tilelang' is a fused TropLinear inference backend, not a standalone score backend")
     if backend == "triton" and _requires_grad_path(z, router_weight, router_bias):
         raise RuntimeError("backend='triton' does not support autograd; use backend='auto' or 'torch' for training")
     if backend == "triton":
