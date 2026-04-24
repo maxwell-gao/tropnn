@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..layers import PairwiseLinear, TropLinear
+from ..layers import PairwiseLinear, TropDeltaLinear, TropLinear, TropLUTLinear, TropSharedLowRankLinear
 
 IDX_DTYPES = {
     0x08: np.uint8,
@@ -29,6 +29,8 @@ IDX_DTYPES = {
     0x0E: np.dtype(">f8"),
 }
 EMNIST_SPLITS = ("byclass", "bymerge", "balanced", "letters", "digits", "mnist")
+TROPICAL_FAMILIES = ("tropical", "trop_lut", "trop_delta", "trop_shared_lowrank")
+ROUTED_FAMILIES = (*TROPICAL_FAMILIES, "pairwise", "linear")
 
 
 def _read_idx(path: Path) -> np.ndarray:
@@ -99,6 +101,12 @@ def _make_layer(
 ) -> nn.Module:
     if family == "tropical":
         return TropLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
+    if family == "trop_lut":
+        return TropLUTLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
+    if family == "trop_delta":
+        return TropDeltaLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
+    if family == "trop_shared_lowrank":
+        return TropSharedLowRankLinear(d_in, d_out, tables=tables, groups=groups, cells=cells, rank=rank, backend=backend, seed=seed)
     if family == "linear":
         layer = nn.Linear(d_in, d_out)
         nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
@@ -171,6 +179,21 @@ class EmnistTropClassifier(EmnistRoutedClassifier):
         super().__init__(family="tropical", comparisons=4, **kwargs)
 
 
+class EmnistTropLUTClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="trop_lut", comparisons=4, **kwargs)
+
+
+class EmnistTropDeltaClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="trop_delta", comparisons=4, **kwargs)
+
+
+class EmnistTropSharedLowRankClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="trop_shared_lowrank", comparisons=4, **kwargs)
+
+
 class EmnistPairwiseClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
         super().__init__(family="pairwise", groups=1, cells=2, rank=1, backend="torch", **kwargs)
@@ -221,7 +244,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--split", choices=EMNIST_SPLITS, default="digits")
-    parser.add_argument("--family", choices=("tropical", "pairwise", "linear"), default="tropical")
+    parser.add_argument("--family", choices=ROUTED_FAMILIES, default="tropical")
     for name, arg_type, default in (
         ("--epochs", int, 10),
         ("--batch-size", int, 256),
@@ -292,12 +315,12 @@ def main() -> None:
         "depth": args.depth,
         "hidden_dim": args.hidden_dim,
         "tables": args.tables if args.family != "linear" else "-",
-        "groups": args.groups if args.family == "tropical" else "-",
-        "cells": args.cells if args.family == "tropical" else "-",
-        "rank": args.rank if args.family == "tropical" else "-",
+        "groups": args.groups if args.family in TROPICAL_FAMILIES else "-",
+        "cells": args.cells if args.family in TROPICAL_FAMILIES else "-",
+        "rank": args.rank if args.family in TROPICAL_FAMILIES else "-",
         "comparisons": args.comparisons if args.family == "pairwise" else "-",
         "activation": args.activation if args.family == "linear" else "-",
-        "backend": args.backend if args.family == "tropical" else "torch",
+        "backend": args.backend if args.family in TROPICAL_FAMILIES else "torch",
         "train/test": f"{len(x_train)}/{len(x_test)}",
         "device": device.type,
         "params": sum(param.numel() for param in model.parameters()),

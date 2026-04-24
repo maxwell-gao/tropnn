@@ -34,6 +34,18 @@ class RoutedLinearBase(nn.Module, ABC):
     def _compute_dtype(self, x: Tensor) -> torch.dtype:
         return torch.float32 if x.dtype in {torch.float16, torch.bfloat16} else x.dtype
 
+    def _route_chunk_size(
+        self,
+        *,
+        item_count: int,
+        payload_width: int,
+        compute_dtype: torch.dtype,
+        route_count: int,
+        target_bytes: int = 16 * 1024 * 1024,
+    ) -> int:
+        bytes_per_route = item_count * payload_width * torch.finfo(compute_dtype).bits // 8
+        return max(1, min(route_count, target_bytes // max(1, bytes_per_route)))
+
     @abstractmethod
     def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
         """Map input to the latent representation used by the routing family."""

@@ -71,11 +71,33 @@ class PairwiseLinear(RoutedLinearBase):
         values = self.lut[table_idx].to(compute_dtype).index_select(0, indices.reshape(-1))
         return values.view(batch, seq, self.out_features)
 
+    def _lookup_chunked(self, indices: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
+        batch, seq, route_count = indices.shape
+        item_count = batch * seq
+        indices_flat = indices.reshape(item_count, route_count)
+        lut_table = self.lut.to(dtype=compute_dtype, device=indices.device).reshape(
+            route_count * self.table_size,
+            self.out_features,
+        )
+        route_chunk = self._route_chunk_size(
+            item_count=item_count,
+            payload_width=self.out_features,
+            compute_dtype=compute_dtype,
+            route_count=route_count,
+        )
+        output = torch.zeros(item_count, self.out_features, device=indices.device, dtype=compute_dtype)
+
+        for route_start in range(0, route_count, route_chunk):
+            route_stop = min(route_start + route_chunk, route_count)
+            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
+            linear_idx = (indices_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
+            selected = lut_table.index_select(0, linear_idx).view(item_count, route_stop - route_start, self.out_features)
+            output = output + selected.sum(dim=1)
+
+        return output.view(batch, seq, self.out_features)
+
     def _lookup_sum(self, indices: Tensor, compute_dtype: torch.dtype) -> Tensor:
-        output = torch.zeros(*indices.shape[:2], self.out_features, device=indices.device, dtype=compute_dtype)
-        for table_idx in range(indices.shape[-1]):
-            output = output + self._select_rows(table_idx, indices[:, :, table_idx], compute_dtype)
-        return output
+        return self._lookup_chunked(indices, compute_dtype=compute_dtype)
 
     def _compute_indices(self, latent: Tensor) -> tuple[Tensor, Tensor]:
         batch, seq, _ = latent.shape
@@ -93,24 +115,64 @@ class PairwiseLinear(RoutedLinearBase):
         neighbor_indices = indices ^ (2**r_mins).long()
         ste_delta = ste_heaviside(u_mins) - (u_mins > 0).to(u_mins.dtype)
 
-        corr = torch.zeros(*indices.shape[:2], self.out_features, device=indices.device, dtype=torch.float32)
-        for table_idx in range(indices.shape[-1]):
-            current = self._select_rows(table_idx, indices[:, :, table_idx], torch.float32)
-            neighbor = self._select_rows(table_idx, neighbor_indices[:, :, table_idx], torch.float32)
-            corr = corr + ste_delta[:, :, table_idx].unsqueeze(-1).float() * (neighbor - current)
-        return corr
+        batch, seq, route_count = indices.shape
+        item_count = batch * seq
+        current_flat = indices.reshape(item_count, route_count)
+        neighbor_flat = neighbor_indices.reshape(item_count, route_count)
+        ste_flat = ste_delta.reshape(item_count, route_count, 1).float()
+        lut_table = self.lut.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
+        route_chunk = self._route_chunk_size(
+            item_count=item_count,
+            payload_width=self.out_features,
+            compute_dtype=torch.float32,
+            route_count=route_count,
+        )
+        corr = torch.zeros(item_count, self.out_features, device=indices.device, dtype=torch.float32)
+
+        for route_start in range(0, route_count, route_chunk):
+            route_stop = min(route_start + route_chunk, route_count)
+            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
+            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
+            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
+            current = lut_table.index_select(0, current_idx).view(item_count, route_stop - route_start, self.out_features)
+            neighbor = lut_table.index_select(0, neighbor_idx).view(item_count, route_stop - route_start, self.out_features)
+            corr = corr + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=1)
+
+        return corr.view(batch, seq, self.out_features)
 
     def _full_ste(self, indices: Tensor, margins: Tensor) -> Tensor:
-        corr = torch.zeros(*indices.shape[:2], self.out_features, device=indices.device, dtype=torch.float32)
-        for table_idx in range(indices.shape[-1]):
-            current = self._select_rows(table_idx, indices[:, :, table_idx], torch.float32)
-            for comp_idx in range(self.comparisons):
-                neighbor_idx = indices[:, :, table_idx] ^ self.powers[comp_idx]
-                neighbor = self._select_rows(table_idx, neighbor_idx, torch.float32)
-                margin = margins[:, :, table_idx, comp_idx]
-                ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
-                corr = corr + ste_delta.unsqueeze(-1).float() * (neighbor - current)
-        return corr
+        batch, seq, route_count = indices.shape
+        item_count = batch * seq
+        current_flat = indices.reshape(item_count, route_count)
+        neighbor_flat = current_flat.unsqueeze(-1) ^ self.powers.view(1, 1, -1)
+        ste_delta = ste_heaviside(margins) - (margins > 0).to(margins.dtype)
+        ste_flat = ste_delta.reshape(item_count, route_count, self.comparisons, 1).float()
+        lut_table = self.lut.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
+        route_chunk = self._route_chunk_size(
+            item_count=item_count,
+            payload_width=self.out_features * (self.comparisons + 1),
+            compute_dtype=torch.float32,
+            route_count=route_count,
+            target_bytes=8 * 1024 * 1024,
+        )
+        corr = torch.zeros(item_count, self.out_features, device=indices.device, dtype=torch.float32)
+
+        for route_start in range(0, route_count, route_chunk):
+            route_stop = min(route_start + route_chunk, route_count)
+            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
+            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
+            current = lut_table.index_select(0, current_idx).view(item_count, route_stop - route_start, 1, self.out_features)
+            neighbor_offsets = route_offsets.unsqueeze(-1)
+            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + neighbor_offsets).reshape(-1)
+            neighbor = lut_table.index_select(0, neighbor_idx).view(
+                item_count,
+                route_stop - route_start,
+                self.comparisons,
+                self.out_features,
+            )
+            corr = corr + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=(1, 2))
+
+        return corr.view(batch, seq, self.out_features)
 
     def _route_output(
         self,

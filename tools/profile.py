@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from ..examples.emnist import EmnistRoutedClassifier
+from ..examples.emnist import TROPICAL_FAMILIES, EmnistRoutedClassifier
 
 
 def _sync_if_cuda(device: torch.device) -> None:
@@ -109,7 +109,7 @@ def profile_family_forward(
         rank=rank,
         comparisons=comparisons,
         activation=activation,
-        backend=backend if family == "tropical" else "torch",
+        backend=backend if family in TROPICAL_FAMILIES else "torch",
         seed=seed,
         device=dev,
     )
@@ -144,12 +144,12 @@ def profile_family_forward(
         "out_features": out_features,
         "depth": depth,
         "tables": tables if family != "linear" else None,
-        "groups": groups if family == "tropical" else None,
-        "cells": cells if family == "tropical" else None,
-        "rank": rank if family == "tropical" else None,
+        "groups": groups if family in TROPICAL_FAMILIES else None,
+        "cells": cells if family in TROPICAL_FAMILIES else None,
+        "rank": rank if family in TROPICAL_FAMILIES else None,
         "comparisons": comparisons if family == "pairwise" else None,
         "activation": activation if family == "linear" else None,
-        "backend": backend if family == "tropical" else "torch",
+        "backend": backend if family in TROPICAL_FAMILIES else "torch",
         "params": int(sum(param.numel() for param in model.parameters())),
         "wall_ms": wall_ms,
         "peak_device_memory_bytes": int(torch.cuda.max_memory_allocated(dev)) if use_cuda else 0,
@@ -183,6 +183,60 @@ def profile_family_set(
     return {
         "tropical": profile_family_forward(
             "tropical",
+            batch_size=batch_size,
+            input_dim=input_dim,
+            hidden_dim=tropical_hidden,
+            out_features=out_features,
+            depth=depth,
+            tables=tropical_tables,
+            groups=tropical_groups,
+            cells=tropical_cells,
+            rank=tropical_rank,
+            backend=tropical_backend,
+            warmup=warmup,
+            seed=seed,
+            dtype=dtype,
+            device=device,
+            top_ops=top_ops,
+        ),
+        "trop_lut": profile_family_forward(
+            "trop_lut",
+            batch_size=batch_size,
+            input_dim=input_dim,
+            hidden_dim=tropical_hidden,
+            out_features=out_features,
+            depth=depth,
+            tables=tropical_tables,
+            groups=tropical_groups,
+            cells=tropical_cells,
+            rank=tropical_rank,
+            backend=tropical_backend,
+            warmup=warmup,
+            seed=seed,
+            dtype=dtype,
+            device=device,
+            top_ops=top_ops,
+        ),
+        "trop_delta": profile_family_forward(
+            "trop_delta",
+            batch_size=batch_size,
+            input_dim=input_dim,
+            hidden_dim=tropical_hidden,
+            out_features=out_features,
+            depth=depth,
+            tables=tropical_tables,
+            groups=tropical_groups,
+            cells=tropical_cells,
+            rank=tropical_rank,
+            backend=tropical_backend,
+            warmup=warmup,
+            seed=seed,
+            dtype=dtype,
+            device=device,
+            top_ops=top_ops,
+        ),
+        "trop_shared_lowrank": profile_family_forward(
+            "trop_shared_lowrank",
             batch_size=batch_size,
             input_dim=input_dim,
             hidden_dim=tropical_hidden,
@@ -238,16 +292,11 @@ def _print_summary(results: dict[str, Any]) -> None:
         )
         for row in summary["top_ops"]:
             time_us = row["device_time_us"] if summary["device"] == "cuda" else row["self_cpu_time_us"]
-            print(
-                f"  {row['name']:<36} calls={row['calls']:<4d} self_time_us={time_us:>10.1f} "
-                f"self_device_mem={row['self_device_memory_bytes']}"
-            )
+            print(f"  {row['name']:<36} calls={row['calls']:<4d} self_time_us={time_us:>10.1f} self_device_mem={row['self_device_memory_bytes']}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Profile tropical, pairwise, and linear forward paths with torch.profiler."
-    )
+    parser = argparse.ArgumentParser(description="Profile tropical, pairwise, and linear forward paths with torch.profiler.")
     for name, default in (
         ("--batch-size", 512),
         ("--input-dim", 28 * 28),

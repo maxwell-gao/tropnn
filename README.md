@@ -1,19 +1,19 @@
 # tropnn
 `tropnn` is a minimal teaching-oriented routed neural layer library.
 
-It exposes two sibling routed building blocks, `TropLinear` and `PairwiseLinear`, plus a small dense baseline path in the EMNIST example for matched-budget comparisons.
+It exposes routed building blocks for tropical and pairwise comparisons, plus a small dense baseline path in the EMNIST example for matched-budget comparisons.
 
 The scope is narrow: hard chamber selection at inference, a local min-face surrogate during training, a readable reference path, and an optional Triton score kernel for the hottest routing step. Examples and benchmarking stay outside the core layer.
 
 ## Core Idea
 
-For each group, the layer computes affine scores
+For each tropical group, the layer computes affine scores
 
 $$
 i_g(x) = \arg\max_k s_{gk}(Px),
 $$
 
-then selects one chamber-affine branch per group and sums them:
+The original `TropLinear` selects one chamber-affine branch per group and sums them:
 
 $$
 y(x) = \sum_{t,g} \bigl(A_{tg,i_g(x)} Px + b_{tg,i_g(x)}\bigr).
@@ -37,13 +37,19 @@ $$
 
 Inference remains fully hard. Only the training path uses the local surrogate.
 
+The package also includes three sparse/shared tropical payload variants for ablations:
+
+- `TropLUTLinear`: pure selected-vector payload, `sum v[t,g,i_g]`.
+- `TropDeltaLinear`: selected-vector payload plus one shared latent dense trunk.
+- `TropSharedLowRankLinear`: selected scalar-gated vector payload, avoiding a full per-chamber `rank x out_features` matrix.
+
 ## Package Layout
 
 - `__init__.py`: public API
 - `backend.py`: backend selection and score dispatch boundary
 - `backends/triton_scores.py`: optional Triton score kernel
 - `layers/base.py`: shared shell for routed linear layers
-- `layers/tropical.py`: `TropLinear` concrete implementation
+- `layers/tropical.py`: `TropLinear` and tropical payload variant implementations
 - `layers/pairwise.py`: `PairwiseLinear` concrete implementation
 - `layers/surrogate.py`: tiny shared STE helper for discrete families
 - `module.py`: compatibility re-export for `TropLinear`
@@ -71,7 +77,7 @@ Basic usage:
 
 ```python
 import torch
-from tropnn import PairwiseLinear, TropLinear
+from tropnn import PairwiseLinear, TropDeltaLinear, TropLinear, TropLUTLinear, TropSharedLowRankLinear
 
 layer = TropLinear(
     256,
@@ -88,6 +94,9 @@ print(y.shape)
 
 pairwise = PairwiseLinear(256, 512, tables=16, comparisons=6)
 print(pairwise(x).shape)
+
+for cls in (TropLUTLinear, TropDeltaLinear, TropSharedLowRankLinear):
+    print(cls(256, 512, tables=16, groups=2, cells=4, rank=32)(x).shape)
 ```
 
 Because `TropLinear` behaves like a basic neural layer, collaborators can stack it directly into MLPs, residual blocks, or recurrent modules.
@@ -118,7 +127,7 @@ uv run python -m tropnn.examples.emnist \
   --seed 0
 ```
 
-Pairwise uses the same script with `--family pairwise --comparisons 6`. A dense baseline uses `--family linear --activation gelu`.
+Pairwise uses the same script with `--family pairwise --comparisons 6`. A dense baseline uses `--family linear --activation gelu`. Tropical payload ablations use `--family trop_lut`, `--family trop_delta`, or `--family trop_shared_lowrank`.
 
 On the same setup used in the original experiment path, this reproduces:
 
