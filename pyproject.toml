@@ -1,12 +1,12 @@
 [project]
 name = "tropnn"
 version = "0.1.0"
-description = "Minimal tropical min-face neural layer library"
+description = "Minimal tropical neural layer library"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "LutFlow Team" }
+    { name = "Senquan(Maxwell) Gao" }
 ]
 keywords = ["tropical", "neural-network", "torch", "triton", "teaching"]
 classifiers = [
