@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from ..backend import has_triton, trop_scores, trop_scores_reference
-from ..module import TropLinear
+from ..layers import TropLinear
 
 
 def _copy_weights(dst: TropLinear, src: TropLinear) -> None:
@@ -128,15 +128,18 @@ def benchmark_trop_linear_auto(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark TropLinear backend='auto' against backend='torch'.")
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--in-features", type=int, default=28 * 28)
-    parser.add_argument("--out-features", type=int, default=128)
-    parser.add_argument("--tables", type=int, default=16)
-    parser.add_argument("--groups", type=int, default=2)
-    parser.add_argument("--cells", type=int, default=4)
-    parser.add_argument("--rank", type=int, default=32)
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--steps", type=int, default=100)
+    for name, default in (
+        ("--batch-size", 512),
+        ("--in-features", 28 * 28),
+        ("--out-features", 128),
+        ("--tables", 16),
+        ("--groups", 2),
+        ("--cells", 4),
+        ("--rank", 32),
+        ("--warmup", 20),
+        ("--steps", 100),
+    ):
+        parser.add_argument(name, type=int, default=default)
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -155,14 +158,9 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
     )
-    print(f"score_torch_ms={result['score_torch_ms']:.4f}")
-    print(f"score_auto_ms={result['score_auto_ms']:.4f}")
-    print(f"score_speedup={result['score_speedup']:.4f}")
-    print(f"score_max_diff={result['score_max_diff']:.6f}")
-    print(f"torch_ms={result['torch_ms']:.4f}")
-    print(f"auto_ms={result['auto_ms']:.4f}")
-    print(f"speedup={result['speedup']:.4f}")
-    print(f"max_diff={result['max_diff']:.6f}")
+    for key in ("score_torch_ms", "score_auto_ms", "score_speedup", "score_max_diff", "torch_ms", "auto_ms", "speedup", "max_diff"):
+        precision = 6 if "diff" in key else 4
+        print(f"{key}={result[key]:.{precision}f}")
 
 
 if __name__ == "__main__":

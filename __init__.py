@@ -1,3 +1,3 @@
-from .module import TropLinear
+from .layers import RoutedLinearBase, TropLinear
 
-__all__ = ["TropLinear"]
+__all__ = ["RoutedLinearBase", "TropLinear"]

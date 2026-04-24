@@ -1,20 +1,4 @@
-"""Train a minimal trop_minface classifier on a locally downloaded EMNIST split.
-
-Example:
-
-    uv run python -m tropnn.examples.emnist \
-        --root /path/to/emnist \
-        --split digits \
-        --epochs 3 \
-        --batch-size 512 \
-        --lr 1e-3 \
-        --tables 16 \
-        --hidden-dim 128 \
-        --depth 2 \
-        --groups 2 \
-        --cells 4 \
-        --rank 32
-"""
+"""Train a minimal trop_minface classifier on a local EMNIST split."""
 
 from __future__ import annotations
 
@@ -33,7 +17,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..module import TropLinear
+from ..layers import TropLinear
 
 IDX_DTYPES = {
     0x08: np.uint8,
@@ -134,39 +118,31 @@ class EmnistTropClassifier(nn.Module):
         return x.squeeze(1)
 
 
-def _evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[float, float]:
-    model.eval()
+def _run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> tuple[float, float]:
+    model.train(mode=optimizer is not None)
     total_loss = 0.0
     total_correct = 0
     total_items = 0
-    with torch.no_grad():
+    context = torch.enable_grad() if optimizer is not None else torch.no_grad()
+    with context:
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
             logits = model(x)
             loss = F.cross_entropy(logits, y)
+            if optimizer is not None:
+                loss.backward()
+                optimizer.step()
             total_loss += float(loss.item()) * x.shape[0]
             total_correct += int((logits.argmax(dim=-1) == y).sum().item())
             total_items += x.shape[0]
-    return total_loss / total_items, total_correct / total_items
-
-
-def _iter_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device) -> tuple[float, float]:
-    model.train()
-    total_loss = 0.0
-    total_correct = 0
-    total_items = 0
-    for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = F.cross_entropy(logits, y)
-        loss.backward()
-        optimizer.step()
-        total_loss += float(loss.item()) * x.shape[0]
-        total_correct += int((logits.argmax(dim=-1) == y).sum().item())
-        total_items += x.shape[0]
     return total_loss / total_items, total_correct / total_items
 
 
@@ -182,15 +158,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--split", choices=EMNIST_SPLITS, default="digits")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=3e-3)
-    parser.add_argument("--tables", type=int, default=16)
-    parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--depth", type=int, default=2)
-    parser.add_argument("--groups", type=int, default=2)
-    parser.add_argument("--cells", type=int, default=4)
-    parser.add_argument("--rank", type=int, default=32)
+    for name, arg_type, default in (
+        ("--epochs", int, 10),
+        ("--batch-size", int, 256),
+        ("--lr", float, 3e-3),
+        ("--tables", int, 16),
+        ("--hidden-dim", int, 256),
+        ("--depth", int, 2),
+        ("--groups", int, 2),
+        ("--cells", int, 4),
+        ("--rank", int, 32),
+    ):
+        parser.add_argument(name, type=arg_type, default=default)
     parser.add_argument("--backend", choices=("torch", "auto", "triton"), default="torch")
     parser.add_argument("--max-train", type=int, default=None)
     parser.add_argument("--max-test", type=int, default=None)
@@ -237,38 +216,30 @@ def main() -> None:
     train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(TensorDataset(x_test, y_test), batch_size=args.batch_size, shuffle=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
-
-    print(
-        f"EMNIST tropnn\n"
-        f"  root       : {args.root}\n"
-        f"  split      : {args.split}\n"
-        f"  layer      : trop_minface\n"
-        f"  depth      : {args.depth}\n"
-        f"  hidden_dim : {args.hidden_dim}\n"
-        f"  tables     : {args.tables}\n"
-        f"  groups     : {args.groups}\n"
-        f"  cells      : {args.cells}\n"
-        f"  rank       : {args.rank}\n"
-        f"  backend    : {args.backend}\n"
-        f"  train/test : {len(x_train)}/{len(x_test)}\n"
-        f"  device     : {device.type}\n"
-        f"  params     : {sum(param.numel() for param in model.parameters())}\n"
-    )
+    config_lines = {
+        "root": args.root,
+        "split": args.split,
+        "layer": "trop_minface",
+        "depth": args.depth,
+        "hidden_dim": args.hidden_dim,
+        "tables": args.tables,
+        "groups": args.groups,
+        "cells": args.cells,
+        "rank": args.rank,
+        "backend": args.backend,
+        "train/test": f"{len(x_train)}/{len(x_test)}",
+        "device": device.type,
+        "params": sum(param.numel() for param in model.parameters()),
+    }
+    config_text = "\n".join(f"  {key:<10} : {value}" for key, value in config_lines.items())
+    print(f"EMNIST tropnn\n{config_text}\n")
 
     rows: list[dict] = []
     t0 = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = _iter_epoch(model, train_loader, optimizer, device)
-        test_loss, test_acc = _evaluate(model, test_loader, device)
-        rows.append(
-            {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "train_acc": train_acc,
-                "test_loss": test_loss,
-                "test_acc": test_acc,
-            }
-        )
+        train_loss, train_acc = _run_epoch(model, train_loader, device, optimizer)
+        test_loss, test_acc = _run_epoch(model, test_loader, device)
+        rows.append({"epoch": epoch, "train_loss": train_loss, "train_acc": train_acc, "test_loss": test_loss, "test_acc": test_acc})
         print(f"epoch {epoch:>3d} | train_loss={train_loss:.4f} train_acc={train_acc:.4f} | test_loss={test_loss:.4f} test_acc={test_acc:.4f}")
 
     repo_root = Path(__file__).resolve().parents[4]

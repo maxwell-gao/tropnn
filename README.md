@@ -1,19 +1,9 @@
 # tropnn
-
 `tropnn` is a minimal teaching-oriented tropical neural layer library.
 
-It exposes one basic building block, `TropLinear`, meant to play the same role for tropical min-face networks that `nn.Linear` plays for dense networks.
+It exposes one basic building block, `TropLinear`, for tropical min-face networks in the role that `nn.Linear` plays for dense networks.
 
-The design target is intentionally narrow:
-
-- hard chamber selection at inference time,
-- local min-face surrogate during training,
-- a small reference implementation that collaborators can read in one sitting,
-- an optional Triton score kernel that accelerates the hottest routing path without changing semantics.
-
-This package is intended to be the seed of a standalone repository for collaborators who want to build other neural networks, such as MLPs or RNNs, out of the same `trop_minface` primitive.
-
-The library core is intentionally small: `__init__.py`, `backend.py`, `functional.py`, `module.py`, and `backends/triton_scores.py` together stay well under 600 lines. Examples and benchmarking live outside that core layer.
+The scope is narrow: hard chamber selection at inference, a local min-face surrogate during training, a readable reference path, and an optional Triton score kernel for the hottest routing step. Examples and benchmarking stay outside the core layer.
 
 ## Core Idea
 
@@ -52,12 +42,13 @@ Inference remains fully hard. Only the training path uses the local surrogate.
 - `__init__.py`: public API
 - `backend.py`: backend selection and score dispatch boundary
 - `backends/triton_scores.py`: optional Triton score kernel
-- `module.py`: `TropLinear`
-- `functional.py`: stateless tensor operations and min-face logic
+- `layers/base.py`: shared shell for routed linear layers
+- `layers/tropical.py`: `TropLinear` concrete implementation
+- `module.py`: compatibility re-export for `TropLinear`
 - `examples/emnist.py`: self-contained EMNIST training example
 - `tools/benchmark.py`: benchmarking helper and CLI
 
-The reference implementation lives in `functional.py` and `module.py`. `backend.py` is the only place that chooses between reference and accelerated paths. Triton is optional and should be treated as an optimization layer, not the source of truth.
+The reference implementation lives in `layers/base.py` and `layers/tropical.py`. `backend.py` is the only place that chooses between reference and accelerated paths. Triton is optional and should be treated as an optimization layer, not the source of truth.
 
 ## Quick Start
 
@@ -127,35 +118,20 @@ On the same setup used in the original experiment path, this reproduces:
 - epoch 3: `test_loss=0.2641`, `test_acc=0.9223`
 
 ## Triton
-
 `backends/triton_scores.py` contains an optional score kernel for the grouped affine routing scores. If Triton is not available, or if the environment cannot compile Triton launchers, the package falls back to the pure PyTorch reference path.
 
-Recommended usage:
-
-- `backend="torch"` for correctness and teaching
-- `backend="auto"` for practical use on CUDA
-- `backend="triton"` only when the environment is known to support Triton compilation
+- `backend="torch"`: correctness and teaching
+- `backend="auto"`: practical CUDA inference
+- `backend="triton"`: only when launcher compilation is known to work
 
 ## Reading Order
 
-For collaborators, the recommended reading order is:
-
-1. `functional.py`
-2. `module.py`
-3. `backend.py`
-4. `examples/emnist.py`
-5. `backends/triton_scores.py`
-6. `tools/benchmark.py`
-
-This keeps the mathematical semantics separate from the acceleration path.
+For collaborators, the recommended reading order is `layers/base.py`, `layers/tropical.py`, `backend.py`, `examples/emnist.py`, `backends/triton_scores.py`, then `tools/benchmark.py`.
 
 ## Scope
-
 This package is deliberately minimal. It does not attempt to include:
 
 - pairwise or sparse comparators,
 - experiment naming or benchmark orchestration,
 - multiple surrogate families,
 - large training frameworks.
-
-The goal is to keep the core layer understandable, reusable, and easy to adapt into new architectures.
