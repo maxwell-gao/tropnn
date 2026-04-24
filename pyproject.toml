@@ -22,17 +22,20 @@ classifiers = [
 dependencies = [
     "numpy>=2.2.6",
     "torch>=2.9.1",
-    "triton",
 ]
 
 [project.optional-dependencies]
+triton = [
+    "triton",
+]
 dev = [
     "pytest>=9.0.2",
     "ruff>=0.1.0",
 ]
 
 [project.scripts]
-tropnn-emnist = "tropnn.example_emnist:main"
+tropnn-emnist = "tropnn.examples.emnist:main"
+tropnn-benchmark = "tropnn.tools.benchmark:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

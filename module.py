@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .functional import Backend, trop_minface_eval_output, trop_minface_training_output, trop_scores
+from .backend import Backend, trop_scores
+from .functional import trop_minface_eval_output, trop_minface_training_output
 
 
 class TropLinear(nn.Module):

@@ -1,25 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
-
-import torch
 from torch import Tensor
-
-from .triton_ops import has_triton, trop_scores_triton
-
-Backend = Literal["auto", "torch", "triton"]
-
-
-def trop_scores_reference(z: Tensor, router_weight: Tensor, router_bias: Tensor) -> Tensor:
-    return torch.einsum("bsr,tgkr->bstgk", z, router_weight) + router_bias.unsqueeze(0).unsqueeze(0)
-
-
-def trop_scores(z: Tensor, router_weight: Tensor, router_bias: Tensor, backend: Backend = "torch") -> Tensor:
-    if backend == "triton":
-        return trop_scores_triton(z, router_weight, router_bias)
-    if backend == "auto" and z.is_cuda and has_triton():
-        return trop_scores_triton(z, router_weight, router_bias)
-    return trop_scores_reference(z, router_weight, router_bias)
 
 
 def minface_uncertainty(margins: Tensor) -> Tensor:

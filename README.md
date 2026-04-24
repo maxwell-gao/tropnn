@@ -13,6 +13,8 @@ The design target is intentionally narrow:
 
 This package is intended to be the seed of a standalone repository for collaborators who want to build other neural networks, such as MLPs or RNNs, out of the same `trop_minface` primitive.
 
+The library core is intentionally small: `__init__.py`, `backend.py`, `functional.py`, `module.py`, and `backends/triton_scores.py` together stay well under 600 lines. Examples and benchmarking live outside that core layer.
+
 ## Core Idea
 
 For each group, the layer computes affine scores
@@ -48,19 +50,27 @@ Inference remains fully hard. Only the training path uses the local surrogate.
 ## Package Layout
 
 - `__init__.py`: public API
+- `backend.py`: backend selection and score dispatch boundary
+- `backends/triton_scores.py`: optional Triton score kernel
 - `module.py`: `TropLinear`
 - `functional.py`: stateless tensor operations and min-face logic
-- `triton_ops.py`: optional Triton score kernel
-- `example_emnist.py`: self-contained EMNIST training example
+- `examples/emnist.py`: self-contained EMNIST training example
+- `tools/benchmark.py`: benchmarking helper and CLI
 
-The reference implementation lives in `functional.py` and `module.py`. Triton is optional and should be treated as an optimization layer, not the source of truth.
+The reference implementation lives in `functional.py` and `module.py`. `backend.py` is the only place that chooses between reference and accelerated paths. Triton is optional and should be treated as an optimization layer, not the source of truth.
 
 ## Quick Start
 
-Install from this directory:
+Install the core library from this directory:
 
 ```bash
 uv pip install -e .
+```
+
+Install with Triton acceleration enabled:
+
+```bash
+uv pip install -e ".[triton]"
 ```
 
 Basic usage:
@@ -92,7 +102,7 @@ The package includes a small example that reproduces the `trop_minface` EMNIST e
 Run:
 
 ```bash
-uv run python -m tropnn.example_emnist \
+uv run python -m tropnn.examples.emnist \
   --root /path/to/emnist \
   --split digits \
   --epochs 3 \
@@ -118,7 +128,7 @@ On the same setup used in the original experiment path, this reproduces:
 
 ## Triton
 
-`triton.py` contains an optional score kernel for the grouped affine routing scores. If Triton is not available, or if the environment cannot compile Triton launchers, the package falls back to the pure PyTorch reference path.
+`backends/triton_scores.py` contains an optional score kernel for the grouped affine routing scores. If Triton is not available, or if the environment cannot compile Triton launchers, the package falls back to the pure PyTorch reference path.
 
 Recommended usage:
 
@@ -132,8 +142,10 @@ For collaborators, the recommended reading order is:
 
 1. `functional.py`
 2. `module.py`
-3. `example_emnist.py`
-4. `triton_ops.py`
+3. `backend.py`
+4. `examples/emnist.py`
+5. `backends/triton_scores.py`
+6. `tools/benchmark.py`
 
 This keeps the mathematical semantics separate from the acceleration path.
 
