@@ -1,0 +1,514 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+from ..layers import PairwiseLinear, TropLinear
+
+FAMILIES = ("paper", "linear", "tropical", "pairwise")
+CODE_SCALE_MODES = ("sqrt", "linear", "none")
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    family: str
+    n_features: int
+    model_dim: int
+    alpha: float
+    activation_density: float
+    batch_size: int
+    steps: int
+    lr: float
+    paper_lr: float
+    weight_decay: float
+    heads: int
+    cells: int
+    code_scale_mode: str
+    pairwise_tables: int
+    comparisons: int
+    seed: int
+    device: str
+    backend: str
+
+
+class PaperFeatureRecovery(nn.Module):
+    def __init__(self, n_features: int, model_dim: int, *, seed: int) -> None:
+        super().__init__()
+        torch.manual_seed(seed)
+        self.n_features = n_features
+        self.model_dim = model_dim
+        self.weight = nn.Parameter(torch.randn(n_features, model_dim) / math.sqrt(model_dim))
+        self.bias = nn.Parameter(torch.zeros(n_features))
+
+    def encode(self, x: Tensor) -> Tensor:
+        return x @ self.weight
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.relu(self.encode(x) @ self.weight.t() + self.bias)
+
+
+class LinearRecovery(nn.Module):
+    def __init__(self, n_features: int, model_dim: int, *, seed: int) -> None:
+        super().__init__()
+        torch.manual_seed(seed)
+        self.encoder = nn.Linear(n_features, model_dim, bias=False)
+        self.decoder = nn.Linear(model_dim, n_features)
+
+    def encode(self, x: Tensor) -> Tensor:
+        return F.relu(self.encoder(x))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.relu(self.decoder(self.encode(x)))
+
+
+def feature_probabilities(n_features: int, alpha: float, activation_density: float, *, device: torch.device) -> Tensor:
+    if n_features < 1:
+        raise ValueError(f"n_features must be >= 1, got {n_features}")
+    if activation_density <= 0:
+        raise ValueError(f"activation_density must be positive, got {activation_density}")
+    ranks = torch.arange(1, n_features + 1, device=device, dtype=torch.float32)
+    probs = ranks.pow(-alpha)
+    probs = probs / probs.sum() * activation_density
+    max_prob = float(probs.max().item())
+    if max_prob > 1.0:
+        raise ValueError(
+            f"activation_density={activation_density} is too high for n_features={n_features}, alpha={alpha}; max probability is {max_prob:.3f}"
+        )
+    return probs
+
+
+def sample_batch(probs: Tensor, batch_size: int, *, generator: torch.Generator | None = None) -> Tensor:
+    active = torch.rand((batch_size, probs.numel()), device=probs.device, generator=generator) < probs.view(1, -1)
+    values = torch.rand((batch_size, probs.numel()), device=probs.device, generator=generator) * 2.0
+    return active.to(values.dtype) * values
+
+
+def _code_scale(heads: int, mode: str) -> float:
+    if mode == "sqrt":
+        return 1.0 / math.sqrt(heads)
+    if mode == "linear":
+        return 1.0 / heads
+    if mode == "none":
+        return 1.0
+    raise ValueError(f"unknown code_scale_mode {mode!r}; expected one of {CODE_SCALE_MODES}")
+
+
+def _build_model(config: RunConfig, device: torch.device) -> nn.Module:
+    if config.family == "paper":
+        return PaperFeatureRecovery(config.n_features, config.model_dim, seed=config.seed).to(device)
+    if config.family == "linear":
+        return LinearRecovery(config.n_features, config.model_dim, seed=config.seed).to(device)
+    if config.family == "tropical":
+        layer = TropLinear(
+            config.n_features,
+            config.n_features,
+            heads=config.heads,
+            cells=config.cells,
+            code_dim=config.model_dim,
+            backend=config.backend,
+            seed=config.seed,
+        )
+        layer.code_scale = _code_scale(config.heads, config.code_scale_mode)
+        return layer.to(device)
+    if config.family == "pairwise":
+        tables = config.pairwise_tables if config.pairwise_tables > 0 else config.model_dim
+        return PairwiseLinear(
+            config.n_features,
+            config.n_features,
+            tables=tables,
+            comparisons=config.comparisons,
+            seed=config.seed,
+        ).to(device)
+    raise ValueError(f"unknown family {config.family!r}")
+
+
+@torch.no_grad()
+def _paper_weight_growth_step(model: nn.Module, lr: float, weight_decay: float, eps: float = 1e-8) -> None:
+    if not isinstance(model, PaperFeatureRecovery):
+        return
+    if weight_decay >= 0:
+        model.weight.mul_(1.0 - lr * weight_decay)
+        return
+    row_norms = model.weight.norm(dim=1, keepdim=True).add_(eps)
+    model.weight.add_(weight_decay * model.weight * (1.0 - 1.0 / row_norms), alpha=lr)
+
+
+def _train_one(config: RunConfig) -> tuple[nn.Module, dict[str, float | int | str]]:
+    device = torch.device(config.device)
+    torch.manual_seed(config.seed)
+    probs = feature_probabilities(config.n_features, config.alpha, config.activation_density, device=device)
+    model = _build_model(config, device)
+    lr = config.paper_lr if config.family == "paper" else config.lr
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+
+    losses: list[float] = []
+    t0 = time.perf_counter()
+    model.train()
+    for _ in range(config.steps):
+        x = sample_batch(probs, config.batch_size)
+        optimizer.zero_grad(set_to_none=True)
+        y = model(x)
+        if y.ndim == 3 and y.shape[1] == 1:
+            y = y.squeeze(1)
+        loss = F.mse_loss(y, x)
+        loss.backward()
+        _paper_weight_growth_step(model, lr=lr, weight_decay=config.weight_decay)
+        optimizer.step()
+        losses.append(float(loss.detach().item()))
+    if device.type == "cuda":
+        torch.cuda.synchronize(device=device)
+    train_ms = (time.perf_counter() - t0) * 1000.0
+
+    return model, {
+        "final_loss": losses[-1],
+        "best_loss": min(losses),
+        "train_ms": train_ms,
+        "params": int(sum(param.numel() for param in model.parameters())),
+    }
+
+
+@torch.no_grad()
+def _representations(model: nn.Module, family: str, n_features: int, device: torch.device, *, batch_size: int = 256) -> Tensor:
+    reps: list[Tensor] = []
+    model.eval()
+    for start in range(0, n_features, batch_size):
+        stop = min(start + batch_size, n_features)
+        x = torch.eye(n_features, device=device)[start:stop]
+        if family == "paper":
+            rep = model.encode(x)  # type: ignore[attr-defined]
+        elif family == "linear":
+            rep = model.encode(x)  # type: ignore[attr-defined]
+        elif family == "tropical":
+            assert isinstance(model, TropLinear)
+            latent = model._project_input(x.unsqueeze(1), torch.float32)
+            scores = model._scores(latent, input_device=device, compute_dtype=torch.float32)
+            winner_idx = scores.argmax(dim=-1)
+            codes = model._selected_codes(winner_idx, input_device=device, compute_dtype=torch.float32)
+            rep = (latent + codes.sum(dim=2) * model.code_scale).squeeze(1)
+        elif family == "pairwise":
+            rep = model(x).squeeze(1)
+        else:
+            raise ValueError(f"unknown family {family!r}")
+        reps.append(rep.detach().float().cpu())
+    return torch.cat(reps, dim=0)
+
+
+def _overlap_metrics(reps: Tensor) -> dict[str, float]:
+    norms = reps.norm(dim=1)
+    represented = norms > max(1e-6, float(norms.median().item()) * 0.1)
+    if int(represented.sum().item()) < 2:
+        return {
+            "represented_fraction": float(represented.float().mean().item()),
+            "mean_squared_overlap": float("nan"),
+            "overlap_variance": float("nan"),
+        }
+    unit = reps[represented] / norms[represented].unsqueeze(1).clamp_min(1e-12)
+    gram2 = (unit @ unit.t()).square()
+    off_diag = gram2[~torch.eye(gram2.shape[0], dtype=torch.bool)]
+    return {
+        "represented_fraction": float(represented.float().mean().item()),
+        "mean_squared_overlap": float(off_diag.mean().item()),
+        "overlap_variance": float(off_diag.var(unbiased=False).item()),
+    }
+
+
+@torch.no_grad()
+def _route_metrics(model: nn.Module, family: str, n_features: int, device: torch.device) -> dict[str, float]:
+    if family == "tropical":
+        assert isinstance(model, TropLinear)
+        x = torch.eye(n_features, device=device)
+        model.eval()
+        model(x)
+        indices = model._last_indices
+        margins = model._last_margins
+        assert indices is not None and margins is not None
+        signatures = indices.squeeze(1).cpu()
+        unique, counts = torch.unique(signatures, dim=0, return_counts=True)
+        probs = counts.float() / counts.sum()
+        entropy = -(probs * probs.log()).sum()
+        return {
+            "route_unique": float(unique.shape[0]),
+            "route_collision_mean": float(counts.float().mean().item()),
+            "route_entropy": float(entropy.item()),
+            "avg_margin": float(margins.float().mean().item()),
+        }
+    if family == "pairwise":
+        x = torch.eye(n_features, device=device)
+        model.eval()
+        model(x)
+        indices = model._last_indices
+        margins = model._last_margins
+        assert indices is not None and margins is not None
+        table_entropies = []
+        unique_counts = []
+        for table in range(indices.shape[-1]):
+            _, counts = torch.unique(indices[:, 0, table].cpu(), return_counts=True)
+            probs = counts.float() / counts.sum()
+            table_entropies.append(float((-(probs * probs.log()).sum()).item()))
+            unique_counts.append(float(counts.numel()))
+        return {
+            "route_unique": sum(unique_counts),
+            "route_collision_mean": float(n_features / max(1.0, sum(unique_counts) / len(unique_counts))),
+            "route_entropy": float(sum(table_entropies) / len(table_entropies)),
+            "avg_margin": float(margins.float().mean().item()),
+        }
+    return {"route_unique": float("nan"), "route_collision_mean": float("nan"), "route_entropy": float("nan"), "avg_margin": float("nan")}
+
+
+def run_config(config: RunConfig) -> dict[str, float | int | str]:
+    model, train_metrics = _train_one(config)
+    device = torch.device(config.device)
+    reps = _representations(model, config.family, config.n_features, device)
+    row: dict[str, float | int | str] = asdict(config)
+    row["effective_pairwise_tables"] = config.pairwise_tables if config.pairwise_tables > 0 else config.model_dim
+    row.update(train_metrics)
+    row.update(_overlap_metrics(reps))
+    row.update(_route_metrics(model, config.family, config.n_features, device))
+    row["overlap_times_dim"] = float(row["mean_squared_overlap"]) * config.model_dim
+    row["loss_per_activation"] = float(row["final_loss"]) / config.activation_density
+    route_unique = float(row["route_unique"])
+    route_entropy = float(row["route_entropy"])
+    if math.isfinite(route_unique) and route_unique > 1 and math.isfinite(route_entropy):
+        row["route_entropy_norm"] = route_entropy / math.log(route_unique)
+    else:
+        row["route_entropy_norm"] = float("nan")
+    return row
+
+
+def _fit_exponents(rows: list[dict[str, float | int | str]]) -> list[dict[str, float | str]]:
+    groups: dict[tuple[str, float, int, int, str, int, int], list[dict[str, float | int | str]]] = {}
+    for row in rows:
+        groups.setdefault(_summary_key(row), []).append(row)
+    summaries: list[dict[str, float | str]] = []
+    for key, group in sorted(groups.items()):
+        family, alpha, heads, cells, code_scale_mode, pairwise_tables, comparisons = key
+        xs = torch.tensor([float(row["model_dim"]) for row in group])
+        ys = torch.tensor([float(row["final_loss"]) for row in group])
+        valid = torch.isfinite(xs) & torch.isfinite(ys) & (xs > 0) & (ys > 0)
+        if int(valid.sum().item()) < 2:
+            beta = float("nan")
+            r2 = float("nan")
+        else:
+            logx = torch.log(xs[valid])
+            logy = torch.log(ys[valid])
+            centered_x = logx - logx.mean()
+            slope = ((centered_x * (logy - logy.mean())).sum() / centered_x.square().sum()).item()
+            pred = logy.mean() + slope * centered_x
+            ss_res = (logy - pred).square().sum()
+            ss_tot = (logy - logy.mean()).square().sum().clamp_min(1e-12)
+            beta = -float(slope)
+            r2 = float((1.0 - ss_res / ss_tot).item())
+        summaries.append(
+            {
+                "family": family,
+                "alpha": alpha,
+                "heads": float(heads),
+                "cells": float(cells),
+                "code_scale_mode": code_scale_mode,
+                "pairwise_tables": float(pairwise_tables),
+                "comparisons": float(comparisons),
+                "beta": beta,
+                "r2": r2,
+                "points": float(len(group)),
+            }
+        )
+    return summaries
+
+
+def _summary_key(row: dict[str, float | int | str]) -> tuple[str, float, int, int, str, int, int]:
+    return (
+        str(row["family"]),
+        float(row["alpha"]),
+        int(row["heads"]),
+        int(row["cells"]),
+        str(row["code_scale_mode"]),
+        int(row["pairwise_tables"]),
+        int(row["comparisons"]),
+    )
+
+
+def _mean_finite(group: list[dict[str, float | int | str]], key: str) -> float:
+    values = torch.tensor([float(row[key]) for row in group])
+    values = values[torch.isfinite(values)]
+    if values.numel() == 0:
+        return float("nan")
+    return float(values.mean().item())
+
+
+def _group_metrics(rows: list[dict[str, float | int | str]]) -> list[dict[str, float | str]]:
+    groups: dict[tuple[str, float, int, int, str, int, int], list[dict[str, float | int | str]]] = {}
+    for row in rows:
+        groups.setdefault(_summary_key(row), []).append(row)
+    summaries: list[dict[str, float | str]] = []
+    for key, group in sorted(groups.items()):
+        family, alpha, heads, cells, code_scale_mode, pairwise_tables, comparisons = key
+        summaries.append(
+            {
+                "family": family,
+                "alpha": alpha,
+                "heads": float(heads),
+                "cells": float(cells),
+                "code_scale_mode": code_scale_mode,
+                "pairwise_tables": float(pairwise_tables),
+                "comparisons": float(comparisons),
+                "mean_overlap_times_dim": _mean_finite(group, "overlap_times_dim"),
+                "mean_route_entropy_norm": _mean_finite(group, "route_entropy_norm"),
+                "mean_represented_fraction": _mean_finite(group, "represented_fraction"),
+                "mean_loss_per_activation": _mean_finite(group, "loss_per_activation"),
+                "points": float(len(group)),
+            }
+        )
+    return summaries
+
+
+def _parse_csv_numbers(value: str, cast: type = int) -> list:
+    return [cast(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
+    families = tuple(_parse_csv_numbers(args.families, str))
+    model_dims = _parse_csv_numbers(args.model_dims, int)
+    alphas = _parse_csv_numbers(args.alphas, float)
+    seeds = _parse_csv_numbers(args.seeds, int)
+    heads_values = _parse_csv_numbers(args.heads_list, int) if args.heads_list else [args.heads]
+    cells_values = _parse_csv_numbers(args.cells_list, int) if args.cells_list else [args.cells]
+    code_scale_modes = _parse_csv_numbers(args.code_scale_modes, str) if args.code_scale_modes else [args.code_scale_mode]
+    configs = []
+    for family in families:
+        if family not in FAMILIES:
+            raise ValueError(f"unknown family {family!r}; expected one of {FAMILIES}")
+        family_heads_values = heads_values if family == "tropical" else [args.heads]
+        family_cells_values = cells_values if family == "tropical" else [args.cells]
+        family_code_scale_modes = code_scale_modes if family == "tropical" else [args.code_scale_mode]
+        for alpha in alphas:
+            for model_dim in model_dims:
+                for heads in family_heads_values:
+                    for cells in family_cells_values:
+                        for code_scale_mode in family_code_scale_modes:
+                            if code_scale_mode not in CODE_SCALE_MODES:
+                                raise ValueError(f"unknown code_scale_mode {code_scale_mode!r}; expected one of {CODE_SCALE_MODES}")
+                            for seed in seeds:
+                                configs.append(
+                                    RunConfig(
+                                        family=family,
+                                        n_features=args.n_features,
+                                        model_dim=model_dim,
+                                        alpha=alpha,
+                                        activation_density=args.activation_density,
+                                        batch_size=args.batch_size,
+                                        steps=args.steps,
+                                        lr=args.lr,
+                                        paper_lr=args.paper_lr,
+                                        weight_decay=args.weight_decay,
+                                        heads=heads,
+                                        cells=cells,
+                                        code_scale_mode=code_scale_mode,
+                                        pairwise_tables=args.pairwise_tables,
+                                        comparisons=args.comparisons,
+                                        seed=seed,
+                                        device=args.device,
+                                        backend=args.backend,
+                                    )
+                                )
+    return configs
+
+
+def _write_csv(rows: list[dict[str, float | int | str]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(rows[0].keys())
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _apply_presets(args: argparse.Namespace) -> None:
+    if args.quick:
+        args.n_features = 32
+        args.model_dims = "4,8"
+        args.alphas = "0.0"
+        args.families = "paper,linear,tropical,pairwise"
+        args.batch_size = 16
+        args.steps = 3
+    if args.paper_scale:
+        args.n_features = 1000
+        args.model_dims = "10,15,25,39,63,100"
+        args.alphas = "0.0,0.25,0.5,0.75,1.0"
+        args.batch_size = 2048
+        args.steps = 20000
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Run sparse feature-recovery scaling benchmarks for tropnn layers.")
+    parser.add_argument("--families", type=str, default="paper,linear,tropical,pairwise")
+    parser.add_argument("--n-features", type=int, default=256)
+    parser.add_argument("--model-dims", type=str, default="8,16,32,64")
+    parser.add_argument("--alphas", type=str, default="0.0,0.5,1.0,1.5")
+    parser.add_argument("--activation-density", type=float, default=1.0)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--paper-lr", type=float, default=1e-2)
+    parser.add_argument("--weight-decay", type=float, default=-1.0)
+    parser.add_argument("--heads", type=int, default=16)
+    parser.add_argument("--cells", type=int, default=4)
+    parser.add_argument("--heads-list", type=str, default="", help="Comma-separated tropical heads sweep; overrides --heads for tropical.")
+    parser.add_argument("--cells-list", type=str, default="", help="Comma-separated tropical cells sweep; overrides --cells for tropical.")
+    parser.add_argument("--code-scale-mode", choices=CODE_SCALE_MODES, default="sqrt")
+    parser.add_argument("--code-scale-modes", type=str, default="", help="Comma-separated tropical code scale modes: sqrt,linear,none.")
+    parser.add_argument("--pairwise-tables", type=int, default=0, help="Use model_dim as PairwiseLinear tables when 0.")
+    parser.add_argument("--comparisons", type=int, default=4)
+    parser.add_argument("--seeds", type=str, default="0")
+    parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
+    parser.add_argument("--backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--tag", type=str, default="")
+    parser.add_argument("--save-every", type=int, default=0, help="Reserved for future checkpointing; currently must be 0.")
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--paper-scale", action="store_true")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.save_every != 0:
+        raise ValueError("--save-every is reserved for future checkpointing and must be 0")
+    _apply_presets(args)
+
+    configs = _configs_from_args(args)
+    rows = []
+    for idx, config in enumerate(configs, start=1):
+        print(
+            f"[{idx}/{len(configs)}] family={config.family} n={config.n_features} m={config.model_dim} "
+            f"alpha={config.alpha} heads={config.heads} cells={config.cells} scale={config.code_scale_mode} seed={config.seed}"
+        )
+        row = run_config(config)
+        rows.append(row)
+        print(
+            f"  loss={float(row['final_loss']):.6g} overlap={float(row['mean_squared_overlap']):.6g} "
+            f"represented={float(row['represented_fraction']):.3f}"
+        )
+
+    repo_root = Path(__file__).resolve().parents[4]
+    output_dir = args.output_dir if args.output_dir is not None else repo_root / "results" / "scaling_benchmark"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    name = f"{args.tag}-{stamp}" if args.tag else stamp
+    csv_path = output_dir / f"runs-{name}.csv"
+    json_path = output_dir / f"summary-{name}.json"
+    _write_csv(rows, csv_path)
+    summary = {"runs": rows, "exponents": _fit_exponents(rows), "group_metrics": _group_metrics(rows)}
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(summary, indent=2))
+    print(f"runs_csv={csv_path}")
+    print(f"summary_json={json_path}")
+
+
+if __name__ == "__main__":
+    main()

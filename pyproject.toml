@@ -38,6 +38,7 @@ dev = [
 tropnn-emnist = "tropnn.examples.emnist:main"
 tropnn-benchmark = "tropnn.tools.benchmark:main"
 tropnn-profile = "tropnn.tools.profile:main"
+tropnn-scaling-benchmark = "tropnn.tools.scaling_benchmark:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
