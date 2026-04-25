@@ -69,6 +69,7 @@ def test_all_scaling_families_run_one_train_step() -> None:
             assert float(row["geometry_loss"]) == 0.0
             assert float(row["code_norm_loss"]) == 0.0
             assert float(row["route_balance_loss"]) == 0.0
+        if family not in {"tropical", "tied_tropical", "tied_pairwise"}:
             assert float(row["recovery_diag_loss"]) == 0.0
             assert float(row["recovery_offdiag_loss"]) == 0.0
 
@@ -203,11 +204,44 @@ def test_tied_tropical_regularizers_run_one_train_step() -> None:
     assert float(row["self_gain_mse"]) >= 0.0
 
 
+def test_tied_pairwise_recovery_regularizers_run_one_train_step() -> None:
+    row = run_config(
+        RunConfig(
+            family="tied_pairwise",
+            n_features=16,
+            model_dim=4,
+            alpha=1.0,
+            activation_density=1.0,
+            batch_size=8,
+            steps=1,
+            lr=1e-3,
+            paper_lr=1e-2,
+            weight_decay=-1.0,
+            heads=4,
+            cells=3,
+            code_scale_mode="linear",
+            pairwise_tables=4,
+            comparisons=2,
+            seed=0,
+            device="cpu",
+            backend="torch",
+            recovery_diag_weight=0.001,
+            recovery_offdiag_weight=0.001,
+        )
+    )
+
+    assert row["family"] == "tied_pairwise"
+    assert float(row["recovery_diag_loss"]) >= 0.0
+    assert float(row["recovery_offdiag_loss"]) >= 0.0
+    assert float(row["recovery_loss"]) >= 0.0
+    assert float(row["route_entropy_norm"]) >= 0.0
+
+
 def test_sweep_lists_expand_tropical_only() -> None:
     import argparse
 
     args = argparse.Namespace(
-        families="paper,tropical,tied_tropical,pairwise",
+        families="paper,untied_paper,tropical,tied_tropical,pairwise,tied_pairwise",
         n_features=16,
         model_dims="4",
         alphas="1.0",
@@ -242,9 +276,12 @@ def test_sweep_lists_expand_tropical_only() -> None:
     assert len([config for config in configs if config.family == "tropical"]) == 8
     assert len([config for config in configs if config.family == "tied_tropical"]) == 8
     assert len([config for config in configs if config.family == "paper"]) == 1
+    assert len([config for config in configs if config.family == "untied_paper"]) == 1
     assert len([config for config in configs if config.family == "pairwise"]) == 1
+    assert len([config for config in configs if config.family == "tied_pairwise"]) == 1
     assert all(config.code_geometry_weight == 0.01 for config in configs if config.family in {"tropical", "tied_tropical"})
-    assert all(config.recovery_diag_weight == 0.001 for config in configs if config.family in {"tropical", "tied_tropical"})
+    assert all(config.recovery_diag_weight == 0.001 for config in configs if config.family in {"tropical", "tied_tropical", "tied_pairwise"})
+    assert all(config.recovery_diag_weight == 0.0 for config in configs if config.family in {"paper", "untied_paper", "pairwise"})
     assert all(config.output_lr_mult == 3.0 for config in configs if config.family == "tropical")
     assert all(config.output_lr_mult == 1.0 for config in configs if config.family != "tropical")
     assert all(config.code_geometry_weight == 0.0 for config in configs if config.family not in {"tropical", "tied_tropical"})

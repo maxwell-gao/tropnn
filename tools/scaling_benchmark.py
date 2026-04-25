@@ -18,10 +18,11 @@ from ..backend import Backend, trop_scores
 from ..layers import PairwiseLinear, TropLinear
 from ..layers.tropical import _minface_mix, _top2_indices
 
-FAMILIES = ("paper", "linear", "tropical", "tied_tropical", "pairwise")
+FAMILIES = ("paper", "untied_paper", "linear", "tropical", "tied_tropical", "pairwise", "tied_pairwise")
 CODE_SCALE_MODES = ("sqrt", "linear", "none")
 CODE_GEOMETRY_LOSSES = ("none", "welch")
 TROPICAL_FAMILIES = ("tropical", "tied_tropical")
+RECOVERY_REGULARIZER_FAMILIES = ("tropical", "tied_tropical", "tied_pairwise")
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,28 @@ class PaperFeatureRecovery(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return F.relu(self.encode(x) @ self.weight.t() + self.bias)
+
+
+class UntiedPaperFeatureRecovery(nn.Module):
+    """Paper toy model with independent encoder and readout feature vectors."""
+
+    def __init__(self, n_features: int, model_dim: int, *, seed: int) -> None:
+        super().__init__()
+        torch.manual_seed(seed)
+        self.n_features = n_features
+        self.model_dim = model_dim
+        self.encoder_weight = nn.Parameter(torch.randn(n_features, model_dim) / math.sqrt(model_dim))
+        self.decoder_weight = nn.Parameter(torch.randn(n_features, model_dim) / math.sqrt(model_dim))
+        self.bias = nn.Parameter(torch.zeros(n_features))
+
+    def encode(self, x: Tensor) -> Tensor:
+        return x @ self.encoder_weight
+
+    def readout_representations(self) -> Tensor:
+        return self.decoder_weight
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.relu(self.encode(x) @ self.decoder_weight.t() + self.bias)
 
 
 class LinearRecovery(nn.Module):
@@ -174,6 +197,65 @@ class TiedTropicalFeatureRecovery(nn.Module):
         return output.unsqueeze(1) if squeeze_seq else output
 
 
+class TiedPairwiseFeatureRecovery(nn.Module):
+    """Paper-style tied autoencoder whose feature vectors are pairwise LUT codes."""
+
+    def __init__(
+        self,
+        n_features: int,
+        model_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        seed: int,
+    ) -> None:
+        super().__init__()
+        if tables < 1:
+            raise ValueError(f"tables must be >= 1, got {tables}")
+        if comparisons < 1:
+            raise ValueError(f"comparisons must be >= 1, got {comparisons}")
+        if model_dim < 1:
+            raise ValueError(f"model_dim must be >= 1, got {model_dim}")
+
+        self.n_features = n_features
+        self.model_dim = model_dim
+        self.tables = tables
+        self.comparisons = comparisons
+        self.router = PairwiseLinear(
+            n_features,
+            model_dim,
+            tables=tables,
+            comparisons=comparisons,
+            seed=seed,
+        )
+        self.bias = nn.Parameter(torch.zeros(n_features))
+        self._last_indices: Tensor | None = None
+        self._last_margins: Tensor | None = None
+
+    def effective_representations(self) -> tuple[Tensor, Tensor, Tensor]:
+        device = self.bias.device
+        x = torch.eye(self.n_features, device=device)
+        reps = self.router(x).squeeze(1).float()
+        self._last_indices = self.router._last_indices
+        self._last_margins = self.router._last_margins
+        empty_scores = torch.empty(self.n_features, self.tables, 0, device=device, dtype=reps.dtype)
+        return reps, reps.view(self.n_features, 1, self.model_dim), empty_scores
+
+    def encode(self, x: Tensor) -> Tensor:
+        reps, _, _ = self.effective_representations()
+        return x.to(reps.dtype) @ reps
+
+    def forward(self, x: Tensor) -> Tensor:
+        squeeze_seq = False
+        if x.ndim == 3 and x.shape[1] == 1:
+            x = x.squeeze(1)
+            squeeze_seq = True
+        reps, _, _ = self.effective_representations()
+        hidden = x.to(reps.dtype) @ reps
+        output = F.relu(hidden @ reps.t() + self.bias.to(dtype=reps.dtype, device=reps.device))
+        return output.unsqueeze(1) if squeeze_seq else output
+
+
 def feature_probabilities(n_features: int, alpha: float, activation_density: float, *, device: torch.device) -> Tensor:
     if n_features < 1:
         raise ValueError(f"n_features must be >= 1, got {n_features}")
@@ -209,6 +291,8 @@ def _code_scale(heads: int, mode: str) -> float:
 def _build_model(config: RunConfig, device: torch.device) -> nn.Module:
     if config.family == "paper":
         return PaperFeatureRecovery(config.n_features, config.model_dim, seed=config.seed).to(device)
+    if config.family == "untied_paper":
+        return UntiedPaperFeatureRecovery(config.n_features, config.model_dim, seed=config.seed).to(device)
     if config.family == "linear":
         return LinearRecovery(config.n_features, config.model_dim, seed=config.seed).to(device)
     if config.family == "tropical":
@@ -243,18 +327,35 @@ def _build_model(config: RunConfig, device: torch.device) -> nn.Module:
             comparisons=config.comparisons,
             seed=config.seed,
         ).to(device)
+    if config.family == "tied_pairwise":
+        tables = config.pairwise_tables if config.pairwise_tables > 0 else config.model_dim
+        return TiedPairwiseFeatureRecovery(
+            config.n_features,
+            config.model_dim,
+            tables=tables,
+            comparisons=config.comparisons,
+            seed=config.seed,
+        ).to(device)
     raise ValueError(f"unknown family {config.family!r}")
 
 
 @torch.no_grad()
-def _paper_weight_growth_step(model: nn.Module, lr: float, weight_decay: float, eps: float = 1e-8) -> None:
-    if not isinstance(model, PaperFeatureRecovery):
-        return
+def _row_weight_growth_(weight: Tensor, lr: float, weight_decay: float, eps: float = 1e-8) -> None:
     if weight_decay >= 0:
-        model.weight.mul_(1.0 - lr * weight_decay)
+        weight.mul_(1.0 - lr * weight_decay)
         return
-    row_norms = model.weight.norm(dim=1, keepdim=True).add_(eps)
-    model.weight.add_(weight_decay * model.weight * (1.0 - 1.0 / row_norms), alpha=lr)
+    row_norms = weight.norm(dim=1, keepdim=True).add_(eps)
+    weight.add_(weight_decay * weight * (1.0 - 1.0 / row_norms), alpha=lr)
+
+
+@torch.no_grad()
+def _paper_weight_growth_step(model: nn.Module, lr: float, weight_decay: float) -> None:
+    if isinstance(model, PaperFeatureRecovery):
+        _row_weight_growth_(model.weight, lr=lr, weight_decay=weight_decay)
+        return
+    if isinstance(model, UntiedPaperFeatureRecovery):
+        _row_weight_growth_(model.encoder_weight, lr=lr, weight_decay=weight_decay)
+        _row_weight_growth_(model.decoder_weight, lr=lr, weight_decay=weight_decay)
 
 
 def _zero_loss(device: torch.device) -> Tensor:
@@ -294,7 +395,9 @@ def _effective_representations(
         return _tropical_effective_representations(model, n_features, device, training=training)
     if isinstance(model, TiedTropicalFeatureRecovery):
         return model.effective_representations(training=training)
-    raise TypeError(f"expected tropical model, got {type(model).__name__}")
+    if isinstance(model, TiedPairwiseFeatureRecovery):
+        return model.effective_representations()
+    raise TypeError(f"expected a routed representation model, got {type(model).__name__}")
 
 
 def _welch_loss(reps: Tensor) -> Tensor:
@@ -400,7 +503,7 @@ def _recovery_regularizers(config: RunConfig, model: nn.Module, probs: Tensor) -
         "recovery_offdiag_loss": 0.0,
         "recovery_loss": 0.0,
     }
-    if config.family not in TROPICAL_FAMILIES:
+    if config.family not in RECOVERY_REGULARIZER_FAMILIES:
         return zero, empty_metrics
     if config.recovery_diag_weight == 0.0 and config.recovery_offdiag_weight == 0.0:
         return zero, empty_metrics
@@ -435,7 +538,7 @@ def _train_one(config: RunConfig) -> tuple[nn.Module, dict[str, float | int | st
     torch.manual_seed(config.seed)
     probs = feature_probabilities(config.n_features, config.alpha, config.activation_density, device=device)
     model = _build_model(config, device)
-    lr = config.paper_lr if config.family == "paper" else config.lr
+    lr = config.paper_lr if config.family in {"paper", "untied_paper"} else config.lr
     optimizer = _build_optimizer(config, model, lr)
 
     task_losses: list[float] = []
@@ -483,9 +586,11 @@ def _representations(model: nn.Module, family: str, n_features: int, device: tor
         x = torch.eye(n_features, device=device)[start:stop]
         if family == "paper":
             rep = model.encode(x)  # type: ignore[attr-defined]
+        elif family == "untied_paper":
+            rep = model.readout_representations()[start:stop]  # type: ignore[attr-defined]
         elif family == "linear":
             rep = model.encode(x)  # type: ignore[attr-defined]
-        elif family in TROPICAL_FAMILIES:
+        elif family in TROPICAL_FAMILIES or family == "tied_pairwise":
             rep = _effective_representations(model, n_features, device, training=False)[0][start:stop]
         elif family == "pairwise":
             rep = model(x).squeeze(1)
@@ -579,6 +684,23 @@ def _recovery_operator_metrics(response: Tensor, probs: Tensor) -> dict[str, flo
 
 
 @torch.no_grad()
+def _pairwise_route_metrics_from_indices(indices: Tensor, margins: Tensor, n_features: int) -> dict[str, float]:
+    table_entropies = []
+    unique_counts = []
+    for table in range(indices.shape[-1]):
+        _, counts = torch.unique(indices[:, 0, table].cpu(), return_counts=True)
+        probs = counts.float() / counts.sum()
+        table_entropies.append(float((-(probs * probs.log()).sum()).item()))
+        unique_counts.append(float(counts.numel()))
+    return {
+        "route_unique": sum(unique_counts),
+        "route_collision_mean": float(n_features / max(1.0, sum(unique_counts) / len(unique_counts))),
+        "route_entropy": float(sum(table_entropies) / len(table_entropies)),
+        "avg_margin": float(margins.float().mean().item()),
+    }
+
+
+@torch.no_grad()
 def _route_metrics(model: nn.Module, family: str, n_features: int, device: torch.device) -> dict[str, float]:
     if family in TROPICAL_FAMILIES:
         assert isinstance(model, (TropLinear, TiedTropicalFeatureRecovery))
@@ -605,19 +727,15 @@ def _route_metrics(model: nn.Module, family: str, n_features: int, device: torch
         indices = model._last_indices
         margins = model._last_margins
         assert indices is not None and margins is not None
-        table_entropies = []
-        unique_counts = []
-        for table in range(indices.shape[-1]):
-            _, counts = torch.unique(indices[:, 0, table].cpu(), return_counts=True)
-            probs = counts.float() / counts.sum()
-            table_entropies.append(float((-(probs * probs.log()).sum()).item()))
-            unique_counts.append(float(counts.numel()))
-        return {
-            "route_unique": sum(unique_counts),
-            "route_collision_mean": float(n_features / max(1.0, sum(unique_counts) / len(unique_counts))),
-            "route_entropy": float(sum(table_entropies) / len(table_entropies)),
-            "avg_margin": float(margins.float().mean().item()),
-        }
+        return _pairwise_route_metrics_from_indices(indices, margins, n_features)
+    if family == "tied_pairwise":
+        model.eval()
+        assert isinstance(model, TiedPairwiseFeatureRecovery)
+        model.effective_representations()
+        indices = model._last_indices
+        margins = model._last_margins
+        assert indices is not None and margins is not None
+        return _pairwise_route_metrics_from_indices(indices, margins, n_features)
     return {"route_unique": float("nan"), "route_collision_mean": float("nan"), "route_entropy": float("nan"), "avg_margin": float("nan")}
 
 
@@ -824,6 +942,7 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
         if family not in FAMILIES:
             raise ValueError(f"unknown family {family!r}; expected one of {FAMILIES}")
         is_tropical_family = family in TROPICAL_FAMILIES
+        uses_recovery_regularizers = family in RECOVERY_REGULARIZER_FAMILIES
         family_heads_values = heads_values if is_tropical_family else [args.heads]
         family_cells_values = cells_values if is_tropical_family else [args.cells]
         family_code_scale_modes = code_scale_modes if is_tropical_family else [args.code_scale_mode]
@@ -859,8 +978,8 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
                                         code_geometry_weight=args.code_geometry_weight if is_tropical_family else 0.0,
                                         code_norm_weight=args.code_norm_weight if is_tropical_family else 0.0,
                                         route_balance_weight=args.route_balance_weight if is_tropical_family else 0.0,
-                                        recovery_diag_weight=args.recovery_diag_weight if is_tropical_family else 0.0,
-                                        recovery_offdiag_weight=args.recovery_offdiag_weight if is_tropical_family else 0.0,
+                                        recovery_diag_weight=args.recovery_diag_weight if uses_recovery_regularizers else 0.0,
+                                        recovery_offdiag_weight=args.recovery_offdiag_weight if uses_recovery_regularizers else 0.0,
                                         output_lr_mult=args.output_lr_mult if family == "tropical" else 1.0,
                                     )
                                 )
