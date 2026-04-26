@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tropnn import TropLinear
-from tropnn.backend import trop_scores, trop_scores_reference
+from tropnn import PairwiseLinear, TropLinear
+from tropnn.backend import has_tilelang, trop_scores, trop_scores_reference
+from tropnn.layers.surrogate import surrogate_gradient
 
 
 def test_trop_linear_shapes_for_2d_and_3d_inputs() -> None:
@@ -99,3 +100,63 @@ def test_trop_linear_tilelang_backend_trains_with_torch_fallback() -> None:
     assert x.grad is not None
     assert layer.router_weight.grad is not None
     assert layer.code.grad is not None
+
+
+def test_fast_sigmoid_odd_surrogate_has_lut_direction() -> None:
+    u = torch.tensor([-2.0, 0.0, 2.0])
+    grad = surrogate_gradient(u, "fast_sigmoid_odd")
+
+    assert grad[0] > 0
+    assert grad[1] == 0
+    assert grad[2] < 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not has_tilelang(), reason="requires CUDA TileLang")
+@pytest.mark.parametrize("use_min_margin_ste", [True, False])
+def test_pairwise_tilelang_forward_backward_matches_torch(use_min_margin_ste: bool) -> None:
+    torch.manual_seed(0)
+    base = PairwiseLinear(8, 5, tables=3, comparisons=3, backend="torch", seed=1, use_min_margin_ste=use_min_margin_ste).cuda()
+    fast = PairwiseLinear(8, 5, tables=3, comparisons=3, backend="tilelang", seed=1, use_min_margin_ste=use_min_margin_ste).cuda()
+    with torch.no_grad():
+        fast.anchors.copy_(base.anchors)
+        fast.thresholds.copy_(base.thresholds)
+        fast.lut.copy_(base.lut)
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    x_fast = x.detach().clone().requires_grad_(True)
+
+    loss = base(x).square().mean()
+    loss.backward()
+    fast_loss = fast(x_fast).square().mean()
+    fast_loss.backward()
+
+    assert torch.allclose(base(x.detach()), fast(x.detach()), atol=1e-6)
+    assert torch.allclose(x.grad, x_fast.grad, atol=1e-6)
+    assert torch.allclose(base.thresholds.grad, fast.thresholds.grad, atol=1e-6)
+    assert torch.allclose(base.lut.grad, fast.lut.grad, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not has_tilelang(), reason="requires CUDA TileLang")
+def test_trop_linear_tilelang_forward_backward_matches_torch() -> None:
+    torch.manual_seed(0)
+    base = TropLinear(8, 5, heads=3, cells=4, code_dim=6, backend="torch", seed=1).cuda()
+    fast = TropLinear(8, 5, heads=3, cells=4, code_dim=6, backend="tilelang", seed=1).cuda()
+    with torch.no_grad():
+        fast.proj.weight.copy_(base.proj.weight)
+        fast.router_weight.copy_(base.router_weight)
+        fast.router_bias.copy_(base.router_bias)
+        fast.code.copy_(base.code)
+        fast.output_proj.weight.copy_(base.output_proj.weight)
+        fast.output_proj.bias.copy_(base.output_proj.bias)
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    x_fast = x.detach().clone().requires_grad_(True)
+
+    loss = base(x).square().mean()
+    loss.backward()
+    fast_loss = fast(x_fast).square().mean()
+    fast_loss.backward()
+
+    assert torch.allclose(base(x.detach()), fast(x.detach()), atol=1e-6)
+    assert torch.allclose(x.grad, x_fast.grad, atol=1e-6)
+    assert torch.allclose(base.router_weight.grad, fast.router_weight.grad, atol=1e-6)
+    assert torch.allclose(base.router_bias.grad, fast.router_bias.grad, atol=1e-6)
+    assert torch.allclose(base.code.grad, fast.code.grad, atol=1e-6)

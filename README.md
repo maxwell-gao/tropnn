@@ -39,10 +39,12 @@ Inference remains fully hard.
 - `layers/pairwise.py`: `PairwiseLinear`
 - `layers/base.py`: shared routed-layer shell
 - `backend.py` and `backends/triton_scores.py`: tropical score backend dispatch
-- `backends/tilelang_route.py`: optional fused TileLang inference route/code backend
+- `backends/tilelang_route.py`: optional fused TileLang tropical route/code backend
+- `backends/pairwise_tilelang.py`: optional fused TileLang pairwise route/LUT backend
 - `examples/emnist.py`: EMNIST training example for `tropical` and `pairwise`
-- `tools/benchmark.py`: backend benchmark for `TropLinear`
+- `tools/benchmark.py`: backend benchmark for `TropLinear` and `PairwiseLinear`
 - `tools/profile.py`: forward profiler for `tropical` and `pairwise`
+- `tools/ncu_memory_case.py` and `tools/ncu_memory_sweep.py`: Nsight Compute DRAM profiling helpers
 
 ## Quick Start
 
@@ -60,6 +62,9 @@ print(tropical_tilelang(x).shape)
 
 pairwise = PairwiseLinear(256, 512, tables=16, comparisons=6)
 print(pairwise(x).shape)
+
+pairwise_tilelang = PairwiseLinear(256, 512, tables=16, comparisons=6, backend="tilelang").cuda()
+print(pairwise_tilelang(x.cuda()).shape)
 ```
 
 ## EMNIST Example
@@ -85,7 +90,7 @@ uv run python -m tropnn.examples.emnist \
 
 Pairwise uses the same script with `--family pairwise --pairwise-tables 136 --comparisons 6`.
 
-`backend="tilelang"` is an explicit inference backend for `TropLinear`. It fuses hard routing and selected-code accumulation without materializing the full score tensor. Training with `backend="tilelang"` falls back to the torch route path to preserve autograd. If TileLang compilation fails, ensure a CUDA toolkit compatible with the GPU is first on `PATH` and export `CC=/usr/bin/gcc CXX=/usr/bin/g++`.
+`backend="tilelang"` is an explicit CUDA backend for `TropLinear` and `PairwiseLinear`. `TropLinear` fuses routing and selected-code accumulation for both eval and train-time min-face backward. `PairwiseLinear` fuses comparator routing, output-block LUT row reads, vectorized LUT-gradient scatter, and block-reduced LUT/STE backward; its TileLang path currently supports the `fast_sigmoid_odd` LUT surrogate. If TileLang compilation fails, ensure a CUDA toolkit compatible with the GPU is first on `PATH` and export `CC=/usr/bin/gcc CXX=/usr/bin/g++`.
 
 CPU inference currently uses the torch path. The TileLang wheel used here exposes CUDA compilation, but not LLVM CPU codegen; for CPU deployment, benchmark `torch.compile(layer.eval(), mode="reduce-overhead")` instead of `backend="tilelang"`.
 
@@ -101,7 +106,9 @@ uv run python -m tropnn.tools.profile \
   --tropical-code-dim 64 \
   --pairwise-hidden 128 \
   --pairwise-tables 136 \
-  --pairwise-comparisons 6
+  --pairwise-comparisons 6 \
+  --tropical-backend tilelang \
+  --pairwise-backend tilelang
 ```
 
 ## Scope

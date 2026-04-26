@@ -8,7 +8,7 @@ from torch import Tensor
 
 from ..backend import Backend
 from .base import RoutedLinearBase
-from .surrogate import ste_heaviside
+from .surrogate import ste_heaviside, surrogate_gradient
 
 
 class PairwiseLinear(RoutedLinearBase):
@@ -26,13 +26,15 @@ class PairwiseLinear(RoutedLinearBase):
         lut_init_std: float = 0.02,
         use_min_margin_ste: bool = True,
         use_output_scaling: bool = True,
+        surrogate: str = "fast_sigmoid_odd",
     ) -> None:
         if tables < 1:
             raise ValueError(f"tables must be >= 1, got {tables}")
         if comparisons < 1:
             raise ValueError(f"comparisons must be >= 1, got {comparisons}")
-        if backend != "torch":
-            raise ValueError(f"PairwiseLinear currently supports backend='torch' only, got {backend!r}")
+        if backend not in {"torch", "tilelang"}:
+            raise ValueError(f"PairwiseLinear currently supports backend='torch' or 'tilelang', got {backend!r}")
+        surrogate_gradient(torch.zeros((), dtype=torch.float32), surrogate)
 
         output_scale = 1.0 / math.sqrt(tables) if use_output_scaling else 1.0
         super().__init__(in_features, out_features, backend=backend, output_scale=output_scale)
@@ -41,6 +43,7 @@ class PairwiseLinear(RoutedLinearBase):
         self.comparisons = comparisons
         self.table_size = 1 << comparisons
         self.use_min_margin_ste = use_min_margin_ste
+        self.surrogate = surrogate
 
         torch.manual_seed(seed)
         anchors = torch.zeros(tables, comparisons, 2, dtype=torch.long)
@@ -60,7 +63,8 @@ class PairwiseLinear(RoutedLinearBase):
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, tables={self.tables}, "
-            f"comparisons={self.comparisons}, backend={self.backend!r}, use_min_margin_ste={self.use_min_margin_ste}"
+            f"comparisons={self.comparisons}, backend={self.backend!r}, use_min_margin_ste={self.use_min_margin_ste}, "
+            f"surrogate={self.surrogate!r}"
         )
 
     def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
@@ -113,7 +117,7 @@ class PairwiseLinear(RoutedLinearBase):
         r_mins = margins.abs().argmin(dim=-1)
         u_mins = margins.gather(dim=-1, index=r_mins.unsqueeze(-1)).squeeze(-1)
         neighbor_indices = indices ^ (2**r_mins).long()
-        ste_delta = ste_heaviside(u_mins) - (u_mins > 0).to(u_mins.dtype)
+        ste_delta = ste_heaviside(u_mins, self.surrogate) - (u_mins > 0).to(u_mins.dtype)
 
         batch, seq, route_count = indices.shape
         item_count = batch * seq
@@ -145,7 +149,7 @@ class PairwiseLinear(RoutedLinearBase):
         item_count = batch * seq
         current_flat = indices.reshape(item_count, route_count)
         neighbor_flat = current_flat.unsqueeze(-1) ^ self.powers.view(1, 1, -1)
-        ste_delta = ste_heaviside(margins) - (margins > 0).to(margins.dtype)
+        ste_delta = ste_heaviside(margins, self.surrogate) - (margins > 0).to(margins.dtype)
         ste_flat = ste_delta.reshape(item_count, route_count, self.comparisons, 1).float()
         lut_table = self.lut.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
         route_chunk = self._route_chunk_size(
@@ -183,6 +187,23 @@ class PairwiseLinear(RoutedLinearBase):
         training: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
         del input_device
+        if self.backend == "tilelang":
+            if not latent.is_cuda:
+                raise ValueError("PairwiseLinear backend='tilelang' requires CUDA input tensors")
+            if compute_dtype != torch.float32:
+                raise TypeError(f"PairwiseLinear backend='tilelang' requires float32 compute dtype, got {compute_dtype}")
+            if self.surrogate != "fast_sigmoid_odd":
+                raise ValueError("PairwiseLinear backend='tilelang' currently supports surrogate='fast_sigmoid_odd' only")
+            from ..backends import pairwise_tilelang
+
+            return pairwise_tilelang(
+                latent,
+                self.anchors.to(device=latent.device),
+                self.thresholds.to(dtype=compute_dtype, device=latent.device),
+                self.lut.to(dtype=compute_dtype, device=latent.device),
+                use_min_margin_ste=self.use_min_margin_ste,
+            )
+
         indices, margins = self._compute_indices(latent)
         output = self._lookup_sum(indices, compute_dtype)
         if training and (latent.requires_grad or self.thresholds.requires_grad):

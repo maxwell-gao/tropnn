@@ -97,7 +97,7 @@ def _make_layer(
 ) -> nn.Module:
     if family == "tropical":
         return TropLinear(d_in, d_out, heads=heads, cells=cells, code_dim=code_dim, backend=backend, seed=seed)
-    return PairwiseLinear(d_in, d_out, tables=pairwise_tables, comparisons=comparisons, backend="torch", seed=seed)
+    return PairwiseLinear(d_in, d_out, tables=pairwise_tables, comparisons=comparisons, backend=backend, seed=seed)
 
 
 class EmnistRoutedClassifier(nn.Module):
@@ -158,7 +158,7 @@ class EmnistTropClassifier(EmnistRoutedClassifier):
 
 class EmnistPairwiseClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="pairwise", backend="torch", **kwargs)
+        super().__init__(family="pairwise", **kwargs)
 
 
 def _run_epoch(

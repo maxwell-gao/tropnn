@@ -44,7 +44,7 @@ def _build_model(
         code_dim=code_dim,
         pairwise_tables=pairwise_tables,
         comparisons=comparisons,
-        backend=backend if family == "tropical" else "torch",
+        backend=backend if family in {"tropical", "pairwise"} else "torch",
         seed=seed,
     ).to(device)
 
@@ -143,7 +143,7 @@ def profile_family_forward(
         "code_dim": code_dim if family == "tropical" else None,
         "pairwise_tables": pairwise_tables if family == "pairwise" else None,
         "comparisons": comparisons if family == "pairwise" else None,
-        "backend": backend if family == "tropical" else "torch",
+        "backend": backend if family in {"tropical", "pairwise"} else "torch",
         "params": int(sum(param.numel() for param in model.parameters())),
         "wall_ms": wall_ms,
         "peak_device_memory_bytes": int(torch.cuda.max_memory_allocated(dev)) if use_cuda else 0,
@@ -165,6 +165,7 @@ def profile_family_set(
     pairwise_hidden: int = 128,
     pairwise_tables: int = 72,
     pairwise_comparisons: int = 6,
+    pairwise_backend: str = "torch",
     warmup: int = 5,
     seed: int = 0,
     dtype: str = "float32",
@@ -198,6 +199,7 @@ def profile_family_set(
             depth=depth,
             pairwise_tables=pairwise_tables,
             comparisons=pairwise_comparisons,
+            backend=pairwise_backend,
             warmup=warmup,
             seed=seed,
             dtype=dtype,
@@ -239,6 +241,7 @@ def main() -> None:
     parser.add_argument("--pairwise-hidden", type=int, default=128)
     parser.add_argument("--pairwise-tables", type=int, default=72)
     parser.add_argument("--pairwise-comparisons", type=int, default=6)
+    parser.add_argument("--pairwise-backend", choices=("torch", "tilelang"), default="torch")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
@@ -255,6 +258,7 @@ def main() -> None:
         pairwise_hidden=args.pairwise_hidden,
         pairwise_tables=args.pairwise_tables,
         pairwise_comparisons=args.pairwise_comparisons,
+        pairwise_backend=args.pairwise_backend,
         warmup=args.warmup,
         seed=args.seed,
         dtype=args.dtype,

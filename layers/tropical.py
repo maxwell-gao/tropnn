@@ -70,7 +70,7 @@ class TropLinear(RoutedLinearBase):
         )
 
     def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
-        return self.proj(x).to(compute_dtype)
+        return self.proj(x.to(dtype=self.proj.weight.dtype)).to(compute_dtype)
 
     def _scores(self, latent: Tensor, *, input_device: torch.device, compute_dtype: torch.dtype) -> Tensor:
         weight = self.router_weight.to(dtype=compute_dtype, device=input_device)
@@ -102,7 +102,7 @@ class TropLinear(RoutedLinearBase):
         compute_dtype: torch.dtype,
         training: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        if self.backend == "tilelang" and not training:
+        if self.backend == "tilelang" and latent.is_cuda and compute_dtype == torch.float32:
             from ..backends import trop_route_hidden_tilelang
 
             weight = self.router_weight.to(dtype=compute_dtype, device=input_device)
@@ -114,6 +114,7 @@ class TropLinear(RoutedLinearBase):
                 bias,
                 code,
                 code_scale=self.code_scale,
+                training=training,
             )
             return self._output_from_hidden(hidden, input_device=input_device, compute_dtype=compute_dtype), winner_idx, margins
 
