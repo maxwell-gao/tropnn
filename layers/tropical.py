@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -34,6 +35,7 @@ class TropLinear(RoutedLinearBase):
         seed: int = 0,
         code_init_std: float = 0.02,
         use_output_scaling: bool = True,
+        cpu_param_dtype: Literal["f32", "f16"] = "f32",
     ) -> None:
         if heads < 1:
             raise ValueError(f"heads must be >= 1, got {heads}")
@@ -41,12 +43,19 @@ class TropLinear(RoutedLinearBase):
             raise ValueError(f"cells must be >= 2, got {cells}")
         if code_dim < 1:
             raise ValueError(f"code_dim must be >= 1, got {code_dim}")
+        if cpu_param_dtype not in {"f32", "f16"}:
+            raise ValueError(f"cpu_param_dtype must be 'f32' or 'f16', got {cpu_param_dtype!r}")
 
         super().__init__(in_features, out_features, backend=backend, output_scale=1.0)
         self.heads = heads
         self.cells = cells
         self.code_dim = code_dim
         self.code_scale = 1.0 / math.sqrt(heads) if use_output_scaling else 1.0
+        self.cpu_param_dtype = cpu_param_dtype
+        self._zig_router_weight_f16_cache: Tensor | None = None
+        self._zig_router_bias_f16_cache: Tensor | None = None
+        self._zig_code_f16_cache: Tensor | None = None
+        self._zig_f16_cache_versions: tuple[int, int, int] | None = None
 
         torch.manual_seed(seed)
         self.proj = nn.Linear(in_features, code_dim, bias=False)
@@ -66,11 +75,38 @@ class TropLinear(RoutedLinearBase):
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, heads={self.heads}, "
-            f"cells={self.cells}, code_dim={self.code_dim}, backend={self.backend!r}"
+            f"cells={self.cells}, code_dim={self.code_dim}, backend={self.backend!r}, cpu_param_dtype={self.cpu_param_dtype!r}"
         )
 
     def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
+        if self.backend == "zig":
+            return self.proj(x.to(dtype=self.proj.weight.dtype)).to(torch.float32)
         return self.proj(x.to(dtype=self.proj.weight.dtype)).to(compute_dtype)
+
+    def _zig_params_for_inference(self) -> tuple[Tensor, Tensor, Tensor]:
+        if self.cpu_param_dtype == "f32":
+            return (
+                self.router_weight.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+                self.router_bias.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+                self.code.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+            )
+
+        versions = (self.router_weight._version, self.router_bias._version, self.code._version)
+        cache_missing = (
+            self._zig_router_weight_f16_cache is None
+            or self._zig_router_bias_f16_cache is None
+            or self._zig_code_f16_cache is None
+            or self._zig_f16_cache_versions != versions
+            or self._zig_router_weight_f16_cache.shape != self.router_weight.shape
+            or self._zig_router_bias_f16_cache.shape != self.router_bias.shape
+            or self._zig_code_f16_cache.shape != self.code.shape
+        )
+        if cache_missing:
+            self._zig_router_weight_f16_cache = self.router_weight.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            self._zig_router_bias_f16_cache = self.router_bias.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            self._zig_code_f16_cache = self.code.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            self._zig_f16_cache_versions = versions
+        return self._zig_router_weight_f16_cache, self._zig_router_bias_f16_cache, self._zig_code_f16_cache
 
     def _scores(self, latent: Tensor, *, input_device: torch.device, compute_dtype: torch.dtype) -> Tensor:
         weight = self.router_weight.to(dtype=compute_dtype, device=input_device)
@@ -102,6 +138,26 @@ class TropLinear(RoutedLinearBase):
         compute_dtype: torch.dtype,
         training: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        if self.backend == "zig":
+            if training:
+                raise RuntimeError("TropLinear backend='zig' is inference-only; call .eval() or use backend='torch' for training")
+            if latent.device.type != "cpu":
+                raise ValueError("TropLinear backend='zig' requires CPU input tensors")
+            from ..backends import trop_route_hidden_zig
+
+            weight, bias, code = self._zig_params_for_inference()
+            hidden = trop_route_hidden_zig(
+                latent.contiguous(),
+                weight,
+                bias,
+                code,
+                code_scale=self.code_scale,
+                param_dtype=self.cpu_param_dtype,
+            )
+            empty_indices = torch.empty((*latent.shape[:2], 0), device=latent.device, dtype=torch.long)
+            empty_margins = torch.empty((*latent.shape[:2], 0), device=latent.device, dtype=latent.dtype)
+            return self._output_from_hidden(hidden, input_device=input_device, compute_dtype=torch.float32), empty_indices, empty_margins
+
         if self.backend == "tilelang" and latent.is_cuda and compute_dtype == torch.float32:
             from ..backends import trop_route_hidden_tilelang
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tropnn import PairwiseLinear, TropLinear
-from tropnn.backend import has_pairwise_zig, has_tilelang, trop_scores, trop_scores_reference
+from tropnn.backend import has_pairwise_zig, has_tilelang, has_tropical_zig, trop_scores, trop_scores_reference
 from tropnn.layers.surrogate import surrogate_gradient
 
 
@@ -88,6 +88,15 @@ def test_tilelang_score_backend_is_fused_only() -> None:
         trop_scores(z, router_weight, router_bias, backend="tilelang")
 
 
+def test_zig_score_backend_is_fused_only() -> None:
+    z = torch.randn(2, 3, 5)
+    router_weight = torch.randn(7, 4, 5)
+    router_bias = torch.randn(7, 4)
+
+    with pytest.raises(RuntimeError, match="fused TropLinear inference backend"):
+        trop_scores(z, router_weight, router_bias, backend="zig")
+
+
 def test_trop_linear_tilelang_backend_trains_with_torch_fallback() -> None:
     layer = TropLinear(6, 4, heads=3, cells=4, code_dim=5, backend="tilelang", seed=0)
     x = torch.randn(8, 2, 6, requires_grad=True)
@@ -141,6 +150,51 @@ def test_pairwise_zig_forward_matches_torch_f16_lut() -> None:
 
 def test_pairwise_zig_backend_is_inference_only() -> None:
     layer = PairwiseLinear(8, 5, tables=3, comparisons=3, backend="zig", seed=1)
+
+    with pytest.raises(RuntimeError, match="inference-only"):
+        layer(torch.randn(4, 8))
+
+
+@pytest.mark.skipif(not has_tropical_zig(), reason="requires ziglang or TROPNN_ZIG")
+def test_trop_linear_zig_forward_matches_torch_f32() -> None:
+    torch.manual_seed(0)
+    base = TropLinear(8, 5, heads=3, cells=4, code_dim=6, backend="torch", seed=1).eval()
+    fast = TropLinear(8, 5, heads=3, cells=4, code_dim=6, backend="zig", seed=1, cpu_param_dtype="f32").eval()
+    with torch.no_grad():
+        fast.proj.weight.copy_(base.proj.weight)
+        fast.router_weight.copy_(base.router_weight)
+        fast.router_bias.copy_(base.router_bias)
+        fast.code.copy_(base.code)
+        fast.output_proj.weight.copy_(base.output_proj.weight)
+        fast.output_proj.bias.copy_(base.output_proj.bias)
+        x = torch.randn(4, 2, 8)
+
+        assert torch.allclose(base(x), fast(x), atol=1e-6)
+        assert fast._last_indices is not None
+        assert fast._last_indices.shape == (4, 2, 0)
+
+
+@pytest.mark.skipif(not has_tropical_zig(), reason="requires ziglang or TROPNN_ZIG")
+def test_trop_linear_zig_forward_matches_torch_f16_params() -> None:
+    torch.manual_seed(0)
+    base = TropLinear(8, 5, heads=4, cells=3, code_dim=6, backend="torch", seed=2).eval()
+    fast = TropLinear(8, 5, heads=4, cells=3, code_dim=6, backend="zig", seed=2, cpu_param_dtype="f16").eval()
+    with torch.no_grad():
+        base.router_weight.zero_()
+        base.router_bias.copy_(torch.tensor([[0.0, 8.0, 16.0]]).expand(4, 3))
+        fast.proj.weight.copy_(base.proj.weight)
+        fast.router_weight.copy_(base.router_weight)
+        fast.router_bias.copy_(base.router_bias)
+        fast.code.copy_(base.code)
+        fast.output_proj.weight.copy_(base.output_proj.weight)
+        fast.output_proj.bias.copy_(base.output_proj.bias)
+        x = torch.randn(7, 8)
+
+        assert torch.allclose(base(x), fast(x), atol=5e-3)
+
+
+def test_trop_linear_zig_backend_is_inference_only() -> None:
+    layer = TropLinear(8, 5, heads=3, cells=4, code_dim=6, backend="zig", seed=1)
 
     with pytest.raises(RuntimeError, match="inference-only"):
         layer(torch.randn(4, 8))

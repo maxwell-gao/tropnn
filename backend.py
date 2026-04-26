@@ -30,13 +30,19 @@ def has_pairwise_zig() -> bool:
     return _has_pairwise_zig()
 
 
+def has_tropical_zig() -> bool:
+    from .backends import has_tropical_zig as _has_tropical_zig
+
+    return _has_tropical_zig()
+
+
 def trop_scores_reference(z: Tensor, router_weight: Tensor, router_bias: Tensor) -> Tensor:
     return torch.einsum("bsr,hkr->bshk", z, router_weight) + router_bias.unsqueeze(0).unsqueeze(0)
 
 
 def trop_scores(z: Tensor, router_weight: Tensor, router_bias: Tensor, backend: Backend = "torch") -> Tensor:
-    if backend == "tilelang":
-        raise RuntimeError("backend='tilelang' is a fused TropLinear inference backend, not a standalone score backend")
+    if backend in {"tilelang", "zig"}:
+        raise RuntimeError(f"backend={backend!r} is a fused TropLinear inference backend, not a standalone score backend")
     if backend == "triton" and _requires_grad_path(z, router_weight, router_bias):
         raise RuntimeError("backend='triton' does not support autograd; use backend='auto' or 'torch' for training")
     if backend == "triton":

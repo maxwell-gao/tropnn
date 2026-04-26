@@ -6,7 +6,7 @@ import time
 import torch
 from torch import Tensor
 
-from ..backend import has_pairwise_zig, has_tilelang, has_triton, trop_scores, trop_scores_reference
+from ..backend import has_pairwise_zig, has_tilelang, has_triton, has_tropical_zig, trop_scores, trop_scores_reference
 from ..layers import PairwiseLinear, TropLinear
 
 
@@ -151,6 +151,7 @@ def benchmark_trop_linear_auto(
     compile_cpu: bool = False,
     pairwise_tables: int = 136,
     comparisons: int = 6,
+    tropical_zig_dtype: str = "f32",
     pairwise_zig_dtype: str = "f32",
 ) -> dict[str, float]:
     dev = torch.device(device)
@@ -184,9 +185,22 @@ def benchmark_trop_linear_auto(
     ).to(dev)
     _copy_weights(auto_layer, torch_layer)
     _copy_weights(tilelang_layer, torch_layer)
+    zig_layer = TropLinear(
+        in_features,
+        out_features,
+        heads=heads,
+        cells=cells,
+        code_dim=code_dim,
+        backend="zig",
+        seed=seed,
+        cpu_param_dtype=tropical_zig_dtype,  # type: ignore[arg-type]
+    )
+    if dev.type == "cpu":
+        _copy_weights(zig_layer, torch_layer)
     torch_layer.eval()
     auto_layer.eval()
     tilelang_layer.eval()
+    zig_layer.eval()
     pairwise_torch = PairwiseLinear(
         in_features,
         out_features,
@@ -229,6 +243,11 @@ def benchmark_trop_linear_auto(
             tilelang_max_diff = float((torch_out - tilelang_out).abs().max().item())
         except RuntimeError as exc:
             print(f"tilelang_unavailable={exc}")
+    zig_ms = float("nan")
+    zig_max_diff = float("nan")
+    if has_tropical_zig() and dev.type == "cpu":
+        zig_out, zig_ms = _bench_forward(zig_layer, x, warmup=warmup, steps=steps)
+        zig_max_diff = float((torch_out - zig_out).abs().max().item())
     compiled_cpu_ms = float("nan")
     compiled_cpu_max_diff = float("nan")
     if compile_cpu and dev.type == "cpu":
@@ -278,8 +297,10 @@ def benchmark_trop_linear_auto(
         "torch_ms": torch_ms,
         "auto_ms": auto_ms,
         "tilelang_ms": tilelang_ms,
+        "zig_ms": zig_ms,
         "speedup": torch_ms / auto_ms,
         "tilelang_speedup": torch_ms / tilelang_ms,
+        "zig_speedup": torch_ms / zig_ms,
         "compiled_cpu_ms": compiled_cpu_ms,
         "compiled_cpu_speedup": torch_ms / compiled_cpu_ms,
         "tropical_torch_train_ms": tropical_torch_train_ms,
@@ -304,6 +325,7 @@ def benchmark_trop_linear_auto(
         "pairwise_tilelang_train_peak_bytes": pairwise_tilelang_train_peak_bytes,
         "max_diff": max_diff,
         "tilelang_max_diff": tilelang_max_diff,
+        "zig_max_diff": zig_max_diff,
         "pairwise_tilelang_max_diff": pairwise_tilelang_max_diff,
         "pairwise_zig_max_diff": pairwise_zig_max_diff,
         "compiled_cpu_max_diff": compiled_cpu_max_diff,
@@ -329,6 +351,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--compile-cpu", action="store_true", help="Also benchmark torch.compile on CPU inference.")
     parser.add_argument("--num-threads", type=int, default=0, help="Set torch CPU threads when > 0.")
+    parser.add_argument("--tropical-zig-dtype", choices=("f32", "f16"), default="f32")
     parser.add_argument("--pairwise-zig-dtype", choices=("f32", "f16"), default="f32")
     args = parser.parse_args()
 
@@ -336,7 +359,7 @@ def main() -> None:
         torch.set_num_threads(args.num_threads)
     print(
         f"cuda={torch.cuda.is_available()} has_triton={has_triton()} has_tilelang={has_tilelang()} "
-        f"has_pairwise_zig={has_pairwise_zig()} device={args.device}"
+        f"has_tropical_zig={has_tropical_zig()} has_pairwise_zig={has_pairwise_zig()} device={args.device}"
     )
     result = benchmark_trop_linear_auto(
         batch_size=args.batch_size,
@@ -352,6 +375,7 @@ def main() -> None:
         compile_cpu=args.compile_cpu,
         pairwise_tables=args.pairwise_tables,
         comparisons=args.comparisons,
+        tropical_zig_dtype=args.tropical_zig_dtype,
         pairwise_zig_dtype=args.pairwise_zig_dtype,
     )
     for key in (
@@ -364,8 +388,10 @@ def main() -> None:
         "torch_ms",
         "auto_ms",
         "tilelang_ms",
+        "zig_ms",
         "speedup",
         "tilelang_speedup",
+        "zig_speedup",
         "compiled_cpu_ms",
         "compiled_cpu_speedup",
         "tropical_torch_train_ms",
@@ -390,6 +416,7 @@ def main() -> None:
         "pairwise_tilelang_train_peak_bytes",
         "max_diff",
         "tilelang_max_diff",
+        "zig_max_diff",
         "pairwise_tilelang_max_diff",
         "pairwise_zig_max_diff",
         "compiled_cpu_max_diff",
