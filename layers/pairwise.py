@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -27,13 +28,16 @@ class PairwiseLinear(RoutedLinearBase):
         use_min_margin_ste: bool = True,
         use_output_scaling: bool = True,
         surrogate: str = "fast_sigmoid_odd",
+        cpu_lut_dtype: Literal["f32", "f16"] = "f32",
     ) -> None:
         if tables < 1:
             raise ValueError(f"tables must be >= 1, got {tables}")
         if comparisons < 1:
             raise ValueError(f"comparisons must be >= 1, got {comparisons}")
-        if backend not in {"torch", "tilelang"}:
-            raise ValueError(f"PairwiseLinear currently supports backend='torch' or 'tilelang', got {backend!r}")
+        if backend not in {"torch", "tilelang", "zig"}:
+            raise ValueError(f"PairwiseLinear currently supports backend='torch', 'tilelang', or 'zig', got {backend!r}")
+        if cpu_lut_dtype not in {"f32", "f16"}:
+            raise ValueError(f"cpu_lut_dtype must be 'f32' or 'f16', got {cpu_lut_dtype!r}")
         surrogate_gradient(torch.zeros((), dtype=torch.float32), surrogate)
 
         output_scale = 1.0 / math.sqrt(tables) if use_output_scaling else 1.0
@@ -44,6 +48,9 @@ class PairwiseLinear(RoutedLinearBase):
         self.table_size = 1 << comparisons
         self.use_min_margin_ste = use_min_margin_ste
         self.surrogate = surrogate
+        self.cpu_lut_dtype = cpu_lut_dtype
+        self._zig_lut_f16_cache: Tensor | None = None
+        self._zig_lut_f16_cache_version = -1
 
         torch.manual_seed(seed)
         anchors = torch.zeros(tables, comparisons, 2, dtype=torch.long)
@@ -64,11 +71,25 @@ class PairwiseLinear(RoutedLinearBase):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, tables={self.tables}, "
             f"comparisons={self.comparisons}, backend={self.backend!r}, use_min_margin_ste={self.use_min_margin_ste}, "
-            f"surrogate={self.surrogate!r}"
+            f"surrogate={self.surrogate!r}, cpu_lut_dtype={self.cpu_lut_dtype!r}"
         )
 
     def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
+        if self.backend == "zig":
+            return x.to(torch.float32)
         return x.to(compute_dtype)
+
+    def _zig_lut_for_inference(self) -> Tensor:
+        if self.cpu_lut_dtype == "f32":
+            return self.lut.detach().to(device="cpu", dtype=torch.float32).contiguous()
+
+        version = self.lut._version
+        cache = self._zig_lut_f16_cache
+        if cache is None or self._zig_lut_f16_cache_version != version or cache.shape != self.lut.shape:
+            cache = self.lut.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            self._zig_lut_f16_cache = cache
+            self._zig_lut_f16_cache_version = version
+        return cache
 
     def _select_rows(self, table_idx: int, indices: Tensor, compute_dtype: torch.dtype) -> Tensor:
         batch, seq = indices.shape
@@ -187,6 +208,22 @@ class PairwiseLinear(RoutedLinearBase):
         training: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
         del input_device
+        if self.backend == "zig":
+            if training:
+                raise RuntimeError("PairwiseLinear backend='zig' is inference-only; call .eval() or use backend='torch' for training")
+            from ..backends import pairwise_zig_forward
+
+            output = pairwise_zig_forward(
+                latent.contiguous(),
+                self.anchors.to(device="cpu", dtype=torch.long),
+                self.thresholds.detach().to(device="cpu", dtype=torch.float32),
+                self._zig_lut_for_inference(),
+                lut_dtype=self.cpu_lut_dtype,
+            )
+            empty_indices = torch.empty((*latent.shape[:2], 0), device=latent.device, dtype=torch.long)
+            empty_margins = torch.empty((*latent.shape[:2], 0), device=latent.device, dtype=latent.dtype)
+            return output, empty_indices, empty_margins
+
         if self.backend == "tilelang":
             if not latent.is_cuda:
                 raise ValueError("PairwiseLinear backend='tilelang' requires CUDA input tensors")

@@ -5,7 +5,7 @@ from typing import Literal
 import torch
 from torch import Tensor
 
-Backend = Literal["auto", "torch", "triton", "tilelang"]
+Backend = Literal["auto", "torch", "triton", "tilelang", "zig"]
 
 
 def _requires_grad_path(*tensors: Tensor) -> bool:
@@ -22,6 +22,12 @@ def has_tilelang() -> bool:
     from .backends import has_tilelang as _has_tilelang
 
     return _has_tilelang()
+
+
+def has_pairwise_zig() -> bool:
+    from .backends import has_pairwise_zig as _has_pairwise_zig
+
+    return _has_pairwise_zig()
 
 
 def trop_scores_reference(z: Tensor, router_weight: Tensor, router_bias: Tensor) -> Tensor:
