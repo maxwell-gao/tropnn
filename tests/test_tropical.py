@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tropnn import PairwiseLinear, TropLinear
-from tropnn.backend import has_tilelang, trop_scores, trop_scores_reference
+from tropnn.backend import has_pairwise_zig, has_tilelang, trop_scores, trop_scores_reference
 from tropnn.layers.surrogate import surrogate_gradient
 
 
@@ -109,6 +109,41 @@ def test_fast_sigmoid_odd_surrogate_has_lut_direction() -> None:
     assert grad[0] > 0
     assert grad[1] == 0
     assert grad[2] < 0
+
+
+@pytest.mark.skipif(not has_pairwise_zig(), reason="requires ziglang or TROPNN_ZIG")
+def test_pairwise_zig_forward_matches_torch_f32() -> None:
+    torch.manual_seed(0)
+    base = PairwiseLinear(8, 5, tables=3, comparisons=3, backend="torch", seed=1).eval()
+    fast = PairwiseLinear(8, 5, tables=3, comparisons=3, backend="zig", seed=1, cpu_lut_dtype="f32").eval()
+    with torch.no_grad():
+        fast.anchors.copy_(base.anchors)
+        fast.thresholds.copy_(base.thresholds)
+        fast.lut.copy_(base.lut)
+        x = torch.randn(4, 2, 8)
+
+        assert torch.allclose(base(x), fast(x), atol=1e-6)
+
+
+@pytest.mark.skipif(not has_pairwise_zig(), reason="requires ziglang or TROPNN_ZIG")
+def test_pairwise_zig_forward_matches_torch_f16_lut() -> None:
+    torch.manual_seed(0)
+    base = PairwiseLinear(8, 5, tables=4, comparisons=3, backend="torch", seed=2).eval()
+    fast = PairwiseLinear(8, 5, tables=4, comparisons=3, backend="zig", seed=2, cpu_lut_dtype="f16").eval()
+    with torch.no_grad():
+        fast.anchors.copy_(base.anchors)
+        fast.thresholds.copy_(base.thresholds)
+        fast.lut.copy_(base.lut)
+        x = torch.randn(7, 8)
+
+        assert torch.allclose(base(x), fast(x), atol=5e-3)
+
+
+def test_pairwise_zig_backend_is_inference_only() -> None:
+    layer = PairwiseLinear(8, 5, tables=3, comparisons=3, backend="zig", seed=1)
+
+    with pytest.raises(RuntimeError, match="inference-only"):
+        layer(torch.randn(4, 8))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not has_tilelang(), reason="requires CUDA TileLang")

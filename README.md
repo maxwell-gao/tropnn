@@ -41,6 +41,7 @@ Inference remains fully hard.
 - `backend.py` and `backends/triton_scores.py`: tropical score backend dispatch
 - `backends/tilelang_route.py`: optional fused TileLang tropical route/code backend
 - `backends/pairwise_tilelang.py`: optional fused TileLang pairwise route/LUT backend
+- `backends/pairwise_zig.py`: optional Zig CPU pairwise inference backend
 - `examples/emnist.py`: EMNIST training example for `tropical` and `pairwise`
 - `tools/benchmark.py`: backend benchmark for `TropLinear` and `PairwiseLinear`
 - `tools/profile.py`: forward profiler for `tropical` and `pairwise`
@@ -65,6 +66,9 @@ print(pairwise(x).shape)
 
 pairwise_tilelang = PairwiseLinear(256, 512, tables=16, comparisons=6, backend="tilelang").cuda()
 print(pairwise_tilelang(x.cuda()).shape)
+
+pairwise_zig = PairwiseLinear(256, 512, tables=16, comparisons=6, backend="zig", cpu_lut_dtype="f16").eval()
+print(pairwise_zig(x.cpu()).shape)
 ```
 
 ## EMNIST Example
@@ -92,7 +96,13 @@ Pairwise uses the same script with `--family pairwise --pairwise-tables 136 --co
 
 `backend="tilelang"` is an explicit CUDA backend for `TropLinear` and `PairwiseLinear`. `TropLinear` fuses routing and selected-code accumulation for both eval and train-time min-face backward. `PairwiseLinear` fuses comparator routing, output-block LUT row reads, vectorized LUT-gradient scatter, and block-reduced LUT/STE backward; its TileLang path currently supports the `fast_sigmoid_odd` LUT surrogate. If TileLang compilation fails, ensure a CUDA toolkit compatible with the GPU is first on `PATH` and export `CC=/usr/bin/gcc CXX=/usr/bin/g++`.
 
-CPU inference currently uses the torch path. The TileLang wheel used here exposes CUDA compilation, but not LLVM CPU codegen; for CPU deployment, benchmark `torch.compile(layer.eval(), mode="reduce-overhead")` instead of `backend="tilelang"`.
+`backend="zig"` is an explicit CPU inference backend for `PairwiseLinear`. It uses the bundled `kernels/src` Zig LUT kernels inside this package, compiles them with the pinned `ziglang==0.16.0` package, and runs no-cache compare/LUT forward in f32 or f16 row-read mode. Install it with:
+
+```bash
+uv sync --extra cpu
+```
+
+Use `cpu_lut_dtype="f32"` for exact f32 row reads, or `cpu_lut_dtype="f16"` to reduce LUT bandwidth during inference. The Zig backend is inference-only; call `.eval()` before use. If you need to override the compiler path, set `TROPNN_ZIG`, for example `TROPNN_ZIG="/path/to/zig"`.
 
 ## Profiling
 
@@ -109,6 +119,16 @@ uv run python -m tropnn.tools.profile \
   --pairwise-comparisons 6 \
   --tropical-backend tilelang \
   --pairwise-backend tilelang
+```
+
+CPU pairwise benchmark:
+
+```bash
+uv run python -m tropnn.tools.benchmark \
+  --device cpu \
+  --batch-size 1 \
+  --steps 1000 \
+  --pairwise-zig-dtype f16
 ```
 
 ## Scope
