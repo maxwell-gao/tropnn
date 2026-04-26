@@ -62,14 +62,18 @@ def test_all_scaling_families_run_one_train_step() -> None:
         assert "geometry_loss" in row
         assert "code_norm_loss" in row
         assert "route_balance_loss" in row
+        assert "scale_abs_mean" in row
+        assert "scale_std" in row
+        assert "selected_scale_abs_mean" in row
+        assert "selected_scale_std" in row
         assert "recovery_diag_loss" in row
         assert "recovery_offdiag_loss" in row
         assert "recovery_loss" in row
-        if family not in {"tropical", "tied_tropical"}:
+        if family not in {"tropical", "tropical_film", "tied_tropical"}:
             assert float(row["geometry_loss"]) == 0.0
             assert float(row["code_norm_loss"]) == 0.0
             assert float(row["route_balance_loss"]) == 0.0
-        if family not in {"tropical", "tied_tropical", "tied_pairwise"}:
+        if family not in {"tropical", "tropical_film", "tied_tropical", "tied_pairwise"}:
             assert float(row["recovery_diag_loss"]) == 0.0
             assert float(row["recovery_offdiag_loss"]) == 0.0
 
@@ -95,6 +99,8 @@ def test_quick_scaling_benchmark_writes_outputs(tmp_path) -> None:
         "mean_offdiag_weighted_energy",
         "mean_geometry_loss",
         "mean_recovery_diag_loss",
+        "mean_scale_abs",
+        "mean_selected_scale_abs",
     }.issubset(summary["group_metrics"][0])
 
 
@@ -170,6 +176,45 @@ def test_tropical_recovery_regularizers_run_one_train_step() -> None:
     assert float(row["total_loss"]) >= float(row["task_loss"])
 
 
+def test_tropical_film_regularizers_run_one_train_step() -> None:
+    row = run_config(
+        RunConfig(
+            family="tropical_film",
+            n_features=16,
+            model_dim=4,
+            alpha=1.0,
+            activation_density=1.0,
+            batch_size=8,
+            steps=1,
+            lr=1e-3,
+            paper_lr=1e-2,
+            weight_decay=-1.0,
+            heads=4,
+            cells=3,
+            code_scale_mode="linear",
+            pairwise_tables=0,
+            comparisons=2,
+            seed=0,
+            device="cpu",
+            backend="torch",
+            code_geometry_loss="welch",
+            code_geometry_weight=0.01,
+            code_norm_weight=0.001,
+            route_balance_weight=0.001,
+            recovery_diag_weight=0.001,
+            recovery_offdiag_weight=0.001,
+            output_lr_mult=3.0,
+        )
+    )
+
+    assert row["family"] == "tropical_film"
+    assert float(row["output_lr_mult"]) == 3.0
+    assert float(row["geometry_loss"]) >= 0.0
+    assert float(row["recovery_loss"]) >= 0.0
+    assert float(row["scale_abs_mean"]) >= 0.0
+    assert float(row["selected_scale_abs_mean"]) >= 0.0
+
+
 def test_tied_tropical_regularizers_run_one_train_step() -> None:
     row = run_config(
         RunConfig(
@@ -241,7 +286,7 @@ def test_sweep_lists_expand_tropical_only() -> None:
     import argparse
 
     args = argparse.Namespace(
-        families="paper,untied_paper,tropical,tied_tropical,pairwise,tied_pairwise",
+        families="paper,untied_paper,tropical,tropical_film,tropical_zero_dense,tied_tropical,pairwise,tied_pairwise",
         n_features=16,
         model_dims="4",
         alphas="1.0",
@@ -259,6 +304,7 @@ def test_sweep_lists_expand_tropical_only() -> None:
         code_scale_modes="sqrt,linear",
         pairwise_tables=0,
         comparisons=2,
+        route_terms=2,
         seeds="0",
         device="cpu",
         backend="torch",
@@ -274,15 +320,19 @@ def test_sweep_lists_expand_tropical_only() -> None:
     configs = _configs_from_args(args)
 
     assert len([config for config in configs if config.family == "tropical"]) == 8
+    assert len([config for config in configs if config.family == "tropical_film"]) == 8
+    assert len([config for config in configs if config.family == "tropical_zero_dense"]) == 1
     assert len([config for config in configs if config.family == "tied_tropical"]) == 8
     assert len([config for config in configs if config.family == "paper"]) == 1
     assert len([config for config in configs if config.family == "untied_paper"]) == 1
     assert len([config for config in configs if config.family == "pairwise"]) == 1
     assert len([config for config in configs if config.family == "tied_pairwise"]) == 1
-    assert all(config.code_geometry_weight == 0.01 for config in configs if config.family in {"tropical", "tied_tropical"})
-    assert all(config.recovery_diag_weight == 0.001 for config in configs if config.family in {"tropical", "tied_tropical", "tied_pairwise"})
+    assert all(config.heads == config.model_dim for config in configs if config.family == "tropical_zero_dense")
+    assert all(config.code_geometry_weight == 0.01 for config in configs if config.family in {"tropical", "tropical_film", "tied_tropical"})
+    recovery_families = {"tropical", "tropical_film", "tied_tropical", "tied_pairwise"}
+    assert all(config.recovery_diag_weight == 0.001 for config in configs if config.family in recovery_families)
     assert all(config.recovery_diag_weight == 0.0 for config in configs if config.family in {"paper", "untied_paper", "pairwise"})
-    assert all(config.output_lr_mult == 3.0 for config in configs if config.family == "tropical")
-    assert all(config.output_lr_mult == 1.0 for config in configs if config.family != "tropical")
-    assert all(config.code_geometry_weight == 0.0 for config in configs if config.family not in {"tropical", "tied_tropical"})
-    assert all(config.code_geometry_loss == "none" for config in configs if config.family not in {"tropical", "tied_tropical"})
+    assert all(config.output_lr_mult == 3.0 for config in configs if config.family in {"tropical", "tropical_film"})
+    assert all(config.output_lr_mult == 1.0 for config in configs if config.family not in {"tropical", "tropical_film"})
+    assert all(config.code_geometry_weight == 0.0 for config in configs if config.family not in {"tropical", "tropical_film", "tied_tropical"})
+    assert all(config.code_geometry_loss == "none" for config in configs if config.family not in {"tropical", "tropical_film", "tied_tropical"})

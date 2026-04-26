@@ -15,14 +15,24 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ..backend import Backend, trop_scores
-from ..layers import PairwiseLinear, TropLinear
+from ..layers import PairwiseLinear, TropFiLMLinear, TropLinear, TropZeroDenseLinear
 from ..layers.tropical import _minface_mix, _top2_indices
 
-FAMILIES = ("paper", "untied_paper", "linear", "tropical", "tied_tropical", "pairwise", "tied_pairwise")
+FAMILIES = (
+    "paper",
+    "untied_paper",
+    "linear",
+    "tropical",
+    "tropical_film",
+    "tropical_zero_dense",
+    "tied_tropical",
+    "pairwise",
+    "tied_pairwise",
+)
 CODE_SCALE_MODES = ("sqrt", "linear", "none")
 CODE_GEOMETRY_LOSSES = ("none", "welch")
-TROPICAL_FAMILIES = ("tropical", "tied_tropical")
-RECOVERY_REGULARIZER_FAMILIES = ("tropical", "tied_tropical", "tied_pairwise")
+TROPICAL_FAMILIES = ("tropical", "tropical_film", "tied_tropical")
+RECOVERY_REGULARIZER_FAMILIES = ("tropical", "tropical_film", "tied_tropical", "tied_pairwise")
 
 
 @dataclass(frozen=True)
@@ -45,6 +55,7 @@ class RunConfig:
     seed: int
     device: str
     backend: str
+    route_terms: int = 2
     code_geometry_loss: str = "none"
     code_geometry_weight: float = 0.0
     code_norm_weight: float = 0.0
@@ -307,6 +318,29 @@ def _build_model(config: RunConfig, device: torch.device) -> nn.Module:
         )
         layer.code_scale = _code_scale(config.heads, config.code_scale_mode)
         return layer.to(device)
+    if config.family == "tropical_film":
+        layer = TropFiLMLinear(
+            config.n_features,
+            config.n_features,
+            heads=config.heads,
+            cells=config.cells,
+            code_dim=config.model_dim,
+            backend=config.backend,
+            seed=config.seed,
+        )
+        layer.code_scale = _code_scale(config.heads, config.code_scale_mode)
+        return layer.to(device)
+    if config.family == "tropical_zero_dense":
+        layer = TropZeroDenseLinear(
+            config.n_features,
+            config.n_features,
+            heads=config.heads,
+            cells=config.cells,
+            route_terms=config.route_terms,
+            seed=config.seed,
+        )
+        layer.code_scale = _code_scale(config.heads, config.code_scale_mode)
+        return layer.to(device)
     if config.family == "tied_tropical":
         model = TiedTropicalFeatureRecovery(
             config.n_features,
@@ -372,15 +406,32 @@ def _tropical_effective_representations(
     use_training_routes = model.training if training is None else training
     x = torch.eye(n_features, device=device)
     latent = model._project_input(x.unsqueeze(1), torch.float32)
-    scores = model._scores(latent, input_device=device, compute_dtype=torch.float32)
+    score_backend = "torch" if model.backend == "tilelang" else model.backend
+    scores = trop_scores(
+        latent,
+        model.router_weight.to(dtype=torch.float32, device=device),
+        model.router_bias.to(dtype=torch.float32, device=device),
+        backend=score_backend,
+    )
     winner_idx, runner_idx, margins = _top2_indices(scores)
     if use_training_routes:
         winner_codes = model._selected_codes(winner_idx, input_device=device, compute_dtype=torch.float32)
         runner_codes = model._selected_codes(runner_idx, input_device=device, compute_dtype=torch.float32)
         codes = _minface_mix(winner_codes, runner_codes, margins)
+        if isinstance(model, TropFiLMLinear):
+            winner_scales = model._selected_scales(winner_idx, input_device=device, compute_dtype=torch.float32)
+            runner_scales = model._selected_scales(runner_idx, input_device=device, compute_dtype=torch.float32)
+            scales = _minface_mix(winner_scales, runner_scales, margins)
     else:
         codes = model._selected_codes(winner_idx, input_device=device, compute_dtype=torch.float32)
-    reps = (latent + codes.sum(dim=2) * model.code_scale).squeeze(1)
+        if isinstance(model, TropFiLMLinear):
+            scales = model._selected_scales(winner_idx, input_device=device, compute_dtype=torch.float32)
+    if isinstance(model, TropFiLMLinear):
+        scale_delta = scales.sum(dim=2) * model.code_scale
+        offset = codes.sum(dim=2) * model.code_scale
+        reps = (latent * (1.0 + scale_delta) + offset).squeeze(1)
+    else:
+        reps = (latent + codes.sum(dim=2) * model.code_scale).squeeze(1)
     return reps, codes.squeeze(1), scores.squeeze(1)
 
 
@@ -420,18 +471,45 @@ def _route_balance_loss(scores: Tensor, *, target_entropy_norm: float = 0.5) -> 
     return deficit.square().mean()
 
 
+def _scale_metrics(model: nn.Module, selected_scales: Tensor | None = None) -> dict[str, float]:
+    if not isinstance(model, TropFiLMLinear):
+        return {
+            "scale_abs_mean": float("nan"),
+            "scale_std": float("nan"),
+            "selected_scale_abs_mean": float("nan"),
+            "selected_scale_std": float("nan"),
+        }
+    scale = model.scale.float()
+    metrics = {
+        "scale_abs_mean": float(scale.abs().mean().detach().item()),
+        "scale_std": float(scale.std(unbiased=False).detach().item()),
+        "selected_scale_abs_mean": float("nan"),
+        "selected_scale_std": float("nan"),
+    }
+    if selected_scales is not None:
+        selected = selected_scales.float()
+        metrics["selected_scale_abs_mean"] = float(selected.abs().mean().detach().item())
+        metrics["selected_scale_std"] = float(selected.std(unbiased=False).detach().item())
+    return metrics
+
+
+def _tropical_metric_defaults() -> dict[str, float]:
+    return {
+        "geometry_loss": 0.0,
+        "code_norm_loss": 0.0,
+        "route_balance_loss": 0.0,
+        "code_norm_mean": float("nan"),
+        "code_norm_std": float("nan"),
+        "selected_code_norm_mean": float("nan"),
+        "selected_code_norm_std": float("nan"),
+        **_scale_metrics(nn.Identity()),
+    }
+
+
 def _tropical_regularizers(config: RunConfig, model: nn.Module, device: torch.device) -> tuple[Tensor, dict[str, float]]:
     zero = _zero_loss(device)
     if config.family not in TROPICAL_FAMILIES or not isinstance(model, (TropLinear, TiedTropicalFeatureRecovery)):
-        return zero, {
-            "geometry_loss": 0.0,
-            "code_norm_loss": 0.0,
-            "route_balance_loss": 0.0,
-            "code_norm_mean": float("nan"),
-            "code_norm_std": float("nan"),
-            "selected_code_norm_mean": float("nan"),
-            "selected_code_norm_std": float("nan"),
-        }
+        return zero, _tropical_metric_defaults()
 
     needs_reps = (
         config.code_geometry_weight > 0.0
@@ -448,9 +526,16 @@ def _tropical_regularizers(config: RunConfig, model: nn.Module, device: torch.de
             "code_norm_std": float(code_norms.std(unbiased=False).detach().item()),
             "selected_code_norm_mean": float("nan"),
             "selected_code_norm_std": float("nan"),
+            **_scale_metrics(model),
         }
 
     reps, selected_codes, scores = _effective_representations(model, config.n_features, device, training=True)
+    selected_scales = None
+    if isinstance(model, TropFiLMLinear):
+        winner_idx, runner_idx, margins = _top2_indices(scores.unsqueeze(1))
+        winner_scales = model._selected_scales(winner_idx, input_device=device, compute_dtype=torch.float32)
+        runner_scales = model._selected_scales(runner_idx, input_device=device, compute_dtype=torch.float32)
+        selected_scales = _minface_mix(winner_scales, runner_scales, margins).squeeze(1)
     if config.code_geometry_loss == "none":
         geometry_loss = zero
     elif config.code_geometry_loss == "welch":
@@ -475,6 +560,7 @@ def _tropical_regularizers(config: RunConfig, model: nn.Module, device: torch.de
         "code_norm_std": float(code_norms.std(unbiased=False).detach().item()),
         "selected_code_norm_mean": float(selected_norms.mean().detach().item()),
         "selected_code_norm_std": float(selected_norms.std(unbiased=False).detach().item()),
+        **_scale_metrics(model, selected_scales),
     }
 
 
@@ -519,7 +605,7 @@ def _recovery_regularizers(config: RunConfig, model: nn.Module, probs: Tensor) -
 
 
 def _build_optimizer(config: RunConfig, model: nn.Module, lr: float) -> torch.optim.Optimizer:
-    if config.family == "tropical" and isinstance(model, TropLinear) and config.output_lr_mult != 1.0:
+    if config.family in {"tropical", "tropical_film"} and isinstance(model, TropLinear) and config.output_lr_mult != 1.0:
         output_params = list(model.output_proj.parameters())
         output_param_ids = {id(param) for param in output_params}
         base_params = [param for param in model.parameters() if id(param) not in output_param_ids]
@@ -592,7 +678,7 @@ def _representations(model: nn.Module, family: str, n_features: int, device: tor
             rep = model.encode(x)  # type: ignore[attr-defined]
         elif family in TROPICAL_FAMILIES or family == "tied_pairwise":
             rep = _effective_representations(model, n_features, device, training=False)[0][start:stop]
-        elif family == "pairwise":
+        elif family in {"pairwise", "tropical_zero_dense"}:
             rep = model(x).squeeze(1)
         else:
             raise ValueError(f"unknown family {family!r}")
@@ -728,6 +814,23 @@ def _route_metrics(model: nn.Module, family: str, n_features: int, device: torch
         margins = model._last_margins
         assert indices is not None and margins is not None
         return _pairwise_route_metrics_from_indices(indices, margins, n_features)
+    if family == "tropical_zero_dense":
+        x = torch.eye(n_features, device=device)
+        model.eval()
+        model(x)
+        indices = model._last_indices
+        margins = model._last_margins
+        assert indices is not None and margins is not None
+        signatures = indices.squeeze(1).cpu()
+        unique, counts = torch.unique(signatures, dim=0, return_counts=True)
+        probs = counts.float() / counts.sum()
+        entropy = -(probs * probs.log()).sum()
+        return {
+            "route_unique": float(unique.shape[0]),
+            "route_collision_mean": float(counts.float().mean().item()),
+            "route_entropy": float(entropy.item()),
+            "avg_margin": float(margins.float().mean().item()),
+        }
     if family == "tied_pairwise":
         model.eval()
         assert isinstance(model, TiedPairwiseFeatureRecovery)
@@ -747,6 +850,7 @@ def run_config(config: RunConfig) -> dict[str, float | int | str]:
     response = _identity_response(model, config.n_features, device)
     row: dict[str, float | int | str] = asdict(config)
     row["effective_pairwise_tables"] = config.pairwise_tables if config.pairwise_tables > 0 else config.model_dim
+    row["effective_zero_dense_heads"] = config.heads if config.family == "tropical_zero_dense" else float("nan")
     row.update(train_metrics)
     row.update(_overlap_metrics(reps))
     row.update(_frequency_weighted_overlap_metrics(reps, probs))
@@ -779,6 +883,7 @@ def _fit_exponents(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
             code_scale_mode,
             pairwise_tables,
             comparisons,
+            route_terms,
             code_geometry_loss,
             code_geometry_weight,
             code_norm_weight,
@@ -812,6 +917,7 @@ def _fit_exponents(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
                 "code_scale_mode": code_scale_mode,
                 "pairwise_tables": float(pairwise_tables),
                 "comparisons": float(comparisons),
+                "route_terms": float(route_terms),
                 "code_geometry_loss": code_geometry_loss,
                 "code_geometry_weight": float(code_geometry_weight),
                 "code_norm_weight": float(code_norm_weight),
@@ -827,7 +933,7 @@ def _fit_exponents(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
     return summaries
 
 
-def _summary_key(row: dict[str, float | int | str]) -> tuple[str, float, int, int, str, int, int, str, float, float, float, float, float, float]:
+def _summary_key(row: dict[str, float | int | str]) -> tuple[str, float, int, int, str, int, int, int, str, float, float, float, float, float, float]:
     return (
         str(row["family"]),
         float(row["alpha"]),
@@ -836,6 +942,7 @@ def _summary_key(row: dict[str, float | int | str]) -> tuple[str, float, int, in
         str(row["code_scale_mode"]),
         int(row["pairwise_tables"]),
         int(row["comparisons"]),
+        int(row["route_terms"]),
         str(row["code_geometry_loss"]),
         float(row["code_geometry_weight"]),
         float(row["code_norm_weight"]),
@@ -868,6 +975,7 @@ def _group_metrics(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
             code_scale_mode,
             pairwise_tables,
             comparisons,
+            route_terms,
             code_geometry_loss,
             code_geometry_weight,
             code_norm_weight,
@@ -885,6 +993,7 @@ def _group_metrics(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
                 "code_scale_mode": code_scale_mode,
                 "pairwise_tables": float(pairwise_tables),
                 "comparisons": float(comparisons),
+                "route_terms": float(route_terms),
                 "code_geometry_loss": code_geometry_loss,
                 "code_geometry_weight": float(code_geometry_weight),
                 "code_norm_weight": float(code_norm_weight),
@@ -911,6 +1020,10 @@ def _group_metrics(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
                 "mean_recovery_diag_loss": _mean_finite(group, "recovery_diag_loss"),
                 "mean_recovery_offdiag_loss": _mean_finite(group, "recovery_offdiag_loss"),
                 "mean_recovery_loss": _mean_finite(group, "recovery_loss"),
+                "mean_scale_abs": _mean_finite(group, "scale_abs_mean"),
+                "mean_scale_std": _mean_finite(group, "scale_std"),
+                "mean_selected_scale_abs": _mean_finite(group, "selected_scale_abs_mean"),
+                "mean_selected_scale_std": _mean_finite(group, "selected_scale_std"),
                 "points": float(len(group)),
             }
         )
@@ -937,6 +1050,8 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
         raise ValueError(f"recovery_diag_weight must be non-negative, got {args.recovery_diag_weight}")
     if args.recovery_offdiag_weight < 0.0:
         raise ValueError(f"recovery_offdiag_weight must be non-negative, got {args.recovery_offdiag_weight}")
+    if args.route_terms < 1:
+        raise ValueError(f"route_terms must be >= 1, got {args.route_terms}")
     configs = []
     for family in families:
         if family not in FAMILIES:
@@ -948,7 +1063,8 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
         family_code_scale_modes = code_scale_modes if is_tropical_family else [args.code_scale_mode]
         for alpha in alphas:
             for model_dim in model_dims:
-                for heads in family_heads_values:
+                effective_heads_values = [model_dim] if family == "tropical_zero_dense" else family_heads_values
+                for heads in effective_heads_values:
                     for cells in family_cells_values:
                         for code_scale_mode in family_code_scale_modes:
                             if code_scale_mode not in CODE_SCALE_MODES:
@@ -974,13 +1090,14 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
                                         seed=seed,
                                         device=args.device,
                                         backend=args.backend,
+                                        route_terms=args.route_terms,
                                         code_geometry_loss=args.code_geometry_loss if is_tropical_family else "none",
                                         code_geometry_weight=args.code_geometry_weight if is_tropical_family else 0.0,
                                         code_norm_weight=args.code_norm_weight if is_tropical_family else 0.0,
                                         route_balance_weight=args.route_balance_weight if is_tropical_family else 0.0,
                                         recovery_diag_weight=args.recovery_diag_weight if uses_recovery_regularizers else 0.0,
                                         recovery_offdiag_weight=args.recovery_offdiag_weight if uses_recovery_regularizers else 0.0,
-                                        output_lr_mult=args.output_lr_mult if family == "tropical" else 1.0,
+                                        output_lr_mult=args.output_lr_mult if family in {"tropical", "tropical_film"} else 1.0,
                                     )
                                 )
     return configs
@@ -1038,6 +1155,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--output-lr-mult", type=float, default=1.0)
     parser.add_argument("--pairwise-tables", type=int, default=0, help="Use model_dim as PairwiseLinear tables when 0.")
     parser.add_argument("--comparisons", type=int, default=4)
+    parser.add_argument("--route-terms", type=int, default=2, help="Sparse coordinate terms per tropical_zero_dense score.")
     parser.add_argument("--seeds", type=str, default="0")
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")

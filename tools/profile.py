@@ -7,9 +7,92 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn as nn
+from torch import Tensor
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from ..examples.emnist import EmnistRoutedClassifier
+from ..examples.emnist import TROPICAL_FAMILIES, EmnistRoutedClassifier
+from ..layers import TropZeroDenseLinear
+
+TROPICAL_PROFILE_FAMILIES = (*TROPICAL_FAMILIES, "tropical_zero_dense")
+
+
+class ProfileMlpClassifier(nn.Module):
+    """Dense MLP baseline with the same depth convention as EmnistRoutedClassifier."""
+
+    def __init__(self, *, input_dim: int, hidden_dim: int, out_features: int, depth: int, activation: str) -> None:
+        super().__init__()
+        if depth < 1:
+            raise ValueError(f"depth must be >= 1, got {depth}")
+        dims = [input_dim]
+        if depth == 1:
+            dims.append(out_features)
+        else:
+            dims.extend([hidden_dim] * (depth - 1))
+            dims.append(out_features)
+
+        if activation == "relu":
+            act_factory = nn.ReLU
+        elif activation == "gelu":
+            act_factory = nn.GELU
+        else:
+            raise ValueError(f"unknown activation {activation!r}; expected 'relu' or 'gelu'")
+
+        layers: list[nn.Module] = []
+        for idx, (d_in, d_out) in enumerate(zip(dims[:-1], dims[1:])):
+            layers.append(nn.Linear(d_in, d_out))
+            if idx < len(dims) - 2:
+                layers.append(act_factory())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
+class ProfileZeroDenseClassifier(nn.Module):
+    """Stack TropZeroDenseLinear layers with the EMNIST depth convention."""
+
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        hidden_dim: int,
+        out_features: int,
+        depth: int,
+        heads: int,
+        cells: int,
+        route_terms: int,
+        seed: int,
+    ) -> None:
+        super().__init__()
+        if depth < 1:
+            raise ValueError(f"depth must be >= 1, got {depth}")
+        dims = [input_dim]
+        if depth == 1:
+            dims.append(out_features)
+        else:
+            dims.extend([hidden_dim] * (depth - 1))
+            dims.append(out_features)
+        self.layers = nn.ModuleList(
+            [
+                TropZeroDenseLinear(
+                    d_in,
+                    d_out,
+                    heads=heads,
+                    cells=cells,
+                    route_terms=route_terms,
+                    seed=seed + idx,
+                )
+                for idx, (d_in, d_out) in enumerate(zip(dims[:-1], dims[1:]))
+            ]
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+        for layer in self.layers:
+            x = layer(x)
+        return x.squeeze(1)
 
 
 def _sync_if_cuda(device: torch.device) -> None:
@@ -27,12 +110,33 @@ def _build_model(
     heads: int,
     cells: int,
     code_dim: int,
+    route_terms: int,
     pairwise_tables: int,
     comparisons: int,
     backend: str,
+    mlp_activation: str,
     seed: int,
     device: torch.device,
-) -> EmnistRoutedClassifier:
+) -> nn.Module:
+    if family == "mlp":
+        return ProfileMlpClassifier(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            out_features=out_features,
+            depth=depth,
+            activation=mlp_activation,
+        ).to(device)
+    if family == "tropical_zero_dense":
+        return ProfileZeroDenseClassifier(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            out_features=out_features,
+            depth=depth,
+            heads=heads,
+            cells=cells,
+            route_terms=route_terms,
+            seed=seed,
+        ).to(device)
     return EmnistRoutedClassifier(
         family=family,
         input_dim=input_dim,
@@ -42,9 +146,10 @@ def _build_model(
         heads=heads,
         cells=cells,
         code_dim=code_dim,
+        route_terms=route_terms,
         pairwise_tables=pairwise_tables,
         comparisons=comparisons,
-        backend=backend if family == "tropical" else "torch",
+        backend=backend if family in TROPICAL_PROFILE_FAMILIES else "torch",
         seed=seed,
     ).to(device)
 
@@ -82,10 +187,13 @@ def profile_family_forward(
     heads: int = 32,
     cells: int = 4,
     code_dim: int = 32,
+    route_terms: int = 2,
     pairwise_tables: int = 72,
     comparisons: int = 6,
     backend: str = "torch",
+    mlp_activation: str = "gelu",
     warmup: int = 5,
+    measure_steps: int = 50,
     seed: int = 0,
     dtype: str = "float32",
     device: str = "cuda",
@@ -103,9 +211,11 @@ def profile_family_forward(
         heads=heads,
         cells=cells,
         code_dim=code_dim,
+        route_terms=route_terms,
         pairwise_tables=pairwise_tables,
         comparisons=comparisons,
         backend=backend,
+        mlp_activation=mlp_activation,
         seed=seed,
         device=dev,
     )
@@ -120,6 +230,20 @@ def profile_family_forward(
         for _ in range(warmup):
             model(x)
         _sync_if_cuda(dev)
+        if use_cuda:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(measure_steps):
+                model(x)
+            end.record()
+            torch.cuda.synchronize(dev)
+            steady_ms = float(start.elapsed_time(end) / measure_steps)
+        else:
+            t_measure = time.perf_counter()
+            for _ in range(measure_steps):
+                model(x)
+            steady_ms = (time.perf_counter() - t_measure) * 1000.0 / measure_steps
 
         activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if use_cuda else [])
         t0 = time.perf_counter()
@@ -138,13 +262,16 @@ def profile_family_forward(
         "hidden_dim": hidden_dim,
         "out_features": out_features,
         "depth": depth,
-        "heads": heads if family == "tropical" else None,
-        "cells": cells if family == "tropical" else None,
-        "code_dim": code_dim if family == "tropical" else None,
+        "heads": heads if family in TROPICAL_PROFILE_FAMILIES else None,
+        "cells": cells if family in TROPICAL_PROFILE_FAMILIES else None,
+        "code_dim": code_dim if family in TROPICAL_FAMILIES else None,
+        "route_terms": route_terms if family == "tropical_zero_dense" else None,
         "pairwise_tables": pairwise_tables if family == "pairwise" else None,
         "comparisons": comparisons if family == "pairwise" else None,
-        "backend": backend if family == "tropical" else "torch",
+        "mlp_activation": mlp_activation if family == "mlp" else None,
+        "backend": backend if family in TROPICAL_FAMILIES else "torch",
         "params": int(sum(param.numel() for param in model.parameters())),
+        "steady_ms": steady_ms,
         "wall_ms": wall_ms,
         "peak_device_memory_bytes": int(torch.cuda.max_memory_allocated(dev)) if use_cuda else 0,
         "top_ops": _event_rows(list(prof.key_averages()), use_cuda=use_cuda, limit=top_ops),
@@ -162,16 +289,37 @@ def profile_family_set(
     tropical_cells: int = 4,
     tropical_code_dim: int = 32,
     tropical_backend: str = "torch",
+    zero_dense_heads: int = 32,
+    zero_dense_cells: int = 4,
+    zero_dense_route_terms: int = 2,
+    mlp_hidden: int = 128,
+    mlp_activation: str = "gelu",
     pairwise_hidden: int = 128,
     pairwise_tables: int = 72,
     pairwise_comparisons: int = 6,
     warmup: int = 5,
+    measure_steps: int = 50,
     seed: int = 0,
     dtype: str = "float32",
     device: str = "cuda",
     top_ops: int = 12,
 ) -> dict[str, Any]:
     return {
+        "mlp": profile_family_forward(
+            "mlp",
+            batch_size=batch_size,
+            input_dim=input_dim,
+            hidden_dim=mlp_hidden,
+            out_features=out_features,
+            depth=depth,
+            mlp_activation=mlp_activation,
+            warmup=warmup,
+            measure_steps=measure_steps,
+            seed=seed,
+            dtype=dtype,
+            device=device,
+            top_ops=top_ops,
+        ),
         "tropical": profile_family_forward(
             "tropical",
             batch_size=batch_size,
@@ -184,6 +332,42 @@ def profile_family_set(
             code_dim=tropical_code_dim,
             backend=tropical_backend,
             warmup=warmup,
+            measure_steps=measure_steps,
+            seed=seed,
+            dtype=dtype,
+            device=device,
+            top_ops=top_ops,
+        ),
+        "tropical_film": profile_family_forward(
+            "tropical_film",
+            batch_size=batch_size,
+            input_dim=input_dim,
+            hidden_dim=tropical_hidden,
+            out_features=out_features,
+            depth=depth,
+            heads=tropical_heads,
+            cells=tropical_cells,
+            code_dim=tropical_code_dim,
+            backend=tropical_backend,
+            warmup=warmup,
+            measure_steps=measure_steps,
+            seed=seed,
+            dtype=dtype,
+            device=device,
+            top_ops=top_ops,
+        ),
+        "tropical_zero_dense": profile_family_forward(
+            "tropical_zero_dense",
+            batch_size=batch_size,
+            input_dim=input_dim,
+            hidden_dim=tropical_hidden,
+            out_features=out_features,
+            depth=depth,
+            heads=zero_dense_heads,
+            cells=zero_dense_cells,
+            route_terms=zero_dense_route_terms,
+            warmup=warmup,
+            measure_steps=measure_steps,
             seed=seed,
             dtype=dtype,
             device=device,
@@ -199,6 +383,7 @@ def profile_family_set(
             pairwise_tables=pairwise_tables,
             comparisons=pairwise_comparisons,
             warmup=warmup,
+            measure_steps=measure_steps,
             seed=seed,
             dtype=dtype,
             device=device,
@@ -210,7 +395,8 @@ def profile_family_set(
 def _print_summary(results: dict[str, Any]) -> None:
     for family, summary in results.items():
         print(
-            f"[{family}] params={summary['params']} wall_ms={summary['wall_ms']:.3f} peak_device_memory_bytes={summary['peak_device_memory_bytes']}"
+            f"[{family}] params={summary['params']} steady_ms={summary['steady_ms']:.3f} "
+            f"wall_ms={summary['wall_ms']:.3f} peak_device_memory_bytes={summary['peak_device_memory_bytes']}"
         )
         for row in summary["top_ops"]:
             time_us = row["device_time_us"] if summary["device"] == "cuda" else row["self_cpu_time_us"]
@@ -225,6 +411,7 @@ def main() -> None:
         ("--out-features", 10),
         ("--depth", 2),
         ("--warmup", 5),
+        ("--measure-steps", 50),
         ("--seed", 0),
         ("--top-ops", 12),
     ):
@@ -236,6 +423,11 @@ def main() -> None:
     parser.add_argument("--tropical-cells", type=int, default=4)
     parser.add_argument("--tropical-code-dim", type=int, default=32)
     parser.add_argument("--tropical-backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
+    parser.add_argument("--zero-dense-heads", type=int, default=32)
+    parser.add_argument("--zero-dense-cells", type=int, default=4)
+    parser.add_argument("--zero-dense-route-terms", type=int, default=2)
+    parser.add_argument("--mlp-hidden", type=int, default=128)
+    parser.add_argument("--mlp-activation", choices=("relu", "gelu"), default="gelu")
     parser.add_argument("--pairwise-hidden", type=int, default=128)
     parser.add_argument("--pairwise-tables", type=int, default=72)
     parser.add_argument("--pairwise-comparisons", type=int, default=6)
@@ -252,10 +444,16 @@ def main() -> None:
         tropical_cells=args.tropical_cells,
         tropical_code_dim=args.tropical_code_dim,
         tropical_backend=args.tropical_backend,
+        zero_dense_heads=args.zero_dense_heads,
+        zero_dense_cells=args.zero_dense_cells,
+        zero_dense_route_terms=args.zero_dense_route_terms,
+        mlp_hidden=args.mlp_hidden,
+        mlp_activation=args.mlp_activation,
         pairwise_hidden=args.pairwise_hidden,
         pairwise_tables=args.pairwise_tables,
         pairwise_comparisons=args.pairwise_comparisons,
         warmup=args.warmup,
+        measure_steps=args.measure_steps,
         seed=args.seed,
         dtype=args.dtype,
         device=args.device,

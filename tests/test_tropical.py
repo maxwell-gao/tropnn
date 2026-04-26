@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tropnn import TropLinear
+import torch.nn as nn
+from tropnn import TropFiLMLinear, TropLinear, TropZeroDenseLinear
 from tropnn.backend import trop_scores, trop_scores_reference
 
 
@@ -65,6 +66,101 @@ def test_trop_linear_train_has_router_code_and_output_gradients() -> None:
         assert param.grad is not None
         assert torch.isfinite(param.grad).all()
         assert float(param.grad.abs().sum()) > 0.0
+
+
+def test_trop_film_linear_starts_as_trop_linear() -> None:
+    base = TropLinear(5, 3, heads=4, cells=3, code_dim=4, seed=0)
+    film = TropFiLMLinear(5, 3, heads=4, cells=3, code_dim=4, seed=0)
+    x = torch.randn(7, 2, 5)
+
+    assert torch.allclose(film.scale, torch.zeros_like(film.scale))
+    assert torch.allclose(film(x), base(x), atol=1e-6)
+
+
+def test_trop_film_linear_eval_uses_selected_scale_and_offset() -> None:
+    layer = TropFiLMLinear(1, 1, heads=1, cells=3, code_dim=1, seed=0, use_output_scaling=False)
+    with torch.no_grad():
+        layer.proj.weight.fill_(1.0)
+        layer.router_weight[0, :, 0] = torch.tensor([1.0, 0.0, -1.0])
+        layer.router_bias.zero_()
+        layer.code[0, :, 0] = torch.tensor([10.0, 20.0, 30.0])
+        layer.scale[0, :, 0] = torch.tensor([0.5, 0.0, -0.5])
+        layer.output_proj.weight.fill_(1.0)
+        layer.output_proj.bias.zero_()
+
+    layer.eval()
+
+    assert torch.allclose(layer(torch.tensor([[2.0]])).squeeze(), torch.tensor(13.0))
+    assert torch.allclose(layer(torch.tensor([[-2.0]])).squeeze(), torch.tensor(29.0))
+
+
+def test_trop_film_linear_train_has_scale_gradients() -> None:
+    layer = TropFiLMLinear(6, 4, heads=6, cells=4, code_dim=5, seed=0)
+    x = torch.randn(8, 2, 6, requires_grad=True)
+
+    y = layer(x)
+    loss = y.square().mean()
+    loss.backward()
+
+    assert x.grad is not None
+    assert layer.scale.grad is not None
+    assert torch.isfinite(layer.scale.grad).all()
+    assert float(layer.scale.grad.abs().sum()) > 0.0
+
+
+def test_trop_zero_dense_shapes_for_2d_and_3d_inputs() -> None:
+    layer = TropZeroDenseLinear(5, 3, heads=4, cells=3, route_terms=2, seed=0)
+
+    y2 = layer(torch.randn(7, 5))
+    y3 = layer(torch.randn(7, 2, 5))
+
+    assert y2.shape == (7, 1, 3)
+    assert y3.shape == (7, 2, 3)
+    assert layer._last_indices is not None
+    assert layer._last_margins is not None
+
+
+def test_trop_zero_dense_has_no_linear_submodules() -> None:
+    layer = TropZeroDenseLinear(5, 3, heads=4, cells=3, route_terms=2, seed=0)
+
+    assert not any(isinstance(module, nn.Linear) for module in layer.modules())
+
+
+def test_trop_zero_dense_eval_uses_only_winner_code() -> None:
+    layer = TropZeroDenseLinear(2, 1, heads=1, cells=2, route_terms=1, seed=0, use_output_scaling=False)
+    with torch.no_grad():
+        layer.anchors[0, 0, 0] = 0
+        layer.anchors[0, 1, 0] = 1
+        layer.router_weight.fill_(1.0)
+        layer.router_bias.zero_()
+        layer.code[0, :, 0] = torch.tensor([10.0, 20.0])
+        layer.bias.zero_()
+
+    layer.eval()
+
+    assert torch.allclose(layer(torch.tensor([[2.0, 1.0]])).squeeze(), torch.tensor(10.0))
+    assert torch.allclose(layer(torch.tensor([[0.0, 3.0]])).squeeze(), torch.tensor(20.0))
+
+
+def test_trop_zero_dense_train_has_router_code_and_input_gradients() -> None:
+    layer = TropZeroDenseLinear(6, 4, heads=6, cells=4, route_terms=2, seed=0)
+    x = torch.randn(8, 2, 6, requires_grad=True)
+
+    y = layer(x)
+    loss = y.square().mean()
+    loss.backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    for param in (layer.router_weight, layer.router_bias, layer.code):
+        assert param.grad is not None
+        assert torch.isfinite(param.grad).all()
+        assert float(param.grad.abs().sum()) > 0.0
+
+
+def test_trop_zero_dense_rejects_empty_sparse_routes() -> None:
+    with pytest.raises(ValueError, match="route_terms"):
+        TropZeroDenseLinear(5, 3, route_terms=0)
 
 
 def test_trop_scores_reference_uses_native_head_cell_shape() -> None:

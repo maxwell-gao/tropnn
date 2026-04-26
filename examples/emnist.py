@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..layers import PairwiseLinear, TropLinear
+from ..layers import PairwiseLinear, TropFiLMLinear, TropLinear, TropZeroDenseLinear
 
 IDX_DTYPES = {
     0x08: np.uint8,
@@ -28,7 +28,9 @@ IDX_DTYPES = {
     0x0E: np.dtype(">f8"),
 }
 EMNIST_SPLITS = ("byclass", "bymerge", "balanced", "letters", "digits", "mnist")
-ROUTED_FAMILIES = ("tropical", "pairwise")
+ROUTED_FAMILIES = ("tropical", "tropical_film", "tropical_zero_dense", "pairwise")
+TROPICAL_FAMILIES = ("tropical", "tropical_film")
+HEAD_ROUTED_FAMILIES = ("tropical", "tropical_film", "tropical_zero_dense")
 
 
 def _read_idx(path: Path) -> np.ndarray:
@@ -90,6 +92,7 @@ def _make_layer(
     heads: int,
     cells: int,
     code_dim: int,
+    route_terms: int,
     comparisons: int,
     pairwise_tables: int,
     backend: str,
@@ -97,6 +100,10 @@ def _make_layer(
 ) -> nn.Module:
     if family == "tropical":
         return TropLinear(d_in, d_out, heads=heads, cells=cells, code_dim=code_dim, backend=backend, seed=seed)
+    if family == "tropical_film":
+        return TropFiLMLinear(d_in, d_out, heads=heads, cells=cells, code_dim=code_dim, backend=backend, seed=seed)
+    if family == "tropical_zero_dense":
+        return TropZeroDenseLinear(d_in, d_out, heads=heads, cells=cells, route_terms=route_terms, seed=seed)
     return PairwiseLinear(d_in, d_out, tables=pairwise_tables, comparisons=comparisons, backend="torch", seed=seed)
 
 
@@ -112,6 +119,7 @@ class EmnistRoutedClassifier(nn.Module):
         heads: int,
         cells: int,
         code_dim: int,
+        route_terms: int,
         comparisons: int,
         pairwise_tables: int,
         backend: str,
@@ -134,6 +142,7 @@ class EmnistRoutedClassifier(nn.Module):
                     heads=heads,
                     cells=cells,
                     code_dim=code_dim,
+                    route_terms=route_terms,
                     comparisons=comparisons,
                     pairwise_tables=pairwise_tables,
                     backend=backend,
@@ -154,6 +163,16 @@ class EmnistRoutedClassifier(nn.Module):
 class EmnistTropClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
         super().__init__(family="tropical", **kwargs)
+
+
+class EmnistTropFiLMClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="tropical_film", **kwargs)
+
+
+class EmnistTropZeroDenseClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="tropical_zero_dense", **kwargs)
 
 
 class EmnistPairwiseClassifier(EmnistRoutedClassifier):
@@ -211,6 +230,7 @@ def main() -> None:
         ("--heads", int, 32),
         ("--cells", int, 4),
         ("--code-dim", int, 32),
+        ("--route-terms", int, 2),
         ("--pairwise-tables", int, 72),
         ("--comparisons", int, 6),
     ):
@@ -255,6 +275,7 @@ def main() -> None:
         heads=args.heads,
         cells=args.cells,
         code_dim=args.code_dim,
+        route_terms=args.route_terms,
         comparisons=args.comparisons,
         pairwise_tables=args.pairwise_tables,
         backend=args.backend,
@@ -269,12 +290,13 @@ def main() -> None:
         "family": args.family,
         "depth": args.depth,
         "hidden_dim": args.hidden_dim,
-        "heads": args.heads if args.family == "tropical" else "-",
-        "cells": args.cells if args.family == "tropical" else "-",
-        "code_dim": args.code_dim if args.family == "tropical" else "-",
+        "heads": args.heads if args.family in HEAD_ROUTED_FAMILIES else "-",
+        "cells": args.cells if args.family in HEAD_ROUTED_FAMILIES else "-",
+        "code_dim": args.code_dim if args.family in TROPICAL_FAMILIES else "-",
+        "route_terms": args.route_terms if args.family == "tropical_zero_dense" else "-",
         "pairwise_tables": args.pairwise_tables if args.family == "pairwise" else "-",
         "comparisons": args.comparisons if args.family == "pairwise" else "-",
-        "backend": args.backend if args.family == "tropical" else "torch",
+        "backend": args.backend if args.family in TROPICAL_FAMILIES else "torch",
         "train/test": f"{len(x_train)}/{len(x_test)}",
         "device": device.type,
         "params": sum(param.numel() for param in model.parameters()),
