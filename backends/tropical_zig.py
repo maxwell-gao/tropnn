@@ -6,7 +6,7 @@ from typing import Literal
 import torch
 from torch import Tensor
 
-from .zig_runtime import has_zig_backend, load_zig_library, tensor_ptr
+from .zig_runtime import configure_zig_threads, has_zig_backend, load_zig_library, tensor_ptr
 
 
 def has_tropical_zig() -> bool:
@@ -28,6 +28,7 @@ def _load_tropical_library() -> ctypes.CDLL:
         lib.trop_route_hidden_batch_f16.argtypes = common_args
         lib.trop_route_hidden_batch_f16.restype = None
         _ARGS_REGISTERED = True
+    configure_zig_threads(lib)
     return lib
 
 

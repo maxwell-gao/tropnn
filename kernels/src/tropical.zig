@@ -1,4 +1,5 @@
 const std = @import("std");
+const parallel = @import("parallel.zig");
 const simd = @import("simd.zig");
 
 inline fn bestCellF32Generic(
@@ -170,6 +171,62 @@ inline fn bestCellF16(
     };
 }
 
+const TropRouteF32Context = struct {
+    heads: usize,
+    cells: usize,
+    code_dim: usize,
+    code_scale: f32,
+    latent: [*]const f32,
+    router_weight: [*]const f32,
+    router_bias: [*]const f32,
+    code: [*]const f32,
+    hidden: [*]f32,
+};
+
+fn tropRouteF32Range(ctx: *TropRouteF32Context, row_start: usize, row_end: usize) void {
+    var row = row_start;
+    while (row < row_end) : (row += 1) {
+        const latent_ptr = ctx.latent + row * ctx.code_dim;
+        const hidden_ptr = ctx.hidden + row * ctx.code_dim;
+        simd.copy(hidden_ptr, latent_ptr, ctx.code_dim);
+
+        var head: usize = 0;
+        while (head < ctx.heads) : (head += 1) {
+            const cell = bestCellF32(latent_ptr, ctx.router_weight, ctx.router_bias, head, ctx.cells, ctx.code_dim);
+            const code_base = (head * ctx.cells + cell) * ctx.code_dim;
+            simd.addScaled(hidden_ptr, ctx.code + code_base, ctx.code_scale, ctx.code_dim);
+        }
+    }
+}
+
+const TropRouteF16Context = struct {
+    heads: usize,
+    cells: usize,
+    code_dim: usize,
+    code_scale: f32,
+    latent: [*]const f32,
+    router_weight: [*]const f16,
+    router_bias: [*]const f16,
+    code: [*]const f16,
+    hidden: [*]f32,
+};
+
+fn tropRouteF16Range(ctx: *TropRouteF16Context, row_start: usize, row_end: usize) void {
+    var row = row_start;
+    while (row < row_end) : (row += 1) {
+        const latent_ptr = ctx.latent + row * ctx.code_dim;
+        const hidden_ptr = ctx.hidden + row * ctx.code_dim;
+        simd.copy(hidden_ptr, latent_ptr, ctx.code_dim);
+
+        var head: usize = 0;
+        while (head < ctx.heads) : (head += 1) {
+            const cell = bestCellF16(latent_ptr, ctx.router_weight, ctx.router_bias, head, ctx.cells, ctx.code_dim);
+            const code_base = (head * ctx.cells + cell) * ctx.code_dim;
+            simd.addScaledF16(hidden_ptr, ctx.code + code_base, ctx.code_scale, ctx.code_dim);
+        }
+    }
+}
+
 /// Batch TropLinear route/code forward with f32 router and code parameters.
 /// Shape contract:
 /// - latent: [item_count, code_dim]
@@ -189,19 +246,18 @@ export fn trop_route_hidden_batch_f32(
     code: [*]const f32,
     hidden: [*]f32,
 ) void {
-    var row: usize = 0;
-    while (row < item_count) : (row += 1) {
-        const latent_ptr = latent + row * code_dim;
-        const hidden_ptr = hidden + row * code_dim;
-        simd.copy(hidden_ptr, latent_ptr, code_dim);
-
-        var head: usize = 0;
-        while (head < heads) : (head += 1) {
-            const cell = bestCellF32(latent_ptr, router_weight, router_bias, head, cells, code_dim);
-            const code_base = (head * cells + cell) * code_dim;
-            simd.addScaled(hidden_ptr, code + code_base, code_scale, code_dim);
-        }
-    }
+    var ctx = TropRouteF32Context{
+        .heads = heads,
+        .cells = cells,
+        .code_dim = code_dim,
+        .code_scale = code_scale,
+        .latent = latent,
+        .router_weight = router_weight,
+        .router_bias = router_bias,
+        .code = code,
+        .hidden = hidden,
+    };
+    parallel.parallelFor(TropRouteF32Context, &ctx, item_count, 128, tropRouteF32Range);
 }
 
 /// Batch TropLinear route/code forward with f16 router/code parameters and f32 accumulation.
@@ -217,19 +273,18 @@ export fn trop_route_hidden_batch_f16(
     code: [*]const f16,
     hidden: [*]f32,
 ) void {
-    var row: usize = 0;
-    while (row < item_count) : (row += 1) {
-        const latent_ptr = latent + row * code_dim;
-        const hidden_ptr = hidden + row * code_dim;
-        simd.copy(hidden_ptr, latent_ptr, code_dim);
-
-        var head: usize = 0;
-        while (head < heads) : (head += 1) {
-            const cell = bestCellF16(latent_ptr, router_weight, router_bias, head, cells, code_dim);
-            const code_base = (head * cells + cell) * code_dim;
-            simd.addScaledF16(hidden_ptr, code + code_base, code_scale, code_dim);
-        }
-    }
+    var ctx = TropRouteF16Context{
+        .heads = heads,
+        .cells = cells,
+        .code_dim = code_dim,
+        .code_scale = code_scale,
+        .latent = latent,
+        .router_weight = router_weight,
+        .router_bias = router_bias,
+        .code = code,
+        .hidden = hidden,
+    };
+    parallel.parallelFor(TropRouteF16Context, &ctx, item_count, 128, tropRouteF16Range);
 }
 
 test "f32 tropical route selects best cells" {

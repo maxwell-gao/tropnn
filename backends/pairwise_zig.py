@@ -6,7 +6,7 @@ from typing import Literal
 import torch
 from torch import Tensor
 
-from .zig_runtime import has_zig_backend, load_zig_library, tensor_ptr
+from .zig_runtime import configure_zig_threads, has_zig_backend, load_zig_library, tensor_ptr
 
 
 def has_pairwise_zig() -> bool:
@@ -28,6 +28,7 @@ def _load_pairwise_library() -> ctypes.CDLL:
         lib.lut_forward_batch_f16_no_cache.argtypes = common_args
         lib.lut_forward_batch_f16_no_cache.restype = None
         _ARGS_REGISTERED = True
+    configure_zig_threads(lib)
     return lib
 
 

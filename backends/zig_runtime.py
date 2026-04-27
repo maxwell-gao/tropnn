@@ -14,6 +14,7 @@ from torch import Tensor
 
 _BUILD_LOCK = threading.Lock()
 _LIB: ctypes.CDLL | None = None
+_THREAD_ARGS_REGISTERED = False
 
 
 def package_root() -> Path:
@@ -52,6 +53,7 @@ def _zig_version(command: list[str]) -> str:
 def _source_digest(root: Path, zig_version: str) -> str:
     digest = hashlib.sha256()
     digest.update(zig_version.encode())
+    digest.update(b"fno-single-threaded-link-libc")
     digest.update(sys.platform.encode())
     digest.update(os.uname().machine.encode() if hasattr(os, "uname") else b"unknown")
     for path in sorted(root.rglob("*.zig")):
@@ -103,6 +105,8 @@ def _build_library() -> Path:
         "-fPIC",
         "-O",
         "ReleaseFast",
+        "-fno-single-threaded",
+        "-lc",
         "-mcpu=native",
         f"-femit-bin={tmp_path}",
         str(lib_zig),
@@ -131,6 +135,35 @@ def load_zig_library() -> ctypes.CDLL:
             return _LIB
         _LIB = ctypes.CDLL(str(_build_library()))
         return _LIB
+
+
+def zig_num_threads() -> int:
+    env_threads = os.environ.get("TROPNN_ZIG_THREADS")
+    if env_threads:
+        try:
+            return max(0, int(env_threads))
+        except ValueError as exc:
+            raise ValueError(f"TROPNN_ZIG_THREADS must be an integer, got {env_threads!r}") from exc
+
+    try:
+        import torch
+
+        return max(1, int(torch.get_num_threads()))
+    except Exception:
+        return max(1, os.cpu_count() or 1)
+
+
+def configure_zig_threads(lib: ctypes.CDLL | None = None) -> None:
+    global _THREAD_ARGS_REGISTERED
+    if lib is None:
+        lib = load_zig_library()
+    if not _THREAD_ARGS_REGISTERED:
+        lib.tropnn_set_num_threads.argtypes = [ctypes.c_size_t]
+        lib.tropnn_set_num_threads.restype = None
+        lib.tropnn_get_num_threads.argtypes = []
+        lib.tropnn_get_num_threads.restype = ctypes.c_size_t
+        _THREAD_ARGS_REGISTERED = True
+    lib.tropnn_set_num_threads(zig_num_threads())
 
 
 def tensor_ptr(tensor: Tensor) -> ctypes.c_void_p:
