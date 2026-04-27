@@ -6,7 +6,7 @@ import time
 import torch
 from torch import Tensor
 
-from ..backend import has_pairwise_zig, has_tilelang, has_triton, has_tropical_zig, trop_scores, trop_scores_reference
+from ..backend import has_pairwise_zig, has_tilelang, has_triton, has_trop_fan_zig, has_tropical_zig, trop_scores, trop_scores_reference
 from ..layers import PairwiseLinear, TropFanLinear, TropLinear
 
 
@@ -169,6 +169,7 @@ def benchmark_trop_linear_auto(
     fan_basis_rank: int = 16,
     tropical_zig_dtype: str = "f32",
     pairwise_zig_dtype: str = "f32",
+    fan_zig_dtype: str = "f32",
 ) -> dict[str, float]:
     dev = torch.device(device)
     torch.manual_seed(seed)
@@ -269,9 +270,24 @@ def benchmark_trop_linear_auto(
         fan_value_mode="basis",
         fan_basis_rank=fan_basis_rank,
     ).to(dev)
+    fan_zig = TropFanLinear(
+        in_features,
+        out_features,
+        heads=heads,
+        cells=cells,
+        code_dim=code_dim,
+        backend="zig",
+        seed=seed,
+        fan_value_mode="basis",
+        fan_basis_rank=fan_basis_rank,
+        cpu_param_dtype=fan_zig_dtype,  # type: ignore[arg-type]
+    )
     _copy_fan_basis_weights(fan_tilelang, fan_torch)
+    if dev.type == "cpu":
+        _copy_fan_basis_weights(fan_zig, fan_torch)
     fan_torch.eval()
     fan_tilelang.eval()
+    fan_zig.eval()
     if sequence_length > 1:
         x = torch.randn(batch_size, sequence_length, in_features, device=dev)
     else:
@@ -313,9 +329,14 @@ def benchmark_trop_linear_auto(
     fan_torch_out, fan_torch_ms = _bench_forward(fan_torch, x, warmup=warmup, steps=steps)
     fan_tilelang_ms = float("nan")
     fan_tilelang_max_diff = float("nan")
+    fan_zig_ms = float("nan")
+    fan_zig_max_diff = float("nan")
     if has_tilelang() and dev.type == "cuda":
         fan_tilelang_out, fan_tilelang_ms = _bench_forward(fan_tilelang, x, warmup=warmup, steps=steps)
         fan_tilelang_max_diff = float((fan_torch_out - fan_tilelang_out).abs().max().item())
+    if has_trop_fan_zig() and dev.type == "cpu":
+        fan_zig_out, fan_zig_ms = _bench_forward(fan_zig, x, warmup=warmup, steps=steps)
+        fan_zig_max_diff = float((fan_torch_out - fan_zig_out).abs().max().item())
     tropical_torch_train_ms = _bench_train_step(torch_layer, x, warmup=max(1, warmup // 4), steps=max(1, steps // 4))
     tropical_tilelang_train_ms = float("nan")
     pairwise_torch_train_ms = _bench_train_step(pairwise_torch, x, warmup=max(1, warmup // 4), steps=max(1, steps // 4))
@@ -374,6 +395,8 @@ def benchmark_trop_linear_auto(
         "fan_basis_torch_ms": fan_torch_ms,
         "fan_basis_tilelang_ms": fan_tilelang_ms,
         "fan_basis_tilelang_speedup": fan_torch_ms / fan_tilelang_ms,
+        "fan_basis_zig_ms": fan_zig_ms,
+        "fan_basis_zig_speedup": fan_torch_ms / fan_zig_ms,
         "pairwise_torch_train_ms": pairwise_torch_train_ms,
         "pairwise_tilelang_train_ms": pairwise_tilelang_train_ms,
         "pairwise_tilelang_train_speedup": pairwise_torch_train_ms / pairwise_tilelang_train_ms,
@@ -399,6 +422,7 @@ def benchmark_trop_linear_auto(
         "pairwise_tilelang_max_diff": pairwise_tilelang_max_diff,
         "pairwise_zig_max_diff": pairwise_zig_max_diff,
         "fan_basis_tilelang_max_diff": fan_tilelang_max_diff,
+        "fan_basis_zig_max_diff": fan_zig_max_diff,
         "compiled_cpu_max_diff": compiled_cpu_max_diff,
     }
 
@@ -426,13 +450,15 @@ def main() -> None:
     parser.add_argument("--num-threads", type=int, default=0, help="Set torch CPU threads when > 0.")
     parser.add_argument("--tropical-zig-dtype", choices=("f32", "f16"), default="f32")
     parser.add_argument("--pairwise-zig-dtype", choices=("f32", "f16"), default="f32")
+    parser.add_argument("--fan-zig-dtype", choices=("f32", "f16"), default="f32")
     args = parser.parse_args()
 
     if args.num_threads > 0:
         torch.set_num_threads(args.num_threads)
     print(
         f"cuda={torch.cuda.is_available()} has_triton={has_triton()} has_tilelang={has_tilelang()} "
-        f"has_tropical_zig={has_tropical_zig()} has_pairwise_zig={has_pairwise_zig()} device={args.device}"
+        f"has_tropical_zig={has_tropical_zig()} has_pairwise_zig={has_pairwise_zig()} has_trop_fan_zig={has_trop_fan_zig()} "
+        f"device={args.device}"
     )
     result = benchmark_trop_linear_auto(
         batch_size=args.batch_size,
@@ -452,6 +478,7 @@ def main() -> None:
         fan_basis_rank=args.fan_basis_rank,
         tropical_zig_dtype=args.tropical_zig_dtype,
         pairwise_zig_dtype=args.pairwise_zig_dtype,
+        fan_zig_dtype=args.fan_zig_dtype,
     )
     for key in (
         "tropical_state_bytes",
@@ -481,6 +508,8 @@ def main() -> None:
         "fan_basis_torch_ms",
         "fan_basis_tilelang_ms",
         "fan_basis_tilelang_speedup",
+        "fan_basis_zig_ms",
+        "fan_basis_zig_speedup",
         "pairwise_torch_train_ms",
         "pairwise_tilelang_train_ms",
         "pairwise_tilelang_train_speedup",
@@ -506,6 +535,7 @@ def main() -> None:
         "pairwise_tilelang_max_diff",
         "pairwise_zig_max_diff",
         "fan_basis_tilelang_max_diff",
+        "fan_basis_zig_max_diff",
         "compiled_cpu_max_diff",
     ):
         precision = 6 if "diff" in key else 4

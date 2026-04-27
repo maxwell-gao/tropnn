@@ -1,7 +1,7 @@
 const std = @import("std");
 const simd = @import("simd.zig");
 
-inline fn bestCellF32(
+inline fn bestCellF32Generic(
     latent: [*]const f32,
     router_weight: [*]const f32,
     router_bias: [*]const f32,
@@ -25,7 +25,67 @@ inline fn bestCellF32(
     return best_cell;
 }
 
-inline fn bestCellF16(
+inline fn bestCellF32Small(
+    comptime cell_count: usize,
+    latent: [*]const f32,
+    router_weight: [*]const f32,
+    router_bias: [*]const f32,
+    head: usize,
+    cells: usize,
+    code_dim: usize,
+) usize {
+    const head_cell_base = head * cells;
+    const weight_base = head_cell_base * code_dim;
+    const zero: simd.VecF32 = @splat(0.0);
+    var acc = [_]simd.VecF32{zero} ** cell_count;
+
+    var i: usize = 0;
+    while (i + simd.VEC_SIZE <= code_dim) : (i += simd.VEC_SIZE) {
+        const x = simd.load(latent + i);
+        inline for (0..cell_count) |cell| {
+            acc[cell] += x * simd.load(router_weight + weight_base + cell * code_dim + i);
+        }
+    }
+
+    var scores: [cell_count]f32 = undefined;
+    inline for (0..cell_count) |cell| {
+        scores[cell] = @reduce(.Add, acc[cell]) + router_bias[head_cell_base + cell];
+    }
+    while (i < code_dim) : (i += 1) {
+        const x = latent[i];
+        inline for (0..cell_count) |cell| {
+            scores[cell] += x * router_weight[weight_base + cell * code_dim + i];
+        }
+    }
+
+    var best_cell: usize = 0;
+    var best_score: f32 = scores[0];
+    inline for (1..cell_count) |cell| {
+        if (scores[cell] > best_score) {
+            best_score = scores[cell];
+            best_cell = cell;
+        }
+    }
+    return best_cell;
+}
+
+inline fn bestCellF32(
+    latent: [*]const f32,
+    router_weight: [*]const f32,
+    router_bias: [*]const f32,
+    head: usize,
+    cells: usize,
+    code_dim: usize,
+) usize {
+    return switch (cells) {
+        2 => bestCellF32Small(2, latent, router_weight, router_bias, head, cells, code_dim),
+        3 => bestCellF32Small(3, latent, router_weight, router_bias, head, cells, code_dim),
+        4 => bestCellF32Small(4, latent, router_weight, router_bias, head, cells, code_dim),
+        else => bestCellF32Generic(latent, router_weight, router_bias, head, cells, code_dim),
+    };
+}
+
+inline fn bestCellF16Generic(
     latent: [*]const f32,
     router_weight: [*]const f16,
     router_bias: [*]const f16,
@@ -48,6 +108,66 @@ inline fn bestCellF16(
         }
     }
     return best_cell;
+}
+
+inline fn bestCellF16Small(
+    comptime cell_count: usize,
+    latent: [*]const f32,
+    router_weight: [*]const f16,
+    router_bias: [*]const f16,
+    head: usize,
+    cells: usize,
+    code_dim: usize,
+) usize {
+    const head_cell_base = head * cells;
+    const weight_base = head_cell_base * code_dim;
+    const zero: simd.VecF32 = @splat(0.0);
+    var acc = [_]simd.VecF32{zero} ** cell_count;
+
+    var i: usize = 0;
+    while (i + simd.VEC_SIZE <= code_dim) : (i += simd.VEC_SIZE) {
+        const x = simd.load(latent + i);
+        inline for (0..cell_count) |cell| {
+            acc[cell] += x * simd.loadF16ToF32(router_weight + weight_base + cell * code_dim + i);
+        }
+    }
+
+    var scores: [cell_count]f32 = undefined;
+    inline for (0..cell_count) |cell| {
+        scores[cell] = @reduce(.Add, acc[cell]) + @as(f32, @floatCast(router_bias[head_cell_base + cell]));
+    }
+    while (i < code_dim) : (i += 1) {
+        const x = latent[i];
+        inline for (0..cell_count) |cell| {
+            scores[cell] += x * @as(f32, @floatCast(router_weight[weight_base + cell * code_dim + i]));
+        }
+    }
+
+    var best_cell: usize = 0;
+    var best_score: f32 = scores[0];
+    inline for (1..cell_count) |cell| {
+        if (scores[cell] > best_score) {
+            best_score = scores[cell];
+            best_cell = cell;
+        }
+    }
+    return best_cell;
+}
+
+inline fn bestCellF16(
+    latent: [*]const f32,
+    router_weight: [*]const f16,
+    router_bias: [*]const f16,
+    head: usize,
+    cells: usize,
+    code_dim: usize,
+) usize {
+    return switch (cells) {
+        2 => bestCellF16Small(2, latent, router_weight, router_bias, head, cells, code_dim),
+        3 => bestCellF16Small(3, latent, router_weight, router_bias, head, cells, code_dim),
+        4 => bestCellF16Small(4, latent, router_weight, router_bias, head, cells, code_dim),
+        else => bestCellF16Generic(latent, router_weight, router_bias, head, cells, code_dim),
+    };
 }
 
 /// Batch TropLinear route/code forward with f32 router and code parameters.

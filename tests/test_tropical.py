@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tropnn import PairwiseLinear, TropFanLinear, TropLinear
-from tropnn.backend import has_pairwise_zig, has_tilelang, has_triton, has_tropical_zig, trop_scores, trop_scores_reference
+from tropnn.backend import has_pairwise_zig, has_tilelang, has_triton, has_trop_fan_zig, has_tropical_zig, trop_scores, trop_scores_reference
 from tropnn.layers.surrogate import surrogate_gradient
 
 
@@ -195,6 +195,60 @@ def test_trop_linear_zig_forward_matches_torch_f16_params() -> None:
 
 def test_trop_linear_zig_backend_is_inference_only() -> None:
     layer = TropLinear(8, 5, heads=3, cells=4, code_dim=6, backend="zig", seed=1)
+
+    with pytest.raises(RuntimeError, match="inference-only"):
+        layer(torch.randn(4, 8))
+
+
+@pytest.mark.skipif(not has_trop_fan_zig(), reason="requires ziglang or TROPNN_ZIG")
+@pytest.mark.parametrize(
+    ("fan_value_mode", "cpu_param_dtype", "atol"),
+    [
+        ("site", "f32", 1e-6),
+        ("basis", "f32", 1e-6),
+        ("site", "f16", 5e-3),
+        ("basis", "f16", 5e-3),
+    ],
+)
+def test_trop_fan_zig_forward_matches_torch(fan_value_mode: str, cpu_param_dtype: str, atol: float) -> None:
+    torch.manual_seed(0)
+    base = TropFanLinear(8, 5, heads=4, cells=3, code_dim=6, backend="torch", fan_value_mode=fan_value_mode, fan_basis_rank=3, seed=3).eval()
+    fast = TropFanLinear(
+        8,
+        5,
+        heads=4,
+        cells=3,
+        code_dim=6,
+        backend="zig",
+        fan_value_mode=fan_value_mode,
+        fan_basis_rank=3,
+        seed=3,
+        cpu_param_dtype=cpu_param_dtype,  # type: ignore[arg-type]
+    ).eval()
+    with torch.no_grad():
+        base.lifting.copy_(torch.tensor([[0.0, 8.0, 16.0]]).expand(4, 3))
+        fast.proj.weight.copy_(base.proj.weight)
+        fast.sites.copy_(base.sites)
+        fast.lifting.copy_(base.lifting)
+        if fan_value_mode == "site":
+            assert base.value_scale is not None and fast.value_scale is not None
+            fast.value_scale.copy_(base.value_scale)
+        else:
+            assert base.value_coeff is not None and fast.value_coeff is not None
+            assert base.value_basis is not None and fast.value_basis is not None
+            fast.value_coeff.copy_(base.value_coeff)
+            fast.value_basis.copy_(base.value_basis)
+        fast.output_proj.weight.copy_(base.output_proj.weight)
+        fast.output_proj.bias.copy_(base.output_proj.bias)
+        x = torch.randn(7, 2, 8)
+
+        assert torch.allclose(base(x), fast(x), atol=atol)
+        assert fast._last_indices is not None
+        assert fast._last_indices.shape == (7, 2, 0)
+
+
+def test_trop_fan_zig_backend_is_inference_only() -> None:
+    layer = TropFanLinear(8, 5, heads=3, cells=4, code_dim=6, backend="zig", fan_value_mode="basis", seed=1)
 
     with pytest.raises(RuntimeError, match="inference-only"):
         layer(torch.randn(4, 8))

@@ -36,6 +36,12 @@ def has_tropical_zig() -> bool:
     return _has_tropical_zig()
 
 
+def has_trop_fan_zig() -> bool:
+    from .backends import has_trop_fan_zig as _has_trop_fan_zig
+
+    return _has_trop_fan_zig()
+
+
 def trop_scores_reference(z: Tensor, router_weight: Tensor, router_bias: Tensor) -> Tensor:
     return torch.einsum("bsr,hkr->bshk", z, router_weight) + router_bias.unsqueeze(0).unsqueeze(0)
 

@@ -37,14 +37,16 @@ Inference remains fully hard.
 
 - `layers/tropical.py`: `TropLinear`
 - `layers/pairwise.py`: `PairwiseLinear`
+- `layers/fan.py`: `TropFanLinear`
 - `layers/base.py`: shared routed-layer shell
 - `backend.py` and `backends/triton_scores.py`: tropical score backend dispatch
 - `backends/tilelang_route.py`: optional fused TileLang tropical route/code backend
 - `backends/tropical_zig.py`: optional Zig CPU tropical route/code inference backend
+- `backends/fan_zig.py`: optional Zig CPU tropical fan route/value inference backend
 - `backends/pairwise_tilelang.py`: optional fused TileLang pairwise route/LUT backend
 - `backends/pairwise_zig.py`: optional Zig CPU pairwise inference backend
 - `examples/emnist.py`: EMNIST training example for `tropical` and `pairwise`
-- `tools/benchmark.py`: backend benchmark for `TropLinear` and `PairwiseLinear`
+- `tools/benchmark.py`: backend benchmark for `TropLinear`, `PairwiseLinear`, and `TropFanLinear`
 - `tools/profile.py`: forward profiler for `tropical` and `pairwise`
 - `tools/ncu_memory_case.py` and `tools/ncu_memory_sweep.py`: Nsight Compute DRAM profiling helpers
 
@@ -52,7 +54,7 @@ Inference remains fully hard.
 
 ```python
 import torch
-from tropnn import PairwiseLinear, TropLinear
+from tropnn import PairwiseLinear, TropFanLinear, TropLinear
 
 x = torch.randn(8, 256)
 
@@ -73,6 +75,9 @@ print(pairwise_tilelang(x.cuda()).shape)
 
 pairwise_zig = PairwiseLinear(256, 512, tables=16, comparisons=6, backend="zig", cpu_lut_dtype="f16").eval()
 print(pairwise_zig(x.cpu()).shape)
+
+fan_zig = TropFanLinear(256, 512, heads=32, cells=4, code_dim=32, backend="zig", fan_value_mode="basis", cpu_param_dtype="f16").eval()
+print(fan_zig(x.cpu()).shape)
 ```
 
 ## EMNIST Example
@@ -100,7 +105,7 @@ Pairwise uses the same script with `--family pairwise --pairwise-tables 136 --co
 
 `backend="tilelang"` is an explicit CUDA backend for `TropLinear` and `PairwiseLinear`. `TropLinear` fuses routing and selected-code accumulation for both eval and train-time min-face backward. `PairwiseLinear` fuses comparator routing, output-block LUT row reads, vectorized LUT-gradient scatter, and block-reduced LUT/STE backward; its TileLang path currently supports the `fast_sigmoid_odd` LUT surrogate. If TileLang compilation fails, ensure a CUDA toolkit compatible with the GPU is first on `PATH` and export `CC=/usr/bin/gcc CXX=/usr/bin/g++`.
 
-`backend="zig"` is an explicit CPU inference backend for `TropLinear` and `PairwiseLinear`. It uses the bundled `kernels/src` Zig kernels inside this package and compiles them with the pinned `ziglang==0.16.0` package. `TropLinear` fuses route selection and selected-code accumulation, then uses the existing torch output projection. `PairwiseLinear` runs no-cache compare/LUT forward. Install it with:
+`backend="zig"` is an explicit CPU inference backend for `TropLinear`, `TropFanLinear`, and `PairwiseLinear`. It uses the bundled `kernels/src` Zig kernels inside this package and compiles them with the pinned `ziglang==0.16.0` package. `TropLinear` fuses route selection and selected-code accumulation, `TropFanLinear` fuses route selection and generated-value accumulation, and both then use the existing torch output projection. `PairwiseLinear` runs no-cache compare/LUT forward. Install it with:
 
 ```bash
 uv sync --extra cpu

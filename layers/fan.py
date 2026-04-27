@@ -42,6 +42,7 @@ class TropFanLinear(RoutedLinearBase):
         fan_basis_rank: int = 16,
         fan_recovery_mode: FanRecoveryMode = "untied",
         use_output_scaling: bool = True,
+        cpu_param_dtype: Literal["f32", "f16"] = "f32",
     ) -> None:
         if heads < 1:
             raise ValueError(f"heads must be >= 1, got {heads}")
@@ -55,6 +56,8 @@ class TropFanLinear(RoutedLinearBase):
             raise ValueError(f"fan_recovery_mode must be one of {FAN_RECOVERY_MODES}, got {fan_recovery_mode!r}")
         if fan_basis_rank < 1:
             raise ValueError(f"fan_basis_rank must be >= 1, got {fan_basis_rank}")
+        if cpu_param_dtype not in {"f32", "f16"}:
+            raise ValueError(f"cpu_param_dtype must be 'f32' or 'f16', got {cpu_param_dtype!r}")
 
         super().__init__(in_features, out_features, backend=backend, output_scale=1.0)
         self.heads = heads
@@ -64,6 +67,15 @@ class TropFanLinear(RoutedLinearBase):
         self.fan_value_mode = fan_value_mode
         self.fan_basis_rank = fan_basis_rank
         self.fan_recovery_mode = fan_recovery_mode
+        self.cpu_param_dtype = cpu_param_dtype
+        self._zig_sites_f32_cache: Tensor | None = None
+        self._zig_lifting_f32_cache: Tensor | None = None
+        self._zig_values_f32_cache: Tensor | None = None
+        self._zig_f32_cache_versions: tuple[int, ...] | None = None
+        self._zig_sites_f16_cache: Tensor | None = None
+        self._zig_lifting_f16_cache: Tensor | None = None
+        self._zig_values_f16_cache: Tensor | None = None
+        self._zig_f16_cache_versions: tuple[int, ...] | None = None
 
         torch.manual_seed(seed)
         self.proj = nn.Linear(in_features, code_dim, bias=False)
@@ -91,11 +103,60 @@ class TropFanLinear(RoutedLinearBase):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, heads={self.heads}, "
             f"cells={self.cells}, code_dim={self.code_dim}, fan_value_mode={self.fan_value_mode!r}, "
-            f"fan_basis_rank={self.fan_basis_rank}, fan_recovery_mode={self.fan_recovery_mode!r}, backend={self.backend!r}"
+            f"fan_basis_rank={self.fan_basis_rank}, fan_recovery_mode={self.fan_recovery_mode!r}, backend={self.backend!r}, "
+            f"cpu_param_dtype={self.cpu_param_dtype!r}"
         )
 
     def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
+        if self.backend == "zig":
+            return self.proj(x.to(dtype=self.proj.weight.dtype)).to(torch.float32)
         return self.proj(x.to(dtype=self.proj.weight.dtype)).to(compute_dtype)
+
+    def _zig_cache_versions(self) -> tuple[int, ...]:
+        if self.fan_value_mode == "site":
+            assert self.value_scale is not None
+            return (self.sites._version, self.lifting._version, self.value_scale._version)
+        assert self.value_coeff is not None and self.value_basis is not None
+        return (self.sites._version, self.lifting._version, self.value_coeff._version, self.value_basis._version)
+
+    def _zig_params_for_inference(self) -> tuple[Tensor, Tensor, Tensor]:
+        versions = self._zig_cache_versions()
+        if self.cpu_param_dtype == "f32":
+            cache_missing = (
+                self._zig_sites_f32_cache is None
+                or self._zig_lifting_f32_cache is None
+                or self._zig_values_f32_cache is None
+                or self._zig_f32_cache_versions != versions
+                or self._zig_sites_f32_cache.shape != self.sites.shape
+                or self._zig_lifting_f32_cache.shape != self.lifting.shape
+                or self._zig_values_f32_cache.shape != (self.heads, self.cells, self.code_dim)
+            )
+            if cache_missing:
+                with torch.no_grad():
+                    values = self.generated_values(input_device=torch.device("cpu"), compute_dtype=torch.float32)
+                self._zig_sites_f32_cache = self.sites.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                self._zig_lifting_f32_cache = self.lifting.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                self._zig_values_f32_cache = values.detach().contiguous()
+                self._zig_f32_cache_versions = versions
+            return self._zig_sites_f32_cache, self._zig_lifting_f32_cache, self._zig_values_f32_cache
+
+        cache_missing = (
+            self._zig_sites_f16_cache is None
+            or self._zig_lifting_f16_cache is None
+            or self._zig_values_f16_cache is None
+            or self._zig_f16_cache_versions != versions
+            or self._zig_sites_f16_cache.shape != self.sites.shape
+            or self._zig_lifting_f16_cache.shape != self.lifting.shape
+            or self._zig_values_f16_cache.shape != (self.heads, self.cells, self.code_dim)
+        )
+        if cache_missing:
+            with torch.no_grad():
+                values = self.generated_values(input_device=torch.device("cpu"), compute_dtype=torch.float32)
+            self._zig_sites_f16_cache = self.sites.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            self._zig_lifting_f16_cache = self.lifting.detach().to(device="cpu", dtype=torch.float16).contiguous()
+            self._zig_values_f16_cache = values.detach().to(dtype=torch.float16).contiguous()
+            self._zig_f16_cache_versions = versions
+        return self._zig_sites_f16_cache, self._zig_lifting_f16_cache, self._zig_values_f16_cache
 
     def generated_values(self, *, input_device: torch.device | None = None, compute_dtype: torch.dtype | None = None) -> Tensor:
         device = self.sites.device if input_device is None else input_device
@@ -180,6 +241,26 @@ class TropFanLinear(RoutedLinearBase):
         compute_dtype: torch.dtype,
         training: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        if self.backend == "zig":
+            if training:
+                raise RuntimeError("TropFanLinear backend='zig' is inference-only; call .eval() or use backend='torch' for training")
+            if latent.device.type != "cpu":
+                raise ValueError("TropFanLinear backend='zig' requires CPU input tensors")
+            from ..backends import trop_fan_route_hidden_zig
+
+            sites, lifting, values = self._zig_params_for_inference()
+            hidden = trop_fan_route_hidden_zig(
+                latent.contiguous(),
+                sites,
+                lifting,
+                values,
+                code_scale=self.code_scale,
+                param_dtype=self.cpu_param_dtype,
+            )
+            empty_indices = torch.empty((*latent.shape[:2], 0), device=latent.device, dtype=torch.long)
+            empty_margins = torch.empty((*latent.shape[:2], 0), device=latent.device, dtype=latent.dtype)
+            return self._output_from_hidden(hidden, input_device=input_device, compute_dtype=torch.float32), empty_indices, empty_margins
+
         if self.backend == "tilelang" and self.fan_value_mode == "basis" and latent.is_cuda and compute_dtype == torch.float32:
             assert self.value_coeff is not None and self.value_basis is not None
             sites = self.sites.to(dtype=compute_dtype, device=input_device)
