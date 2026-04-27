@@ -159,11 +159,25 @@ class TropLinear(RoutedLinearBase):
             return self._output_from_hidden(hidden, input_device=input_device, compute_dtype=torch.float32), empty_indices, empty_margins
 
         if self.backend == "tilelang" and latent.is_cuda and compute_dtype == torch.float32:
-            from ..backends import trop_route_hidden_tilelang
-
             weight = self.router_weight.to(dtype=compute_dtype, device=input_device)
             bias = self.router_bias.to(dtype=compute_dtype, device=input_device)
             code = self.code.to(dtype=compute_dtype, device=input_device)
+            score_bytes = latent.shape[0] * latent.shape[1] * self.heads * self.cells * 4
+            if not training and not torch.is_grad_enabled() and self.code_dim >= 128 and score_bytes <= 128 * 1024 * 1024:
+                from ..backends import has_triton, trop_route_hidden_triton_eval
+
+                if has_triton():
+                    hidden, winner_idx, margins = trop_route_hidden_triton_eval(
+                        latent,
+                        weight,
+                        bias,
+                        code,
+                        code_scale=self.code_scale,
+                    )
+                    return self._output_from_hidden(hidden, input_device=input_device, compute_dtype=compute_dtype), winner_idx, margins
+
+            from ..backends import trop_route_hidden_tilelang
+
             hidden, winner_idx, margins = trop_route_hidden_tilelang(
                 latent,
                 weight,

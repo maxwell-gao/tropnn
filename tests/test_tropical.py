@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tropnn import PairwiseLinear, TropLinear
-from tropnn.backend import has_pairwise_zig, has_tilelang, has_tropical_zig, trop_scores, trop_scores_reference
+from tropnn import PairwiseLinear, TropFanLinear, TropLinear
+from tropnn.backend import has_pairwise_zig, has_tilelang, has_triton, has_tropical_zig, trop_scores, trop_scores_reference
 from tropnn.layers.surrogate import surrogate_gradient
 
 
@@ -249,3 +249,194 @@ def test_trop_linear_tilelang_forward_backward_matches_torch() -> None:
     assert torch.allclose(base.router_weight.grad, fast.router_weight.grad, atol=1e-6)
     assert torch.allclose(base.router_bias.grad, fast.router_bias.grad, atol=1e-6)
     assert torch.allclose(base.code.grad, fast.code.grad, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not has_tilelang(), reason="requires CUDA TileLang")
+def test_trop_linear_tilelang_parallel_route_matches_torch() -> None:
+    torch.manual_seed(0)
+    base = TropLinear(16, 7, heads=4, cells=4, code_dim=64, backend="torch", seed=2).cuda()
+    fast = TropLinear(16, 7, heads=4, cells=4, code_dim=64, backend="tilelang", seed=2).cuda()
+    with torch.no_grad():
+        fast.proj.weight.copy_(base.proj.weight)
+        fast.router_weight.copy_(base.router_weight)
+        fast.router_bias.copy_(base.router_bias)
+        fast.code.copy_(base.code)
+        fast.output_proj.weight.copy_(base.output_proj.weight)
+        fast.output_proj.bias.copy_(base.output_proj.bias)
+    x = torch.randn(5, 2, 16, device="cuda", requires_grad=True)
+    x_fast = x.detach().clone().requires_grad_(True)
+
+    loss = base(x).square().mean()
+    loss.backward()
+    fast_loss = fast(x_fast).square().mean()
+    fast_loss.backward()
+
+    assert torch.allclose(base(x.detach()), fast(x.detach()), atol=1e-5)
+    assert torch.allclose(x.grad, x_fast.grad, atol=1e-5)
+    assert torch.allclose(base.proj.weight.grad, fast.proj.weight.grad, atol=1e-5)
+    assert torch.allclose(base.router_weight.grad, fast.router_weight.grad, atol=1e-5)
+    assert torch.allclose(base.router_bias.grad, fast.router_bias.grad, atol=1e-5)
+    assert torch.allclose(base.code.grad, fast.code.grad, atol=1e-5)
+    assert torch.allclose(base.output_proj.weight.grad, fast.output_proj.weight.grad, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not has_tilelang(), reason="requires CUDA TileLang")
+def test_trop_linear_tilelang_hybrid_score_route_matches_torch() -> None:
+    torch.manual_seed(0)
+    base = TropLinear(16, 7, heads=4, cells=4, code_dim=128, backend="torch", seed=3).cuda()
+    fast = TropLinear(16, 7, heads=4, cells=4, code_dim=128, backend="tilelang", seed=3).cuda()
+    with torch.no_grad():
+        fast.proj.weight.copy_(base.proj.weight)
+        fast.router_weight.copy_(base.router_weight)
+        fast.router_bias.copy_(base.router_bias)
+        fast.code.copy_(base.code)
+        fast.output_proj.weight.copy_(base.output_proj.weight)
+        fast.output_proj.bias.copy_(base.output_proj.bias)
+    x = torch.randn(3, 2, 16, device="cuda", requires_grad=True)
+    x_fast = x.detach().clone().requires_grad_(True)
+
+    loss = base(x).square().mean()
+    loss.backward()
+    fast_loss = fast(x_fast).square().mean()
+    fast_loss.backward()
+
+    assert torch.allclose(base(x.detach()), fast(x.detach()), atol=1e-5)
+    assert torch.allclose(x.grad, x_fast.grad, atol=1e-5)
+    assert torch.allclose(base.proj.weight.grad, fast.proj.weight.grad, atol=1e-5)
+    assert torch.allclose(base.router_weight.grad, fast.router_weight.grad, atol=1e-5)
+    assert torch.allclose(base.router_bias.grad, fast.router_bias.grad, atol=1e-5)
+    assert torch.allclose(base.code.grad, fast.code.grad, atol=1e-5)
+    assert torch.allclose(base.output_proj.weight.grad, fast.output_proj.weight.grad, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not has_tilelang() or not has_triton(),
+    reason="requires CUDA TileLang and Triton",
+)
+def test_trop_linear_tilelang_triton_eval_route_matches_torch() -> None:
+    torch.manual_seed(0)
+    base = TropLinear(16, 7, heads=4, cells=4, code_dim=128, backend="torch", seed=4).cuda().eval()
+    fast = TropLinear(16, 7, heads=4, cells=4, code_dim=128, backend="tilelang", seed=4).cuda().eval()
+    with torch.no_grad():
+        fast.proj.weight.copy_(base.proj.weight)
+        fast.router_weight.copy_(base.router_weight)
+        fast.router_bias.copy_(base.router_bias)
+        fast.code.copy_(base.code)
+        fast.output_proj.weight.copy_(base.output_proj.weight)
+        fast.output_proj.bias.copy_(base.output_proj.bias)
+        x = torch.randn(3, 2, 16, device="cuda")
+
+        base_out = base(x)
+        fast_out = fast(x)
+
+    assert torch.allclose(base_out, fast_out, atol=1e-5)
+    assert base._last_indices is not None and fast._last_indices is not None
+    assert base._last_margins is not None and fast._last_margins is not None
+    assert torch.equal(base._last_indices, fast._last_indices)
+    assert torch.allclose(base._last_margins, fast._last_margins, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not has_tilelang(), reason="requires CUDA TileLang")
+def test_trop_fan_basis_tilelang_forward_backward_matches_torch() -> None:
+    torch.manual_seed(0)
+    base = TropFanLinear(8, 5, heads=3, cells=4, code_dim=6, backend="torch", fan_value_mode="basis", fan_basis_rank=3, seed=1).cuda()
+    fast = TropFanLinear(8, 5, heads=3, cells=4, code_dim=6, backend="tilelang", fan_value_mode="basis", fan_basis_rank=3, seed=1).cuda()
+    assert base.value_coeff is not None and base.value_basis is not None
+    assert fast.value_coeff is not None and fast.value_basis is not None
+    with torch.no_grad():
+        fast.proj.weight.copy_(base.proj.weight)
+        fast.sites.copy_(base.sites)
+        fast.lifting.copy_(base.lifting)
+        fast.value_coeff.copy_(base.value_coeff)
+        fast.value_basis.copy_(base.value_basis)
+        fast.output_proj.weight.copy_(base.output_proj.weight)
+        fast.output_proj.bias.copy_(base.output_proj.bias)
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    x_fast = x.detach().clone().requires_grad_(True)
+
+    loss = base(x).square().mean()
+    loss.backward()
+    fast_loss = fast(x_fast).square().mean()
+    fast_loss.backward()
+
+    assert torch.allclose(base(x.detach()), fast(x.detach()), atol=1e-6)
+    assert torch.allclose(x.grad, x_fast.grad, atol=1e-5)
+    assert torch.allclose(base.proj.weight.grad, fast.proj.weight.grad, atol=1e-5)
+    assert torch.allclose(base.sites.grad, fast.sites.grad, atol=1e-5)
+    assert torch.allclose(base.lifting.grad, fast.lifting.grad, atol=1e-5)
+    assert torch.allclose(base.value_coeff.grad, fast.value_coeff.grad, atol=1e-5)
+    assert torch.allclose(base.value_basis.grad, fast.value_basis.grad, atol=1e-5)
+    assert torch.allclose(base.output_proj.weight.grad, fast.output_proj.weight.grad, atol=1e-6)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not has_tilelang() or not has_triton(),
+    reason="requires CUDA TileLang and Triton",
+)
+def test_trop_fan_basis_tilelang_triton_eval_route_matches_torch() -> None:
+    torch.manual_seed(0)
+    base = (
+        TropFanLinear(
+            16,
+            7,
+            heads=4,
+            cells=4,
+            code_dim=128,
+            backend="torch",
+            fan_value_mode="basis",
+            fan_basis_rank=8,
+            seed=5,
+        )
+        .cuda()
+        .eval()
+    )
+    fast = (
+        TropFanLinear(
+            16,
+            7,
+            heads=4,
+            cells=4,
+            code_dim=128,
+            backend="tilelang",
+            fan_value_mode="basis",
+            fan_basis_rank=8,
+            seed=5,
+        )
+        .cuda()
+        .eval()
+    )
+    assert base.value_coeff is not None and base.value_basis is not None
+    assert fast.value_coeff is not None and fast.value_basis is not None
+    with torch.no_grad():
+        fast.proj.weight.copy_(base.proj.weight)
+        fast.sites.copy_(base.sites)
+        fast.lifting.copy_(base.lifting)
+        fast.value_coeff.copy_(base.value_coeff)
+        fast.value_basis.copy_(base.value_basis)
+        fast.output_proj.weight.copy_(base.output_proj.weight)
+        fast.output_proj.bias.copy_(base.output_proj.bias)
+        x = torch.randn(3, 2, 16, device="cuda")
+
+        base_out = base(x)
+        fast_out = fast(x)
+
+    assert torch.allclose(base_out, fast_out, atol=1e-5)
+    assert base._last_indices is not None and fast._last_indices is not None
+    assert base._last_margins is not None and fast._last_margins is not None
+    assert torch.equal(base._last_indices, fast._last_indices)
+    assert torch.allclose(base._last_margins, fast._last_margins, atol=1e-5)
+
+
+def test_trop_fan_site_tilelang_backend_uses_torch_fallback() -> None:
+    layer = TropFanLinear(6, 4, heads=3, cells=4, code_dim=5, backend="tilelang", fan_value_mode="site", seed=0)
+    x = torch.randn(8, 2, 6, requires_grad=True)
+
+    layer.train()
+    y = layer(x)
+    loss = y.square().mean()
+    loss.backward()
+
+    assert x.grad is not None
+    assert layer.sites.grad is not None
+    assert layer.value_scale is not None
+    assert layer.value_scale.grad is not None

@@ -71,6 +71,138 @@ if _HAS_TRITON:
             mask=(offs_m[:, None] < num_rows) & (offs_n[None, :] < num_cols),
         )
 
+    @triton.jit
+    def _hidden_from_scores_kernel(
+        scores_ptr,
+        latent_ptr,
+        code_ptr,
+        hidden_ptr,
+        winner_ptr,
+        margins_ptr,
+        item_count,
+        heads: tl.constexpr,
+        cells: tl.constexpr,
+        code_dim: tl.constexpr,
+        code_scale: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_m = tl.program_id(axis=0)
+        pid_d = tl.program_id(axis=1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        row_mask = offs_m < item_count
+        dim_mask = offs_d < code_dim
+
+        acc = tl.load(
+            latent_ptr + offs_m[:, None] * code_dim + offs_d[None, :],
+            mask=row_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
+
+        store_route_mask = row_mask & (pid_d == 0)
+        for head in range(0, heads):
+            best = tl.full((BLOCK_M,), -3.4028234663852886e38, dtype=tl.float32)
+            second = tl.full((BLOCK_M,), -3.4028234663852886e38, dtype=tl.float32)
+            best_cell = tl.zeros((BLOCK_M,), dtype=tl.int32)
+
+            for cell in range(0, cells):
+                score = tl.load(
+                    scores_ptr + (offs_m * heads + head) * cells + cell,
+                    mask=row_mask,
+                    other=-3.4028234663852886e38,
+                )
+                is_best = score > best
+                is_second = (score > second) & ~is_best
+                second = tl.where(is_best, best, tl.where(is_second, score, second))
+                best = tl.where(is_best, score, best)
+                best_cell = tl.where(is_best, cell, best_cell)
+
+            code_offsets = head * cells * code_dim + best_cell[:, None] * code_dim + offs_d[None, :]
+            selected = tl.load(code_ptr + code_offsets, mask=row_mask[:, None] & dim_mask[None, :], other=0.0)
+            acc += selected * code_scale
+
+            tl.store(
+                winner_ptr + offs_m * heads + head,
+                best_cell.to(tl.int64),
+                mask=store_route_mask,
+            )
+            tl.store(
+                margins_ptr + offs_m * heads + head,
+                best - second,
+                mask=store_route_mask,
+            )
+
+        tl.store(
+            hidden_ptr + offs_m[:, None] * code_dim + offs_d[None, :],
+            acc,
+            mask=row_mask[:, None] & dim_mask[None, :],
+        )
+
+    @triton.jit
+    def _fan_basis_coeff_from_scores_kernel(
+        scores_ptr,
+        coeff_ptr,
+        coeff_sum_ptr,
+        winner_ptr,
+        margins_ptr,
+        item_count,
+        heads: tl.constexpr,
+        cells: tl.constexpr,
+        basis_rank: tl.constexpr,
+        code_scale: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+    ):
+        pid_m = tl.program_id(axis=0)
+        pid_r = tl.program_id(axis=1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        row_mask = offs_m < item_count
+        rank_mask = offs_r < basis_rank
+        coeff_acc = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
+        store_route_mask = row_mask & (pid_r == 0)
+
+        for head in range(0, heads):
+            best = tl.full((BLOCK_M,), -3.4028234663852886e38, dtype=tl.float32)
+            second = tl.full((BLOCK_M,), -3.4028234663852886e38, dtype=tl.float32)
+            best_cell = tl.zeros((BLOCK_M,), dtype=tl.int32)
+
+            for cell in range(0, cells):
+                score = tl.load(
+                    scores_ptr + (offs_m * heads + head) * cells + cell,
+                    mask=row_mask,
+                    other=-3.4028234663852886e38,
+                )
+                is_best = score > best
+                is_second = (score > second) & ~is_best
+                second = tl.where(is_best, best, tl.where(is_second, score, second))
+                best = tl.where(is_best, score, best)
+                best_cell = tl.where(is_best, cell, best_cell)
+
+            coeff_offsets = head * cells * basis_rank + best_cell[:, None] * basis_rank + offs_r[None, :]
+            selected = tl.load(coeff_ptr + coeff_offsets, mask=row_mask[:, None] & rank_mask[None, :], other=0.0)
+            coeff_acc += selected
+
+            tl.store(
+                winner_ptr + offs_m * heads + head,
+                best_cell.to(tl.int64),
+                mask=store_route_mask,
+            )
+            tl.store(
+                margins_ptr + offs_m * heads + head,
+                best - second,
+                mask=store_route_mask,
+            )
+
+        tl.store(
+            coeff_sum_ptr + offs_m[:, None] * basis_rank + offs_r[None, :],
+            coeff_acc * code_scale,
+            mask=row_mask[:, None] & rank_mask[None, :],
+        )
+
 
 def trop_scores_triton(z: Tensor, router_weight: Tensor, router_bias: Tensor) -> Tensor:
     if not _HAS_TRITON:
@@ -113,3 +245,148 @@ def trop_scores_triton(z: Tensor, router_weight: Tensor, router_bias: Tensor) ->
         BLOCK_K=32,
     )
     return out.reshape(batch, steps, *router_bias.shape)
+
+
+def _requires_grad_path(*tensors: Tensor) -> bool:
+    return torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors)
+
+
+def _next_power_of_2(value: int) -> int:
+    if value < 1:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
+def trop_route_hidden_triton_eval(
+    z: Tensor,
+    router_weight: Tensor,
+    router_bias: Tensor,
+    code: Tensor,
+    *,
+    code_scale: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    if not _HAS_TRITON:
+        raise RuntimeError("Triton is not available")
+    if _requires_grad_path(z, router_weight, router_bias, code):
+        raise RuntimeError("trop_route_hidden_triton_eval is inference-only; use the TileLang backend for autograd")
+    if not z.is_cuda:
+        raise ValueError("trop_route_hidden_triton_eval requires CUDA tensors")
+    if z.ndim != 3:
+        raise ValueError(f"z must have shape [batch, steps, code_dim], got {tuple(z.shape)}")
+    if router_weight.ndim != 3:
+        raise ValueError(f"router_weight must have shape [heads, cells, code_dim], got {tuple(router_weight.shape)}")
+    if router_bias.shape != router_weight.shape[:2]:
+        raise ValueError(
+            f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}"
+        )
+    if code.shape != router_weight.shape:
+        raise ValueError(f"code must match router_weight shape, got {tuple(code.shape)} and {tuple(router_weight.shape)}")
+
+    batch, steps, code_dim = z.shape
+    heads, cells, weight_dim = router_weight.shape
+    if weight_dim != code_dim:
+        raise ValueError(f"z code_dim {code_dim} does not match router_weight code_dim {weight_dim}")
+
+    item_count = batch * steps
+    z_flat = z.reshape(item_count, code_dim).contiguous().to(torch.float32)
+    weight = router_weight.contiguous().to(torch.float32)
+    bias = router_bias.contiguous().to(torch.float32)
+    code_table = code.contiguous().to(torch.float32)
+    scores = trop_scores_triton(z, weight, bias).reshape(item_count, heads, cells).contiguous()
+    hidden = torch.empty((item_count, code_dim), device=z.device, dtype=torch.float32)
+    winner_idx = torch.empty((item_count, heads), device=z.device, dtype=torch.int64)
+    margins = torch.empty((item_count, heads), device=z.device, dtype=torch.float32)
+
+    block_d = min(128, _next_power_of_2(code_dim))
+    block_m = 4 if block_d >= 128 else 8
+
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
+        return triton.cdiv(item_count, meta["BLOCK_M"]), triton.cdiv(code_dim, meta["BLOCK_D"])
+
+    _hidden_from_scores_kernel[grid](
+        scores,
+        z_flat,
+        code_table,
+        hidden,
+        winner_idx,
+        margins,
+        item_count,
+        heads,
+        cells,
+        code_dim,
+        float(code_scale),
+        BLOCK_M=block_m,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return hidden.view(batch, steps, code_dim), winner_idx.view(batch, steps, heads), margins.view(batch, steps, heads)
+
+
+def trop_fan_basis_hidden_triton_eval(
+    z: Tensor,
+    sites: Tensor,
+    lifting: Tensor,
+    value_coeff: Tensor,
+    value_basis: Tensor,
+    *,
+    code_scale: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    if not _HAS_TRITON:
+        raise RuntimeError("Triton is not available")
+    if _requires_grad_path(z, sites, lifting, value_coeff, value_basis):
+        raise RuntimeError("trop_fan_basis_hidden_triton_eval is inference-only; use the TileLang backend for autograd")
+    if not z.is_cuda:
+        raise ValueError("trop_fan_basis_hidden_triton_eval requires CUDA tensors")
+    if z.ndim != 3:
+        raise ValueError(f"z must have shape [batch, steps, code_dim], got {tuple(z.shape)}")
+    if sites.ndim != 3:
+        raise ValueError(f"sites must have shape [heads, cells, code_dim], got {tuple(sites.shape)}")
+    if lifting.shape != sites.shape[:2]:
+        raise ValueError(f"lifting must have shape [heads, cells] matching sites, got {tuple(lifting.shape)}")
+    if value_coeff.ndim != 3 or value_coeff.shape[:2] != sites.shape[:2]:
+        raise ValueError(f"value_coeff must have shape [heads, cells, rank], got {tuple(value_coeff.shape)}")
+    if value_basis.ndim != 2:
+        raise ValueError(f"value_basis must have shape [rank, code_dim], got {tuple(value_basis.shape)}")
+
+    batch, steps, code_dim = z.shape
+    heads, cells, site_dim = sites.shape
+    basis_rank = value_coeff.shape[2]
+    if site_dim != code_dim:
+        raise ValueError(f"z code_dim {code_dim} does not match sites code_dim {site_dim}")
+    if value_basis.shape != (basis_rank, code_dim):
+        raise ValueError(f"value_basis must have shape {(basis_rank, code_dim)}, got {tuple(value_basis.shape)}")
+
+    item_count = batch * steps
+    z_flat = z.reshape(item_count, code_dim).contiguous().to(torch.float32)
+    site_table = sites.contiguous().to(torch.float32)
+    lift = lifting.contiguous().to(torch.float32)
+    coeff = value_coeff.contiguous().to(torch.float32)
+    basis = value_basis.contiguous().to(torch.float32)
+    scores = trop_scores_triton(z, site_table, lift).reshape(item_count, heads, cells).contiguous()
+    coeff_sum = torch.empty((item_count, basis_rank), device=z.device, dtype=torch.float32)
+    winner_idx = torch.empty((item_count, heads), device=z.device, dtype=torch.int64)
+    margins = torch.empty((item_count, heads), device=z.device, dtype=torch.float32)
+
+    block_r = min(64, _next_power_of_2(basis_rank))
+    block_m = 4 if block_r >= 64 else 8
+
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
+        return triton.cdiv(item_count, meta["BLOCK_M"]), triton.cdiv(basis_rank, meta["BLOCK_R"])
+
+    _fan_basis_coeff_from_scores_kernel[grid](
+        scores,
+        coeff,
+        coeff_sum,
+        winner_idx,
+        margins,
+        item_count,
+        heads,
+        cells,
+        basis_rank,
+        float(code_scale),
+        BLOCK_M=block_m,
+        BLOCK_R=block_r,
+        num_warps=4,
+    )
+    hidden = torch.addmm(z_flat, coeff_sum, basis)
+    return hidden.view(batch, steps, code_dim), winner_idx.view(batch, steps, heads), margins.view(batch, steps, heads)

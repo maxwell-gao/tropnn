@@ -4,6 +4,8 @@ from typing import Any
 import torch
 from torch import Tensor
 
+_MAX_SCORE_ROUTE_BYTES = 128 * 1024 * 1024
+
 
 def _next_power_of_2(value: int) -> int:
     if value < 1:
@@ -28,6 +30,10 @@ def _dtype_name(dtype: torch.dtype) -> str:
     if dtype == torch.float32:
         return "float32"
     raise TypeError(f"TileLang route backend currently supports float32 tensors only, got {dtype}")
+
+
+def _can_materialize_scores(item_count: int, heads: int, cells: int) -> bool:
+    return item_count * heads * cells * 4 <= _MAX_SCORE_ROUTE_BYTES
 
 
 @lru_cache(maxsize=64)
@@ -92,6 +98,168 @@ def _trop_route_kernel(
         return kernel
 
     return route_kernel()
+
+
+@lru_cache(maxsize=64)
+def _trop_route_parallel_kernel(
+    item_count: int,
+    heads: int,
+    cells: int,
+    code_dim: int,
+    block_d: int,
+    code_blocks: int,
+    target: str,
+) -> Any:
+    try:
+        import tilelang
+        import tilelang.language as T
+    except ImportError as exc:
+        raise RuntimeError("TileLang is not installed; install tilelang or use backend='torch'/'auto'") from exc
+
+    @tilelang.jit(target=target, compile_flags=["-allow-unsupported-compiler", "-ccbin=/usr/bin/g++"])
+    def route_kernel() -> Any:
+        head_count = heads
+        cell_count = cells
+        latent_dim = code_dim
+        block_width = block_d
+        latent_tiles = code_blocks
+
+        @T.prim_func
+        def kernel(
+            latent: T.Tensor((item_count, latent_dim), "float32"),
+            router_weight: T.Tensor((head_count, cell_count, latent_dim), "float32"),
+            router_bias: T.Tensor((head_count, cell_count), "float32"),
+            winner_idx: T.Tensor((item_count, head_count), "int64"),
+            runner_idx: T.Tensor((item_count, head_count), "int64"),
+            margins: T.Tensor((item_count, head_count), "float32"),
+        ):
+            with T.Kernel(item_count, head_count, threads=block_width) as (row, head):
+                tx = T.get_thread_bindings()[0]
+                partial = T.alloc_shared((block_width,), "float32")
+                best = T.alloc_fragment((1,), "float32")
+                second = T.alloc_fragment((1,), "float32")
+                dot = T.alloc_fragment((1,), "float32")
+                best_cell = T.alloc_fragment((1,), "int32")
+                second_cell = T.alloc_fragment((1,), "int32")
+                if tx == 0:
+                    best[0] = -3.4028234663852886e38
+                    second[0] = -3.4028234663852886e38
+                    best_cell[0] = 0
+                    second_cell[0] = 0
+
+                for cell in T.serial(cell_count):
+                    dot[0] = 0.0
+                    for dim_tile in T.serial(latent_tiles):
+                        dim = dim_tile * block_width + tx
+                        if dim < latent_dim:
+                            dot[0] = dot[0] + latent[row, dim] * router_weight[head, cell, dim]
+                    partial[tx] = dot[0]
+                    T.sync_threads()
+                    if block_width >= 256:
+                        if tx < 128:
+                            partial[tx] = partial[tx] + partial[tx + 128]
+                        T.sync_threads()
+                    if block_width >= 128:
+                        if tx < 64:
+                            partial[tx] = partial[tx] + partial[tx + 64]
+                        T.sync_threads()
+                    if block_width >= 64:
+                        if tx < 32:
+                            partial[tx] = partial[tx] + partial[tx + 32]
+                        T.sync_threads()
+                    if tx < 16:
+                        partial[tx] = partial[tx] + partial[tx + 16]
+                    T.sync_threads()
+                    if tx < 8:
+                        partial[tx] = partial[tx] + partial[tx + 8]
+                    T.sync_threads()
+                    if tx < 4:
+                        partial[tx] = partial[tx] + partial[tx + 4]
+                    T.sync_threads()
+                    if tx < 2:
+                        partial[tx] = partial[tx] + partial[tx + 2]
+                    T.sync_threads()
+                    if tx < 1:
+                        partial[tx] = partial[tx] + partial[tx + 1]
+                    T.sync_threads()
+
+                    if tx == 0:
+                        score = partial[0] + router_bias[head, cell]
+                        if score > best[0]:
+                            second[0] = best[0]
+                            second_cell[0] = best_cell[0]
+                            best[0] = score
+                            best_cell[0] = cell
+                        else:
+                            if score > second[0]:
+                                second[0] = score
+                                second_cell[0] = cell
+                    T.sync_threads()
+
+                if tx == 0:
+                    winner_idx[row, head] = best_cell[0]
+                    runner_idx[row, head] = second_cell[0]
+                    margins[row, head] = best[0] - second[0]
+
+        return kernel
+
+    return route_kernel()
+
+
+@lru_cache(maxsize=64)
+def _trop_top2_scores_kernel(
+    item_count: int,
+    heads: int,
+    cells: int,
+    target: str,
+) -> Any:
+    try:
+        import tilelang
+        import tilelang.language as T
+    except ImportError as exc:
+        raise RuntimeError("TileLang is not installed; install tilelang or use backend='torch'/'auto'") from exc
+
+    @tilelang.jit(target=target, compile_flags=["-allow-unsupported-compiler", "-ccbin=/usr/bin/g++"])
+    def top2_kernel() -> Any:
+        head_count = heads
+        cell_count = cells
+
+        @T.prim_func
+        def kernel(
+            scores: T.Tensor((item_count, head_count, cell_count), "float32"),
+            winner_idx: T.Tensor((item_count, head_count), "int64"),
+            runner_idx: T.Tensor((item_count, head_count), "int64"),
+            margins: T.Tensor((item_count, head_count), "float32"),
+        ):
+            with T.Kernel(item_count, head_count, threads=1) as (row, head):
+                best = T.alloc_fragment((1,), "float32")
+                second = T.alloc_fragment((1,), "float32")
+                best_cell = T.alloc_fragment((1,), "int32")
+                second_cell = T.alloc_fragment((1,), "int32")
+                best[0] = -3.4028234663852886e38
+                second[0] = -3.4028234663852886e38
+                best_cell[0] = 0
+                second_cell[0] = 0
+
+                for cell in T.serial(cell_count):
+                    score = scores[row, head, cell]
+                    if score > best[0]:
+                        second[0] = best[0]
+                        second_cell[0] = best_cell[0]
+                        best[0] = score
+                        best_cell[0] = cell
+                    else:
+                        if score > second[0]:
+                            second[0] = score
+                            second_cell[0] = cell
+
+                winner_idx[row, head] = best_cell[0]
+                runner_idx[row, head] = second_cell[0]
+                margins[row, head] = best[0] - second[0]
+
+        return kernel
+
+    return top2_kernel()
 
 
 @lru_cache(maxsize=64)
@@ -347,7 +515,6 @@ def _run_trop_forward(
     block_d = _select_block_size(code_dim)
     code_blocks = (code_dim + block_d - 1) // block_d
 
-    route_kernel = _trop_route_kernel(item_count, heads, cells, code_dim, target)
     hidden_kernel = _trop_hidden_kernel(
         item_count,
         heads,
@@ -359,7 +526,26 @@ def _run_trop_forward(
         code_blocks,
         target,
     )
-    route_kernel(latent_flat, weight, bias, winner_idx, runner_idx, margins)
+    if code_dim >= 128 and _can_materialize_scores(item_count, heads, cells):
+        try:
+            from .triton_scores import has_triton, trop_scores_triton
+        except ImportError:
+            use_score_route = False
+        else:
+            use_score_route = has_triton()
+        if use_score_route:
+            scores = trop_scores_triton(latent, weight, bias).reshape(item_count, heads, cells).contiguous()
+            top2_kernel = _trop_top2_scores_kernel(item_count, heads, cells, target)
+            top2_kernel(scores, winner_idx, runner_idx, margins)
+        else:
+            route_kernel = _trop_route_parallel_kernel(item_count, heads, cells, code_dim, block_d, code_blocks, target)
+            route_kernel(latent_flat, weight, bias, winner_idx, runner_idx, margins)
+    elif code_dim >= 32:
+        route_kernel = _trop_route_parallel_kernel(item_count, heads, cells, code_dim, block_d, code_blocks, target)
+        route_kernel(latent_flat, weight, bias, winner_idx, runner_idx, margins)
+    else:
+        route_kernel = _trop_route_kernel(item_count, heads, cells, code_dim, target)
+        route_kernel(latent_flat, weight, bias, winner_idx, runner_idx, margins)
     hidden_kernel(latent_flat, code_table, winner_idx, runner_idx, margins, hidden)
     return (
         hidden.view(batch, steps, code_dim),
