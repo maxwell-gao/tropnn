@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 
 _MAX_SCORE_ROUTE_BYTES = 128 * 1024 * 1024
+_STREAM_TOP2_SCORE_BYTES = 1024 * 1024 * 1024
 
 
 def _next_power_of_2(value: int) -> int:
@@ -32,8 +33,9 @@ def _dtype_name(dtype: torch.dtype) -> str:
     raise TypeError(f"TileLang route backend currently supports float32 tensors only, got {dtype}")
 
 
-def _can_materialize_scores(item_count: int, heads: int, cells: int) -> bool:
-    return item_count * heads * cells * 4 <= _MAX_SCORE_ROUTE_BYTES
+def _can_materialize_scores(item_count: int, heads: int, cells: int, *, max_bytes: int | None = None) -> bool:
+    limit = _MAX_SCORE_ROUTE_BYTES if max_bytes is None else max_bytes
+    return item_count * heads * cells * 4 <= limit
 
 
 @lru_cache(maxsize=64)
@@ -500,6 +502,7 @@ def _run_trop_forward(
     code_scale: float,
     training: bool,
     target: str,
+    score_route_max_bytes: int | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     batch, steps, code_dim = latent.shape
     heads, cells, _ = router_weight.shape
@@ -526,24 +529,51 @@ def _run_trop_forward(
         code_blocks,
         target,
     )
-    if code_dim >= 128 and _can_materialize_scores(item_count, heads, cells):
+    score_bytes = item_count * heads * cells * 4
+    prefer_stream_top2 = training and (cells >= 16 or score_bytes > _STREAM_TOP2_SCORE_BYTES)
+    routed = False
+    if prefer_stream_top2:
         try:
-            from .triton_scores import has_triton, trop_scores_triton
+            from .triton_scores import has_triton, trop_top2_stream_triton
+        except ImportError:
+            use_stream_top2 = False
+        else:
+            use_stream_top2 = has_triton()
+        if use_stream_top2:
+            winner_view, runner_view, margins_view = trop_top2_stream_triton(latent, weight, bias)
+            winner_idx = winner_view.reshape(item_count, heads).contiguous()
+            runner_idx = runner_view.reshape(item_count, heads).contiguous()
+            margins = margins_view.reshape(item_count, heads).contiguous()
+            routed = True
+    if not routed and code_dim >= 128 and _can_materialize_scores(item_count, heads, cells, max_bytes=score_route_max_bytes):
+        try:
+            from .triton_scores import has_triton, trop_route_hidden_triton_train, trop_scores_triton
         except ImportError:
             use_score_route = False
         else:
             use_score_route = has_triton()
+        if use_score_route and training:
+            hidden_view, winner_view, runner_view, margins_view = trop_route_hidden_triton_train(
+                latent,
+                weight,
+                bias,
+                code_table,
+                code_scale=code_scale,
+            )
+            return hidden_view, winner_view, runner_view, margins_view
         if use_score_route:
             scores = trop_scores_triton(latent, weight, bias).reshape(item_count, heads, cells).contiguous()
             top2_kernel = _trop_top2_scores_kernel(item_count, heads, cells, target)
             top2_kernel(scores, winner_idx, runner_idx, margins)
+            routed = True
         else:
             route_kernel = _trop_route_parallel_kernel(item_count, heads, cells, code_dim, block_d, code_blocks, target)
             route_kernel(latent_flat, weight, bias, winner_idx, runner_idx, margins)
-    elif code_dim >= 32:
+            routed = True
+    if not routed and code_dim >= 32:
         route_kernel = _trop_route_parallel_kernel(item_count, heads, cells, code_dim, block_d, code_blocks, target)
         route_kernel(latent_flat, weight, bias, winner_idx, runner_idx, margins)
-    else:
+    elif not routed:
         route_kernel = _trop_route_kernel(item_count, heads, cells, code_dim, target)
         route_kernel(latent_flat, weight, bias, winner_idx, runner_idx, margins)
     hidden_kernel(latent_flat, code_table, winner_idx, runner_idx, margins, hidden)
@@ -566,6 +596,7 @@ class _TropRouteHiddenTileLangFunction(torch.autograd.Function):
         code_scale: float,
         training: bool,
         target: str,
+        score_route_max_bytes: int | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         hidden, winner_idx, runner_idx, margins = _run_trop_forward(
             latent,
@@ -575,6 +606,7 @@ class _TropRouteHiddenTileLangFunction(torch.autograd.Function):
             code_scale=code_scale,
             training=training,
             target=target,
+            score_route_max_bytes=score_route_max_bytes,
         )
         ctx.save_for_backward(latent, router_weight, code, winner_idx, runner_idx, margins)
         ctx.code_scale = float(code_scale)
@@ -642,7 +674,7 @@ class _TropRouteHiddenTileLangFunction(torch.autograd.Function):
                 grad_router_bias,
             )
 
-        return grad_latent.view(batch, steps, code_dim), grad_router_weight, grad_router_bias, grad_code, None, None, None
+        return grad_latent.view(batch, steps, code_dim), grad_router_weight, grad_router_bias, grad_code, None, None, None, None
 
 
 def trop_route_hidden_tilelang(
@@ -654,6 +686,7 @@ def trop_route_hidden_tilelang(
     code_scale: float,
     training: bool = False,
     target: str = "cuda",
+    score_route_max_bytes: int | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     if not has_tilelang():
         raise RuntimeError("TileLang is not installed; install tilelang or use backend='torch'/'auto'")
@@ -683,6 +716,7 @@ def trop_route_hidden_tilelang(
             float(code_scale),
             bool(training),
             target,
+            score_route_max_bytes,
         )
     except Exception as exc:
         raise RuntimeError(

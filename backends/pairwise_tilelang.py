@@ -175,6 +175,7 @@ def _pairwise_min_backward_kernel(
     table_size: int,
     block_d: int,
     out_blocks: int,
+    use_izhikevich_surrogate: bool,
     target: str,
 ) -> Any:
     try:
@@ -192,6 +193,7 @@ def _pairwise_min_backward_kernel(
         bucket_count = table_size
         block_width = block_d
         output_tiles = out_blocks
+        use_izhikevich = use_izhikevich_surrogate
 
         @T.prim_func
         def kernel(
@@ -263,14 +265,25 @@ def _pairwise_min_backward_kernel(
 
                 if tx == 0:
                     u = margins[row, table, r_min[0]]
-                    denom = (1.0 + T.abs(u)) * (1.0 + T.abs(u))
                     surr = T.alloc_fragment((1,), "float32")
                     surr[0] = 0.0
-                    if u > 0.0:
-                        surr[0] = -0.5 / denom
+                    if use_izhikevich:
+                        abs_u = T.alloc_fragment((1,), "float32")
+                        abs_u[0] = T.abs(u)
+                        if abs_u[0] > 10.0:
+                            abs_u[0] = 10.0
+                        sig = 1.0 / (1.0 + T.exp(0.0 - abs_u[0]))
+                        if u > 0.0:
+                            surr[0] = -2.0 * sig * (1.0 - sig)
+                        else:
+                            surr[0] = 2.0 * sig * (1.0 - sig)
                     else:
-                        if u < 0.0:
-                            surr[0] = 0.5 / denom
+                        denom = (1.0 + T.abs(u)) * (1.0 + T.abs(u))
+                        if u > 0.0:
+                            surr[0] = -0.5 / denom
+                        else:
+                            if u < 0.0:
+                                surr[0] = 0.5 / denom
 
                     grad_margin = partial[0] * surr[0]
                     a = anchors[table, r_min[0], 0]
@@ -294,6 +307,7 @@ def _pairwise_full_backward_kernel(
     table_size: int,
     block_d: int,
     out_blocks: int,
+    use_izhikevich_surrogate: bool,
     target: str,
 ) -> Any:
     try:
@@ -311,6 +325,7 @@ def _pairwise_full_backward_kernel(
         bucket_count = table_size
         block_width = block_d
         output_tiles = out_blocks
+        use_izhikevich = use_izhikevich_surrogate
 
         @T.prim_func
         def kernel(
@@ -372,14 +387,25 @@ def _pairwise_full_backward_kernel(
 
                 if tx == 0:
                     u = margins[row, table, comp]
-                    denom = (1.0 + T.abs(u)) * (1.0 + T.abs(u))
                     surr = T.alloc_fragment((1,), "float32")
                     surr[0] = 0.0
-                    if u > 0.0:
-                        surr[0] = -0.5 / denom
+                    if use_izhikevich:
+                        abs_u = T.alloc_fragment((1,), "float32")
+                        abs_u[0] = T.abs(u)
+                        if abs_u[0] > 10.0:
+                            abs_u[0] = 10.0
+                        sig = 1.0 / (1.0 + T.exp(0.0 - abs_u[0]))
+                        if u > 0.0:
+                            surr[0] = -2.0 * sig * (1.0 - sig)
+                        else:
+                            surr[0] = 2.0 * sig * (1.0 - sig)
                     else:
-                        if u < 0.0:
-                            surr[0] = 0.5 / denom
+                        denom = (1.0 + T.abs(u)) * (1.0 + T.abs(u))
+                        if u > 0.0:
+                            surr[0] = -0.5 / denom
+                        else:
+                            if u < 0.0:
+                                surr[0] = 0.5 / denom
 
                     grad_margin = partial[0] * surr[0]
                     a = anchors[table, comp, 0]
@@ -449,12 +475,14 @@ class _PairwiseTileLangFunction(torch.autograd.Function):
         thresholds: Tensor,
         lut: Tensor,
         use_min_margin_ste: bool,
+        surrogate: str,
         target: str,
     ) -> tuple[Tensor, Tensor, Tensor]:
         output, indices, margins = _run_forward(latent, anchors, thresholds, lut, target=target)
         ctx.save_for_backward(indices, margins, anchors, lut)
         ctx.latent_shape = tuple(latent.shape)
         ctx.use_min_margin_ste = bool(use_min_margin_ste)
+        ctx.use_izhikevich_surrogate = surrogate == "izhikevich"
         ctx.target = target
         ctx.mark_non_differentiable(indices, margins)
         return output, indices, margins
@@ -494,6 +522,7 @@ class _PairwiseTileLangFunction(torch.autograd.Function):
                 table_size,
                 block_d,
                 out_blocks,
+                ctx.use_izhikevich_surrogate,
                 ctx.target,
             )
         else:
@@ -506,11 +535,12 @@ class _PairwiseTileLangFunction(torch.autograd.Function):
                 table_size,
                 block_d,
                 out_blocks,
+                ctx.use_izhikevich_surrogate,
                 ctx.target,
             )
         ste_kernel(grad_flat, indices_flat, margins_flat, anchors_contig, lut_contig, grad_latent, grad_thresholds)
 
-        return grad_latent.view(batch, steps, in_features), None, grad_thresholds, grad_lut, None, None
+        return grad_latent.view(batch, steps, in_features), None, grad_thresholds, grad_lut, None, None, None
 
 
 def pairwise_tilelang(
@@ -520,6 +550,9 @@ def pairwise_tilelang(
     lut: Tensor,
     *,
     use_min_margin_ste: bool,
+    surrogate: str = "fast_sigmoid_odd",
     target: str = "cuda",
 ) -> tuple[Tensor, Tensor, Tensor]:
-    return _PairwiseTileLangFunction.apply(latent, anchors, thresholds, lut, use_min_margin_ste, target)
+    if surrogate not in {"fast_sigmoid_odd", "izhikevich"}:
+        raise ValueError(f"Pairwise TileLang backend does not support surrogate={surrogate!r}")
+    return _PairwiseTileLangFunction.apply(latent, anchors, thresholds, lut, use_min_margin_ste, surrogate, target)

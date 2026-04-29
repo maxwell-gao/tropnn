@@ -72,6 +72,67 @@ if _HAS_TRITON:
         )
 
     @triton.jit
+    def _top2_stream_kernel(
+        z_ptr,
+        w_ptr,
+        b_ptr,
+        winner_ptr,
+        runner_ptr,
+        margins_ptr,
+        item_count,
+        heads: tl.constexpr,
+        cells: tl.constexpr,
+        code_dim: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_m = tl.program_id(axis=0)
+        pid_h = tl.program_id(axis=1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+        row_mask = offs_m < item_count
+        head_mask = offs_h < heads
+
+        best = tl.full((BLOCK_M, BLOCK_H), -3.4028234663852886e38, dtype=tl.float32)
+        second = tl.full((BLOCK_M, BLOCK_H), -3.4028234663852886e38, dtype=tl.float32)
+        best_cell = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.int32)
+        second_cell = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.int32)
+
+        for cell in range(0, cells):
+            score = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.float32)
+            for d0 in range(0, code_dim, BLOCK_D):
+                offs_d = d0 + tl.arange(0, BLOCK_D)
+                dim_mask = offs_d < code_dim
+                z = tl.load(
+                    z_ptr + offs_m[:, None] * code_dim + offs_d[None, :],
+                    mask=row_mask[:, None] & dim_mask[None, :],
+                    other=0.0,
+                )
+                w = tl.load(
+                    w_ptr + (offs_h[None, :] * cells + cell) * code_dim + offs_d[:, None],
+                    mask=head_mask[None, :] & dim_mask[:, None],
+                    other=0.0,
+                )
+                score += tl.dot(z, w, input_precision="ieee")
+
+            bias = tl.load(b_ptr + offs_h * cells + cell, mask=head_mask, other=0.0)
+            score += bias[None, :]
+            is_best = score > best
+            is_second = (score > second) & ~is_best
+            second_cell = tl.where(is_best, best_cell, tl.where(is_second, cell, second_cell))
+            second = tl.where(is_best, best, tl.where(is_second, score, second))
+            best_cell = tl.where(is_best, cell, best_cell)
+            best = tl.where(is_best, score, best)
+
+        out_offsets = offs_m[:, None] * heads + offs_h[None, :]
+        out_mask = row_mask[:, None] & head_mask[None, :]
+        tl.store(winner_ptr + out_offsets, best_cell.to(tl.int64), mask=out_mask)
+        tl.store(runner_ptr + out_offsets, second_cell.to(tl.int64), mask=out_mask)
+        tl.store(margins_ptr + out_offsets, best - second, mask=out_mask)
+
+    @triton.jit
     def _hidden_from_scores_kernel(
         scores_ptr,
         latent_ptr,
@@ -131,6 +192,87 @@ if _HAS_TRITON:
             tl.store(
                 margins_ptr + offs_m * heads + head,
                 best - second,
+                mask=store_route_mask,
+            )
+
+        tl.store(
+            hidden_ptr + offs_m[:, None] * code_dim + offs_d[None, :],
+            acc,
+            mask=row_mask[:, None] & dim_mask[None, :],
+        )
+
+    @triton.jit
+    def _hidden_from_scores_train_kernel(
+        scores_ptr,
+        latent_ptr,
+        code_ptr,
+        hidden_ptr,
+        winner_ptr,
+        runner_ptr,
+        margins_ptr,
+        item_count,
+        heads: tl.constexpr,
+        cells: tl.constexpr,
+        code_dim: tl.constexpr,
+        code_scale: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_m = tl.program_id(axis=0)
+        pid_d = tl.program_id(axis=1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        row_mask = offs_m < item_count
+        dim_mask = offs_d < code_dim
+
+        acc = tl.load(
+            latent_ptr + offs_m[:, None] * code_dim + offs_d[None, :],
+            mask=row_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
+
+        store_route_mask = row_mask & (pid_d == 0)
+        for head in range(0, heads):
+            best = tl.full((BLOCK_M,), -3.4028234663852886e38, dtype=tl.float32)
+            second = tl.full((BLOCK_M,), -3.4028234663852886e38, dtype=tl.float32)
+            best_cell = tl.zeros((BLOCK_M,), dtype=tl.int32)
+            second_cell = tl.zeros((BLOCK_M,), dtype=tl.int32)
+
+            for cell in range(0, cells):
+                score = tl.load(
+                    scores_ptr + (offs_m * heads + head) * cells + cell,
+                    mask=row_mask,
+                    other=-3.4028234663852886e38,
+                )
+                is_best = score > best
+                is_second = (score > second) & ~is_best
+                second_cell = tl.where(is_best, best_cell, tl.where(is_second, cell, second_cell))
+                second = tl.where(is_best, best, tl.where(is_second, score, second))
+                best_cell = tl.where(is_best, cell, best_cell)
+                best = tl.where(is_best, score, best)
+
+            margin = best - second
+            alpha = 0.5 / (1.0 + tl.abs(margin))
+            winner_offsets = head * cells * code_dim + best_cell[:, None] * code_dim + offs_d[None, :]
+            runner_offsets = head * cells * code_dim + second_cell[:, None] * code_dim + offs_d[None, :]
+            winner_code = tl.load(code_ptr + winner_offsets, mask=row_mask[:, None] & dim_mask[None, :], other=0.0)
+            runner_code = tl.load(code_ptr + runner_offsets, mask=row_mask[:, None] & dim_mask[None, :], other=0.0)
+            acc += (winner_code + alpha[:, None] * (runner_code - winner_code)) * code_scale
+
+            tl.store(
+                winner_ptr + offs_m * heads + head,
+                best_cell.to(tl.int64),
+                mask=store_route_mask,
+            )
+            tl.store(
+                runner_ptr + offs_m * heads + head,
+                second_cell.to(tl.int64),
+                mask=store_route_mask,
+            )
+            tl.store(
+                margins_ptr + offs_m * heads + head,
+                margin,
                 mask=store_route_mask,
             )
 
@@ -257,6 +399,60 @@ def _next_power_of_2(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
+def trop_top2_stream_triton(z: Tensor, router_weight: Tensor, router_bias: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    if not _HAS_TRITON:
+        raise RuntimeError("Triton is not available")
+    if not z.is_cuda:
+        raise ValueError("trop_top2_stream_triton requires CUDA tensors")
+    if z.ndim != 3:
+        raise ValueError(f"z must have shape [batch, steps, code_dim], got {tuple(z.shape)}")
+    if router_weight.ndim != 3:
+        raise ValueError(f"router_weight must have shape [heads, cells, code_dim], got {tuple(router_weight.shape)}")
+    if router_bias.shape != router_weight.shape[:2]:
+        raise ValueError(
+            f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}"
+        )
+
+    batch, steps, code_dim = z.shape
+    heads, cells, weight_dim = router_weight.shape
+    if weight_dim != code_dim:
+        raise ValueError(f"z code_dim {code_dim} does not match router_weight code_dim {weight_dim}")
+
+    item_count = batch * steps
+    z_flat = z.reshape(item_count, code_dim).contiguous().to(torch.float32)
+    weight = router_weight.reshape(heads * cells, code_dim).contiguous().to(torch.float32)
+    bias = router_bias.reshape(heads * cells).contiguous().to(torch.float32)
+    winner_idx = torch.empty((item_count, heads), device=z.device, dtype=torch.int64)
+    runner_idx = torch.empty((item_count, heads), device=z.device, dtype=torch.int64)
+    margins = torch.empty((item_count, heads), device=z.device, dtype=torch.float32)
+
+    block_m = 16 if code_dim >= 128 else 32
+    block_h = 16
+    block_d = min(64, max(32, _next_power_of_2(code_dim)))
+
+    _top2_stream_kernel[(triton.cdiv(item_count, block_m), triton.cdiv(heads, block_h))](
+        z_flat,
+        weight,
+        bias,
+        winner_idx,
+        runner_idx,
+        margins,
+        item_count,
+        heads,
+        cells,
+        code_dim,
+        BLOCK_M=block_m,
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return (
+        winner_idx.view(batch, steps, heads),
+        runner_idx.view(batch, steps, heads),
+        margins.view(batch, steps, heads),
+    )
+
+
 def trop_route_hidden_triton_eval(
     z: Tensor,
     router_weight: Tensor,
@@ -320,6 +516,76 @@ def trop_route_hidden_triton_eval(
         num_warps=4,
     )
     return hidden.view(batch, steps, code_dim), winner_idx.view(batch, steps, heads), margins.view(batch, steps, heads)
+
+
+def trop_route_hidden_triton_train(
+    z: Tensor,
+    router_weight: Tensor,
+    router_bias: Tensor,
+    code: Tensor,
+    *,
+    code_scale: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    if not _HAS_TRITON:
+        raise RuntimeError("Triton is not available")
+    if not z.is_cuda:
+        raise ValueError("trop_route_hidden_triton_train requires CUDA tensors")
+    if z.ndim != 3:
+        raise ValueError(f"z must have shape [batch, steps, code_dim], got {tuple(z.shape)}")
+    if router_weight.ndim != 3:
+        raise ValueError(f"router_weight must have shape [heads, cells, code_dim], got {tuple(router_weight.shape)}")
+    if router_bias.shape != router_weight.shape[:2]:
+        raise ValueError(
+            f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}"
+        )
+    if code.shape != router_weight.shape:
+        raise ValueError(f"code must match router_weight shape, got {tuple(code.shape)} and {tuple(router_weight.shape)}")
+
+    batch, steps, code_dim = z.shape
+    heads, cells, weight_dim = router_weight.shape
+    if weight_dim != code_dim:
+        raise ValueError(f"z code_dim {code_dim} does not match router_weight code_dim {weight_dim}")
+
+    item_count = batch * steps
+    z_flat = z.reshape(item_count, code_dim).contiguous().to(torch.float32)
+    weight = router_weight.contiguous().to(torch.float32)
+    bias = router_bias.contiguous().to(torch.float32)
+    code_table = code.contiguous().to(torch.float32)
+    scores = trop_scores_triton(z, weight, bias).reshape(item_count, heads, cells).contiguous()
+    hidden = torch.empty((item_count, code_dim), device=z.device, dtype=torch.float32)
+    winner_idx = torch.empty((item_count, heads), device=z.device, dtype=torch.int64)
+    runner_idx = torch.empty((item_count, heads), device=z.device, dtype=torch.int64)
+    margins = torch.empty((item_count, heads), device=z.device, dtype=torch.float32)
+
+    block_d = min(128, _next_power_of_2(code_dim))
+    block_m = 4 if block_d >= 128 else 8
+
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
+        return triton.cdiv(item_count, meta["BLOCK_M"]), triton.cdiv(code_dim, meta["BLOCK_D"])
+
+    _hidden_from_scores_train_kernel[grid](
+        scores,
+        z_flat,
+        code_table,
+        hidden,
+        winner_idx,
+        runner_idx,
+        margins,
+        item_count,
+        heads,
+        cells,
+        code_dim,
+        float(code_scale),
+        BLOCK_M=block_m,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return (
+        hidden.view(batch, steps, code_dim),
+        winner_idx.view(batch, steps, heads),
+        runner_idx.view(batch, steps, heads),
+        margins.view(batch, steps, heads),
+    )
 
 
 def trop_fan_basis_hidden_triton_eval(

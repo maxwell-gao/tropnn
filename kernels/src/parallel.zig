@@ -9,7 +9,7 @@ export fn tropnn_set_num_threads(num_threads: usize) void {
     configured_num_threads.store(@min(num_threads, MAX_THREADS), .monotonic);
 }
 
-export fn tropnn_get_num_threads() usize {
+pub export fn tropnn_get_num_threads() usize {
     const requested = configured_num_threads.load(.monotonic);
     if (requested != 0) return requested;
     return @min(std.Thread.getCpuCount() catch 1, MAX_THREADS);

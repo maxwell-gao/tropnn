@@ -10,6 +10,8 @@ from torch import Tensor
 from ..backend import Backend, trop_scores
 from .base import RoutedLinearBase
 
+_CUDA_TORCH_FALLBACK_SCORE_BYTES = 128 * 1024 * 1024
+
 
 def _top2_indices(scores: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     top2_vals, top2_idx = scores.topk(k=2, dim=-1)
@@ -18,6 +20,68 @@ def _top2_indices(scores: Tensor) -> tuple[Tensor, Tensor, Tensor]:
 
 def _minface_mix(winner_values: Tensor, runner_values: Tensor, margins: Tensor) -> Tensor:
     return winner_values + (0.5 / (1.0 + margins.abs())).unsqueeze(-1) * (runner_values - winner_values)
+
+
+def _packed_route_index_dtype(cells: int) -> torch.dtype:
+    if cells <= 256:
+        return torch.uint8
+    if cells <= 32767:
+        return torch.int16
+    return torch.int64
+
+
+def _pack_route_indices(indices: Tensor, cells: int) -> Tensor:
+    return indices.to(dtype=_packed_route_index_dtype(cells))
+
+
+def _unpack_route_indices(indices: Tensor) -> Tensor:
+    return indices if indices.dtype == torch.int64 else indices.to(dtype=torch.int64)
+
+
+def _gather_route_margins_from_scores(scores: Tensor, winner_idx: Tensor, runner_idx: Tensor) -> Tensor:
+    winner_scores = scores.gather(dim=2, index=winner_idx.unsqueeze(-1)).squeeze(-1)
+    runner_scores = scores.gather(dim=2, index=runner_idx.unsqueeze(-1)).squeeze(-1)
+    return winner_scores - runner_scores
+
+
+def _recompute_route_margins_torch(latent_flat: Tensor, router_weight: Tensor, router_bias: Tensor, winner_idx: Tensor, runner_idx: Tensor) -> Tensor:
+    heads, cells, code_dim = router_weight.shape
+    scores = torch.matmul(latent_flat, router_weight.reshape(heads * cells, code_dim).t()).view(latent_flat.shape[0], heads, cells)
+    scores = scores + router_bias.view(1, heads, cells)
+    return _gather_route_margins_from_scores(scores, winner_idx, runner_idx)
+
+
+def _route_score_bytes(item_count: int, heads: int, cells: int) -> int:
+    return item_count * heads * cells * 4
+
+
+def _can_cuda_torch_route_fallback(item_count: int, heads: int, cells: int) -> bool:
+    return _route_score_bytes(item_count, heads, cells) <= _CUDA_TORCH_FALLBACK_SCORE_BYTES
+
+
+def _is_hard_cuda_failure(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "out of memory",
+            "cuda error",
+            "device-side assert",
+            "illegal memory",
+            "misaligned address",
+            "unspecified launch failure",
+            "invalid configuration argument",
+            "too many resources requested",
+        )
+    )
+
+
+def _raise_no_cuda_torch_fallback(exc: BaseException, item_count: int, heads: int, cells: int) -> None:
+    score_bytes = _route_score_bytes(item_count, heads, cells)
+    raise RuntimeError(
+        "TropLinear exact_fused='train' CUDA route failed and torch fallback was disabled because it would "
+        f"materialize a full score tensor ({score_bytes} bytes for items={item_count}, heads={heads}, cells={cells})."
+    ) from exc
 
 
 class _TropExactRouteFunction(torch.autograd.Function):
@@ -30,6 +94,7 @@ class _TropExactRouteFunction(torch.autograd.Function):
         code: Tensor,
         code_scale: float,
         training: bool,
+        score_route_max_bytes: int | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         batch, steps, code_dim = latent.shape
         heads, cells, _ = code.shape
@@ -42,7 +107,9 @@ class _TropExactRouteFunction(torch.autograd.Function):
         if latent.is_cuda:
             try:
                 from ..backends.tilelang_route import _run_trop_forward
-            except (ImportError, RuntimeError):
+            except (ImportError, RuntimeError, OSError) as exc:
+                if not _can_cuda_torch_route_fallback(item_count, heads, cells):
+                    _raise_no_cuda_torch_fallback(exc, item_count, heads, cells)
                 hidden, winner_idx, runner_idx, margins = _TropExactRouteFunction._forward_torch(
                     latent_flat,
                     weight,
@@ -62,8 +129,11 @@ class _TropExactRouteFunction(torch.autograd.Function):
                         code_scale=float(code_scale),
                         training=bool(training),
                         target="cuda",
+                        score_route_max_bytes=score_route_max_bytes,
                     )
-                except RuntimeError:
+                except RuntimeError as exc:
+                    if _is_hard_cuda_failure(exc) or not _can_cuda_torch_route_fallback(item_count, heads, cells):
+                        _raise_no_cuda_torch_fallback(exc, item_count, heads, cells)
                     hidden, winner_idx, runner_idx, margins = _TropExactRouteFunction._forward_torch(
                         latent_flat,
                         weight,
@@ -89,7 +159,9 @@ class _TropExactRouteFunction(torch.autograd.Function):
                 shape=(batch, steps, code_dim, heads, cells),
             )
 
-        ctx.save_for_backward(latent_flat, weight, code_table, winner_idx, runner_idx, margins)
+        winner_saved = _pack_route_indices(winner_idx, cells)
+        runner_saved = _pack_route_indices(runner_idx, cells)
+        ctx.save_for_backward(latent_flat, weight, bias, code_table, winner_saved, runner_saved)
         ctx.code_scale = float(code_scale)
         ctx.training = bool(training)
         ctx.shape = (batch, steps, code_dim, heads, cells)
@@ -132,9 +204,9 @@ class _TropExactRouteFunction(torch.autograd.Function):
         grad_hidden: Tensor,
         grad_winner: Tensor | None,
         grad_margins_out: Tensor | None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, None, None]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, None, None, None]:
         del grad_winner, grad_margins_out
-        latent_flat, router_weight, code, winner_idx, runner_idx, margins = ctx.saved_tensors
+        latent_flat, router_weight, router_bias, code, winner_saved, runner_saved = ctx.saved_tensors
         batch, steps, code_dim, heads, cells = ctx.shape
         item_count = batch * steps
         grad_flat = grad_hidden.reshape(item_count, code_dim).contiguous().to(torch.float32)
@@ -142,17 +214,18 @@ class _TropExactRouteFunction(torch.autograd.Function):
         if ctx.training and grad_flat.is_cuda:
             try:
                 from ..backends.triton_backward import trop_exact_route_backward_triton
-            except (ImportError, RuntimeError):
-                pass
+            except (ImportError, RuntimeError, OSError) as exc:
+                if not _can_cuda_torch_route_fallback(item_count, heads, cells):
+                    _raise_no_cuda_torch_fallback(exc, item_count, heads, cells)
             else:
                 grad_latent, grad_router_weight, grad_router_bias, grad_code = trop_exact_route_backward_triton(
                     grad_flat,
                     latent_flat,
                     router_weight,
+                    router_bias,
                     code,
-                    winner_idx,
-                    runner_idx,
-                    margins,
+                    winner_saved,
+                    runner_saved,
                     code_scale=ctx.code_scale,
                 )
                 return (
@@ -162,7 +235,12 @@ class _TropExactRouteFunction(torch.autograd.Function):
                     grad_code,
                     None,
                     None,
+                    None,
                 )
+
+        winner_idx = _unpack_route_indices(winner_saved)
+        runner_idx = _unpack_route_indices(runner_saved)
+        margins = _recompute_route_margins_torch(latent_flat, router_weight, router_bias, winner_idx, runner_idx)
 
         code_coeff = torch.zeros(item_count, heads, cells, device=grad_flat.device, dtype=grad_flat.dtype)
         if ctx.training:
@@ -193,7 +271,7 @@ class _TropExactRouteFunction(torch.autograd.Function):
             grad_router_bias = route_coeff.sum(dim=0)
             grad_latent = grad_latent + torch.einsum("nhc,hcr->nr", route_coeff, router_weight)
 
-        return grad_latent.view(batch, steps, code_dim), grad_router_weight, grad_router_bias, grad_code, None, None
+        return grad_latent.view(batch, steps, code_dim), grad_router_weight, grad_router_bias, grad_code, None, None, None
 
 
 class TropLinear(RoutedLinearBase):
@@ -213,6 +291,8 @@ class TropLinear(RoutedLinearBase):
         use_output_scaling: bool = True,
         cpu_param_dtype: Literal["f32", "f16"] = "f32",
         exact_fused: Literal["off", "eval", "train"] = "off",
+        score_route_max_bytes: int | None = None,
+        cache_route_debug: bool = True,
     ) -> None:
         if heads < 1:
             raise ValueError(f"heads must be >= 1, got {heads}")
@@ -224,6 +304,8 @@ class TropLinear(RoutedLinearBase):
             raise ValueError(f"cpu_param_dtype must be 'f32' or 'f16', got {cpu_param_dtype!r}")
         if exact_fused not in {"off", "eval", "train"}:
             raise ValueError(f"exact_fused must be 'off', 'eval', or 'train', got {exact_fused!r}")
+        if score_route_max_bytes is not None and score_route_max_bytes < 0:
+            raise ValueError(f"score_route_max_bytes must be >= 0 when set, got {score_route_max_bytes}")
 
         super().__init__(in_features, out_features, backend=backend, output_scale=1.0)
         self.heads = heads
@@ -232,6 +314,8 @@ class TropLinear(RoutedLinearBase):
         self.code_scale = 1.0 / math.sqrt(heads) if use_output_scaling else 1.0
         self.cpu_param_dtype = cpu_param_dtype
         self.exact_fused = exact_fused
+        self.score_route_max_bytes = score_route_max_bytes
+        self.cache_route_debug = cache_route_debug
         self._zig_router_weight_f16_cache: Tensor | None = None
         self._zig_router_bias_f16_cache: Tensor | None = None
         self._zig_code_f16_cache: Tensor | None = None
@@ -257,7 +341,8 @@ class TropLinear(RoutedLinearBase):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, heads={self.heads}, "
             f"cells={self.cells}, code_dim={self.code_dim}, backend={self.backend!r}, cpu_param_dtype={self.cpu_param_dtype!r}, "
-            f"exact_fused={self.exact_fused!r}"
+            f"exact_fused={self.exact_fused!r}, score_route_max_bytes={self.score_route_max_bytes!r}, "
+            f"cache_route_debug={self.cache_route_debug!r}"
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -431,8 +516,12 @@ class TropLinear(RoutedLinearBase):
 
         output_flat = output_flat + value_sum * self.code_scale
         route_shape = (batch, steps, self.heads)
-        self._last_indices = winner_idx.view(route_shape).detach()
-        self._last_margins = margins.view(route_shape).detach()
+        if self.cache_route_debug:
+            self._last_indices = winner_idx.view(route_shape).detach()
+            self._last_margins = margins.view(route_shape).detach()
+        else:
+            self._last_indices = None
+            self._last_margins = None
         return output_flat.view(batch, steps, self.out_features).to(dtype=input_dtype)
 
     def _forward_exact_route(self, x: Tensor) -> Tensor:
@@ -448,10 +537,15 @@ class TropLinear(RoutedLinearBase):
             self.code.to(dtype=compute_dtype, device=x.device),
             self.code_scale,
             self.training,
+            self.score_route_max_bytes,
         )
         output = self._output_from_hidden(hidden, input_device=x.device, compute_dtype=compute_dtype)
-        self._last_indices = winner_idx.detach()
-        self._last_margins = margins.detach()
+        if self.cache_route_debug:
+            self._last_indices = winner_idx.detach()
+            self._last_margins = margins.detach()
+        else:
+            self._last_indices = None
+            self._last_margins = None
         return output.to(dtype=input_dtype)
 
     def _route_output(
@@ -509,6 +603,7 @@ class TropLinear(RoutedLinearBase):
                 code,
                 code_scale=self.code_scale,
                 training=training,
+                score_route_max_bytes=self.score_route_max_bytes,
             )
             return self._output_from_hidden(hidden, input_device=input_device, compute_dtype=compute_dtype), winner_idx, margins
 
@@ -527,3 +622,98 @@ class TropLinear(RoutedLinearBase):
         else:
             codes = self._selected_codes(winner_idx, input_device=input_device, compute_dtype=compute_dtype)
         return self._output_from_codes(latent, codes, input_device=input_device, compute_dtype=compute_dtype), winner_idx, margins
+
+
+class TropZeroDenseLinear(RoutedLinearBase):
+    """Tropical layer with sparse-coordinate routing and direct output codes.
+
+    This experimental variant removes the dense projection and dense readout
+    used by ``TropLinear``:
+
+        score[h, k] = sum_r w[h, k, r] * x[anchor[h, k, r]] + b[h, k]
+        y = bias + code_scale * sum_h code[h, argmax_k score[h, k]]
+
+    It is meant as a zero-dense control for EMNIST and scaling experiments,
+    not as a drop-in replacement for the optimized TropLinear TileLang path.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        heads: int = 32,
+        cells: int = 4,
+        route_terms: int = 2,
+        backend: Backend = "torch",
+        seed: int = 0,
+        code_init_std: float = 0.02,
+        use_output_scaling: bool = True,
+    ) -> None:
+        if heads < 1:
+            raise ValueError(f"heads must be >= 1, got {heads}")
+        if cells < 2:
+            raise ValueError(f"cells must be >= 2, got {cells}")
+        if route_terms < 1:
+            raise ValueError(f"route_terms must be >= 1, got {route_terms}")
+        if backend != "torch":
+            raise ValueError(f"TropZeroDenseLinear currently supports backend='torch' only, got {backend!r}")
+
+        super().__init__(in_features, out_features, backend=backend, output_scale=1.0)
+        self.heads = heads
+        self.cells = cells
+        self.route_terms = route_terms
+        self.code_scale = 1.0 / math.sqrt(heads) if use_output_scaling else 1.0
+
+        torch.manual_seed(seed)
+        anchors = torch.randint(0, in_features, (heads, cells, route_terms), dtype=torch.long)
+        self.register_buffer("anchors", anchors)
+        router_std = 1.0 / math.sqrt(route_terms)
+        self.router_weight = nn.Parameter(torch.randn(heads, cells, route_terms) * router_std)
+        self.router_bias = nn.Parameter(torch.zeros(heads, cells))
+        self.code = nn.Parameter(torch.randn(heads, cells, out_features) * code_init_std)
+        self.bias = nn.Parameter(torch.zeros(out_features))
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, heads={self.heads}, "
+            f"cells={self.cells}, route_terms={self.route_terms}, backend={self.backend!r}"
+        )
+
+    def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
+        return x.to(compute_dtype)
+
+    def _scores(self, latent: Tensor, *, input_device: torch.device, compute_dtype: torch.dtype) -> Tensor:
+        del input_device
+        batch, seq, _ = latent.shape
+        selected = latent.index_select(-1, self.anchors.flatten()).view(batch, seq, self.heads, self.cells, self.route_terms)
+        weight = self.router_weight.to(dtype=compute_dtype, device=latent.device)
+        bias = self.router_bias.to(dtype=compute_dtype, device=latent.device)
+        return (selected * weight.view(1, 1, self.heads, self.cells, self.route_terms)).sum(dim=-1) + bias.view(1, 1, self.heads, self.cells)
+
+    def _selected_codes(self, winner_idx: Tensor, *, input_device: torch.device, compute_dtype: torch.dtype) -> Tensor:
+        code = self.code.to(dtype=compute_dtype, device=input_device).unsqueeze(0).unsqueeze(0)
+        gather_idx = winner_idx.unsqueeze(-1).unsqueeze(-1).expand(*winner_idx.shape, 1, self.out_features)
+        return code.expand(*winner_idx.shape[:2], -1, -1, -1).gather(-2, gather_idx).squeeze(-2)
+
+    def _output_from_codes(self, codes: Tensor, *, input_device: torch.device, compute_dtype: torch.dtype) -> Tensor:
+        output = codes.sum(dim=2) * self.code_scale
+        return output + self.bias.to(dtype=compute_dtype, device=input_device)
+
+    def _route_output(
+        self,
+        latent: Tensor,
+        *,
+        input_device: torch.device,
+        compute_dtype: torch.dtype,
+        training: bool,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        scores = self._scores(latent, input_device=input_device, compute_dtype=compute_dtype)
+        winner_idx, runner_idx, margins = _top2_indices(scores)
+        if training:
+            winner_codes = self._selected_codes(winner_idx, input_device=input_device, compute_dtype=compute_dtype)
+            runner_codes = self._selected_codes(runner_idx, input_device=input_device, compute_dtype=compute_dtype)
+            codes = _minface_mix(winner_codes, runner_codes, margins)
+        else:
+            codes = self._selected_codes(winner_idx, input_device=input_device, compute_dtype=compute_dtype)
+        return self._output_from_codes(codes, input_device=input_device, compute_dtype=compute_dtype), winner_idx, margins

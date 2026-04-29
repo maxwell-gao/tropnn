@@ -229,8 +229,6 @@ class PairwiseLinear(RoutedLinearBase):
                 raise ValueError("PairwiseLinear backend='tilelang' requires CUDA input tensors")
             if compute_dtype != torch.float32:
                 raise TypeError(f"PairwiseLinear backend='tilelang' requires float32 compute dtype, got {compute_dtype}")
-            if self.surrogate != "fast_sigmoid_odd":
-                raise ValueError("PairwiseLinear backend='tilelang' currently supports surrogate='fast_sigmoid_odd' only")
             from ..backends import pairwise_tilelang
 
             return pairwise_tilelang(
@@ -239,6 +237,7 @@ class PairwiseLinear(RoutedLinearBase):
                 self.thresholds.to(dtype=compute_dtype, device=latent.device),
                 self.lut.to(dtype=compute_dtype, device=latent.device),
                 use_min_margin_ste=self.use_min_margin_ste,
+                surrogate=self.surrogate,
             )
 
         indices, margins = self._compute_indices(latent)

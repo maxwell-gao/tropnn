@@ -75,6 +75,10 @@ class RoutedLinearBase(nn.Module, ABC):
         )
         if self.output_scale != 1.0:
             output = output * self.output_scale
-        self._last_indices = route_indices.detach()
-        self._last_margins = margins.detach()
+        if getattr(self, "cache_route_debug", True):
+            self._last_indices = route_indices.detach()
+            self._last_margins = margins.detach()
+        else:
+            self._last_indices = None
+            self._last_margins = None
         return output.to(dtype=input_dtype)

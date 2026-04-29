@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..layers import PairwiseLinear, TropLinear
+from ..layers import PairwiseLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
 
 IDX_DTYPES = {
     0x08: np.uint8,
@@ -28,7 +28,9 @@ IDX_DTYPES = {
     0x0E: np.dtype(">f8"),
 }
 EMNIST_SPLITS = ("byclass", "bymerge", "balanced", "letters", "digits", "mnist")
-ROUTED_FAMILIES = ("tropical", "pairwise")
+ROUTED_FAMILIES = ("tropical", "tropical_lowrank", "tropical_zero_dense", "tropfan_zero_dense", "pairwise")
+TROPICAL_FAMILIES = ("tropical", "tropical_lowrank")
+HEAD_ROUTED_FAMILIES = ("tropical", "tropical_lowrank", "tropical_zero_dense", "tropfan_zero_dense")
 
 
 def _read_idx(path: Path) -> np.ndarray:
@@ -90,13 +92,29 @@ def _make_layer(
     heads: int,
     cells: int,
     code_dim: int,
+    route_terms: int,
+    fan_value_mode: str,
+    fan_basis_rank: int,
     comparisons: int,
     pairwise_tables: int,
     backend: str,
     seed: int,
 ) -> nn.Module:
-    if family == "tropical":
+    if family in TROPICAL_FAMILIES:
         return TropLinear(d_in, d_out, heads=heads, cells=cells, code_dim=code_dim, backend=backend, seed=seed)
+    if family == "tropical_zero_dense":
+        return TropZeroDenseLinear(d_in, d_out, heads=heads, cells=cells, route_terms=route_terms, seed=seed)
+    if family == "tropfan_zero_dense":
+        return TropFanZeroDenseLinear(
+            d_in,
+            d_out,
+            heads=heads,
+            cells=cells,
+            code_dim=code_dim,
+            fan_value_mode=fan_value_mode,  # type: ignore[arg-type]
+            fan_basis_rank=fan_basis_rank,
+            seed=seed,
+        )
     return PairwiseLinear(d_in, d_out, tables=pairwise_tables, comparisons=comparisons, backend=backend, seed=seed)
 
 
@@ -112,6 +130,9 @@ class EmnistRoutedClassifier(nn.Module):
         heads: int,
         cells: int,
         code_dim: int,
+        route_terms: int,
+        fan_value_mode: str,
+        fan_basis_rank: int,
         comparisons: int,
         pairwise_tables: int,
         backend: str,
@@ -134,6 +155,9 @@ class EmnistRoutedClassifier(nn.Module):
                     heads=heads,
                     cells=cells,
                     code_dim=code_dim,
+                    route_terms=route_terms,
+                    fan_value_mode=fan_value_mode,
+                    fan_basis_rank=fan_basis_rank,
                     comparisons=comparisons,
                     pairwise_tables=pairwise_tables,
                     backend=backend,
@@ -154,6 +178,21 @@ class EmnistRoutedClassifier(nn.Module):
 class EmnistTropClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
         super().__init__(family="tropical", **kwargs)
+
+
+class EmnistTropLowRankClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="tropical_lowrank", **kwargs)
+
+
+class EmnistTropZeroDenseClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="tropical_zero_dense", **kwargs)
+
+
+class EmnistTropFanZeroDenseClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="tropfan_zero_dense", **kwargs)
 
 
 class EmnistPairwiseClassifier(EmnistRoutedClassifier):
@@ -211,11 +250,14 @@ def main() -> None:
         ("--heads", int, 32),
         ("--cells", int, 4),
         ("--code-dim", int, 32),
+        ("--route-terms", int, 2),
+        ("--fan-basis-rank", int, 16),
         ("--pairwise-tables", int, 72),
         ("--comparisons", int, 6),
     ):
         parser.add_argument(name, type=arg_type, default=default)
     parser.add_argument("--backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
+    parser.add_argument("--fan-value-mode", choices=("site", "basis"), default="site")
     parser.add_argument("--max-train", type=int, default=None)
     parser.add_argument("--max-test", type=int, default=None)
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
@@ -255,6 +297,9 @@ def main() -> None:
         heads=args.heads,
         cells=args.cells,
         code_dim=args.code_dim,
+        route_terms=args.route_terms,
+        fan_value_mode=args.fan_value_mode,
+        fan_basis_rank=args.fan_basis_rank,
         comparisons=args.comparisons,
         pairwise_tables=args.pairwise_tables,
         backend=args.backend,
@@ -269,12 +314,15 @@ def main() -> None:
         "family": args.family,
         "depth": args.depth,
         "hidden_dim": args.hidden_dim,
-        "heads": args.heads if args.family == "tropical" else "-",
-        "cells": args.cells if args.family == "tropical" else "-",
-        "code_dim": args.code_dim if args.family == "tropical" else "-",
+        "heads": args.heads if args.family in HEAD_ROUTED_FAMILIES else "-",
+        "cells": args.cells if args.family in HEAD_ROUTED_FAMILIES else "-",
+        "code_dim": args.code_dim if args.family in TROPICAL_FAMILIES or args.family == "tropfan_zero_dense" else "-",
+        "route_terms": args.route_terms if args.family == "tropical_zero_dense" else "-",
+        "fan_value_mode": args.fan_value_mode if args.family == "tropfan_zero_dense" else "-",
+        "fan_basis_rank": args.fan_basis_rank if args.family == "tropfan_zero_dense" else "-",
         "pairwise_tables": args.pairwise_tables if args.family == "pairwise" else "-",
         "comparisons": args.comparisons if args.family == "pairwise" else "-",
-        "backend": args.backend if args.family == "tropical" else "torch",
+        "backend": args.backend if args.family in TROPICAL_FAMILIES or args.family == "pairwise" else "torch",
         "train/test": f"{len(x_train)}/{len(x_test)}",
         "device": device.type,
         "params": sum(param.numel() for param in model.parameters()),

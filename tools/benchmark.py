@@ -427,6 +427,58 @@ def benchmark_trop_linear_auto(
     }
 
 
+def benchmark_trop_linear_exact_train(
+    *,
+    batch_size: int = 512,
+    sequence_length: int = 1,
+    in_features: int = 28 * 28,
+    out_features: int = 128,
+    cells: int = 31,
+    heads: int = 256,
+    code_dim: int = 256,
+    warmup: int = 5,
+    steps: int = 20,
+    device: str = "cuda",
+    seed: int = 0,
+    score_route_max_bytes: int | None = None,
+) -> dict[str, float]:
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        raise ValueError("exact train benchmark requires device='cuda'")
+    if not has_tilelang():
+        raise RuntimeError("exact train benchmark requires TileLang")
+
+    torch.manual_seed(seed)
+    layer = TropLinear(
+        in_features,
+        out_features,
+        heads=heads,
+        cells=cells,
+        code_dim=code_dim,
+        backend="tilelang",
+        exact_fused="train",
+        score_route_max_bytes=score_route_max_bytes,
+        cache_route_debug=False,
+        seed=seed,
+    ).to(dev)
+    x = torch.randn(batch_size, sequence_length, in_features, device=dev)
+
+    score_bytes = batch_size * sequence_length * heads * cells * 4
+    score_limit = 128 * 1024 * 1024 if score_route_max_bytes is None else score_route_max_bytes
+    streams_top2 = has_triton() and (cells >= 16 or score_bytes > 1024 * 1024 * 1024)
+    materializes_scores = (not streams_top2) and code_dim >= 128 and score_bytes <= score_limit
+
+    train_ms = _bench_train_step(layer, x, warmup=warmup, steps=steps)
+    train_peak_bytes = _bench_train_peak_bytes(layer, x)
+    return {
+        "exact_train_ms": train_ms,
+        "exact_train_peak_bytes": float(train_peak_bytes),
+        "exact_train_score_bytes": float(score_bytes),
+        "exact_train_stream_top2": float(streams_top2),
+        "exact_train_materialized_scores": float(materializes_scores),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark TropLinear backend='auto' against backend='torch'.")
     for name, default in (
@@ -451,6 +503,8 @@ def main() -> None:
     parser.add_argument("--tropical-zig-dtype", choices=("f32", "f16"), default="f32")
     parser.add_argument("--pairwise-zig-dtype", choices=("f32", "f16"), default="f32")
     parser.add_argument("--fan-zig-dtype", choices=("f32", "f16"), default="f32")
+    parser.add_argument("--exact-train-only", action="store_true", help="Benchmark TropLinear exact_fused='train' only.")
+    parser.add_argument("--score-route-max-bytes", type=int, default=-1, help="Materialized score route limit for exact train; -1 uses default.")
     args = parser.parse_args()
 
     if args.num_threads > 0:
@@ -460,6 +514,32 @@ def main() -> None:
         f"has_tropical_zig={has_tropical_zig()} has_pairwise_zig={has_pairwise_zig()} has_trop_fan_zig={has_trop_fan_zig()} "
         f"device={args.device}"
     )
+    score_route_max_bytes = None if args.score_route_max_bytes < 0 else args.score_route_max_bytes
+    if args.exact_train_only:
+        result = benchmark_trop_linear_exact_train(
+            batch_size=args.batch_size,
+            sequence_length=args.sequence_length,
+            in_features=args.in_features,
+            out_features=args.out_features,
+            heads=args.heads,
+            cells=args.cells,
+            code_dim=args.code_dim,
+            warmup=args.warmup,
+            steps=args.steps,
+            device=args.device,
+            seed=args.seed,
+            score_route_max_bytes=score_route_max_bytes,
+        )
+        for key in (
+            "exact_train_ms",
+            "exact_train_peak_bytes",
+            "exact_train_score_bytes",
+            "exact_train_stream_top2",
+            "exact_train_materialized_scores",
+        ):
+            print(f"{key}={result[key]:.4f}")
+        return
+
     result = benchmark_trop_linear_auto(
         batch_size=args.batch_size,
         sequence_length=args.sequence_length,

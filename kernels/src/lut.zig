@@ -78,7 +78,7 @@ const LutForwardF32Context = struct {
     outputs: [*]f32,
 };
 
-fn lutForwardF32Range(ctx: *LutForwardF32Context, row_start: usize, row_end: usize) void {
+fn lutForwardF32RowMajorRange(ctx: *LutForwardF32Context, row_start: usize, row_end: usize) void {
     var row = row_start;
     while (row < row_end) : (row += 1) {
         const input_ptr = ctx.inputs + row * ctx.input_dim;
@@ -112,6 +112,49 @@ fn lutForwardF32Range(ctx: *LutForwardF32Context, row_start: usize, row_end: usi
     }
 }
 
+fn lutForwardF32TableMajorRange(ctx: *LutForwardF32Context, row_start: usize, row_end: usize) void {
+    var row = row_start;
+    while (row < row_end) : (row += 1) {
+        const output_ptr = ctx.outputs + row * ctx.output_dim;
+        simd.zero(output_ptr, ctx.output_dim);
+    }
+
+    const stride = ctx.table_size * ctx.output_dim;
+    var table_idx: usize = 0;
+    while (table_idx + 4 <= ctx.num_tables) : (table_idx += 4) {
+        if (table_idx + simd.PREFETCH_L2 < ctx.num_tables) {
+            @prefetch(&ctx.anchors[(table_idx + simd.PREFETCH_L2) * ctx.num_comparisons * 2], .{ .rw = .read, .locality = 3, .cache = .data });
+            @prefetch(&ctx.offsets[(table_idx + simd.PREFETCH_L2) * ctx.num_comparisons], .{ .rw = .read, .locality = 3, .cache = .data });
+        }
+
+        row = row_start;
+        while (row < row_end) : (row += 1) {
+            const input_ptr = ctx.inputs + row * ctx.input_dim;
+            const output_ptr = ctx.outputs + row * ctx.output_dim;
+            const idx0 = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx, ctx.num_comparisons);
+            const idx1 = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx + 1, ctx.num_comparisons);
+            const idx2 = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx + 2, ctx.num_comparisons);
+            const idx3 = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx + 3, ctx.num_comparisons);
+            const base0 = table_idx * stride + idx0 * ctx.output_dim;
+            const base1 = (table_idx + 1) * stride + idx1 * ctx.output_dim;
+            const base2 = (table_idx + 2) * stride + idx2 * ctx.output_dim;
+            const base3 = (table_idx + 3) * stride + idx3 * ctx.output_dim;
+
+            simd.accumulate4Sources(output_ptr, ctx.weights + base0, ctx.weights + base1, ctx.weights + base2, ctx.weights + base3, ctx.output_dim);
+        }
+    }
+    while (table_idx < ctx.num_tables) : (table_idx += 1) {
+        row = row_start;
+        while (row < row_end) : (row += 1) {
+            const input_ptr = ctx.inputs + row * ctx.input_dim;
+            const output_ptr = ctx.outputs + row * ctx.output_dim;
+            const idx = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx, ctx.num_comparisons);
+            const weight_base = table_idx * ctx.table_size * ctx.output_dim + idx * ctx.output_dim;
+            simd.accumulate4x(output_ptr, ctx.weights + weight_base, ctx.output_dim);
+        }
+    }
+}
+
 const LutForwardF16Context = struct {
     num_tables: usize,
     num_comparisons: usize,
@@ -125,7 +168,7 @@ const LutForwardF16Context = struct {
     outputs: [*]f32,
 };
 
-fn lutForwardF16Range(ctx: *LutForwardF16Context, row_start: usize, row_end: usize) void {
+fn lutForwardF16RowMajorRange(ctx: *LutForwardF16Context, row_start: usize, row_end: usize) void {
     var row = row_start;
     while (row < row_end) : (row += 1) {
         const input_ptr = ctx.inputs + row * ctx.input_dim;
@@ -152,6 +195,49 @@ fn lutForwardF16Range(ctx: *LutForwardF16Context, row_start: usize, row_end: usi
             simd.accumulate4SourcesF16(output_ptr, ctx.weights_f16 + base0, ctx.weights_f16 + base1, ctx.weights_f16 + base2, ctx.weights_f16 + base3, ctx.output_dim);
         }
         while (table_idx < ctx.num_tables) : (table_idx += 1) {
+            const idx = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx, ctx.num_comparisons);
+            const weight_base = table_idx * ctx.table_size * ctx.output_dim + idx * ctx.output_dim;
+            simd.accumulate4xF16(output_ptr, ctx.weights_f16 + weight_base, ctx.output_dim);
+        }
+    }
+}
+
+fn lutForwardF16TableMajorRange(ctx: *LutForwardF16Context, row_start: usize, row_end: usize) void {
+    var row = row_start;
+    while (row < row_end) : (row += 1) {
+        const output_ptr = ctx.outputs + row * ctx.output_dim;
+        simd.zero(output_ptr, ctx.output_dim);
+    }
+
+    const stride = ctx.table_size * ctx.output_dim;
+    var table_idx: usize = 0;
+    while (table_idx + 4 <= ctx.num_tables) : (table_idx += 4) {
+        if (table_idx + simd.PREFETCH_L2 < ctx.num_tables) {
+            @prefetch(&ctx.anchors[(table_idx + simd.PREFETCH_L2) * ctx.num_comparisons * 2], .{ .rw = .read, .locality = 3, .cache = .data });
+            @prefetch(&ctx.offsets[(table_idx + simd.PREFETCH_L2) * ctx.num_comparisons], .{ .rw = .read, .locality = 3, .cache = .data });
+        }
+
+        row = row_start;
+        while (row < row_end) : (row += 1) {
+            const input_ptr = ctx.inputs + row * ctx.input_dim;
+            const output_ptr = ctx.outputs + row * ctx.output_dim;
+            const idx0 = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx, ctx.num_comparisons);
+            const idx1 = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx + 1, ctx.num_comparisons);
+            const idx2 = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx + 2, ctx.num_comparisons);
+            const idx3 = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx + 3, ctx.num_comparisons);
+            const base0 = table_idx * stride + idx0 * ctx.output_dim;
+            const base1 = (table_idx + 1) * stride + idx1 * ctx.output_dim;
+            const base2 = (table_idx + 2) * stride + idx2 * ctx.output_dim;
+            const base3 = (table_idx + 3) * stride + idx3 * ctx.output_dim;
+
+            simd.accumulate4SourcesF16(output_ptr, ctx.weights_f16 + base0, ctx.weights_f16 + base1, ctx.weights_f16 + base2, ctx.weights_f16 + base3, ctx.output_dim);
+        }
+    }
+    while (table_idx < ctx.num_tables) : (table_idx += 1) {
+        row = row_start;
+        while (row < row_end) : (row += 1) {
+            const input_ptr = ctx.inputs + row * ctx.input_dim;
+            const output_ptr = ctx.outputs + row * ctx.output_dim;
             const idx = computeComparisonsWithOffsets(input_ptr, ctx.anchors, ctx.offsets, table_idx, ctx.num_comparisons);
             const weight_base = table_idx * ctx.table_size * ctx.output_dim + idx * ctx.output_dim;
             simd.accumulate4xF16(output_ptr, ctx.weights_f16 + weight_base, ctx.output_dim);
@@ -191,7 +277,11 @@ export fn lut_forward_batch_with_offsets_no_cache(
         .inputs = inputs,
         .outputs = outputs,
     };
-    parallel.parallelFor(LutForwardF32Context, &ctx, batch_size, 64, lutForwardF32Range);
+    if (parallel.tropnn_get_num_threads() <= 1) {
+        parallel.parallelFor(LutForwardF32Context, &ctx, batch_size, 64, lutForwardF32TableMajorRange);
+    } else {
+        parallel.parallelFor(LutForwardF32Context, &ctx, batch_size, 64, lutForwardF32RowMajorRange);
+    }
 }
 
 /// Batch pairwise-LUT forward with f16 weights and f32 accumulation.
@@ -220,7 +310,11 @@ export fn lut_forward_batch_f16_no_cache(
         .inputs = inputs,
         .outputs = outputs,
     };
-    parallel.parallelFor(LutForwardF16Context, &ctx, batch_size, 64, lutForwardF16Range);
+    if (parallel.tropnn_get_num_threads() <= 1) {
+        parallel.parallelFor(LutForwardF16Context, &ctx, batch_size, 64, lutForwardF16TableMajorRange);
+    } else {
+        parallel.parallelFor(LutForwardF16Context, &ctx, batch_size, 64, lutForwardF16RowMajorRange);
+    }
 }
 
 test "comparison hash uses thresholds" {
