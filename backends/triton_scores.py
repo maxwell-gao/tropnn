@@ -354,9 +354,7 @@ def trop_scores_triton(z: Tensor, router_weight: Tensor, router_bias: Tensor) ->
     if router_weight.ndim != 3:
         raise ValueError(f"router_weight must have shape [heads, cells, rank], got {tuple(router_weight.shape)}")
     if router_bias.shape != router_weight.shape[:2]:
-        raise ValueError(
-            f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}"
-        )
+        raise ValueError(f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}")
 
     batch, steps, rank = z.shape
     flat_cols = router_bias.numel()
@@ -409,9 +407,7 @@ def trop_top2_stream_triton(z: Tensor, router_weight: Tensor, router_bias: Tenso
     if router_weight.ndim != 3:
         raise ValueError(f"router_weight must have shape [heads, cells, code_dim], got {tuple(router_weight.shape)}")
     if router_bias.shape != router_weight.shape[:2]:
-        raise ValueError(
-            f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}"
-        )
+        raise ValueError(f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}")
 
     batch, steps, code_dim = z.shape
     heads, cells, weight_dim = router_weight.shape
@@ -472,9 +468,7 @@ def trop_route_hidden_triton_eval(
     if router_weight.ndim != 3:
         raise ValueError(f"router_weight must have shape [heads, cells, code_dim], got {tuple(router_weight.shape)}")
     if router_bias.shape != router_weight.shape[:2]:
-        raise ValueError(
-            f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}"
-        )
+        raise ValueError(f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}")
     if code.shape != router_weight.shape:
         raise ValueError(f"code must match router_weight shape, got {tuple(code.shape)} and {tuple(router_weight.shape)}")
 
@@ -535,9 +529,7 @@ def trop_route_hidden_triton_train(
     if router_weight.ndim != 3:
         raise ValueError(f"router_weight must have shape [heads, cells, code_dim], got {tuple(router_weight.shape)}")
     if router_bias.shape != router_weight.shape[:2]:
-        raise ValueError(
-            f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}"
-        )
+        raise ValueError(f"router_bias must have shape [heads, cells] matching router_weight, got {tuple(router_bias.shape)}")
     if code.shape != router_weight.shape:
         raise ValueError(f"code must match router_weight shape, got {tuple(code.shape)} and {tuple(router_weight.shape)}")
 

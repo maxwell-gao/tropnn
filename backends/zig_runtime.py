@@ -83,8 +83,7 @@ def _build_library() -> Path:
         version = _zig_version(command)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(
-            "Zig is not available for tropnn backend='zig'. Install the cpu extra with "
-            "`uv sync --extra cpu`, or set TROPNN_ZIG to a Zig executable."
+            "Zig is not available for tropnn backend='zig'. Install the cpu extra with `uv sync --extra cpu`, or set TROPNN_ZIG to a Zig executable."
         ) from exc
 
     cache_dir = package_root() / ".zig-cache" / "cpu"
@@ -116,12 +115,7 @@ def _build_library() -> Path:
     env["ZIG_LOCAL_CACHE_DIR"] = str(zig_local_cache)
     result = subprocess.run(build_cmd, cwd=cache_dir, capture_output=True, text=True, env=env)
     if result.returncode != 0:
-        raise RuntimeError(
-            "Failed to build Zig CPU backend.\n"
-            f"Command: {' '.join(build_cmd)}\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
+        raise RuntimeError(f"Failed to build Zig CPU backend.\nCommand: {' '.join(build_cmd)}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
     tmp_path.replace(lib_path)
     return lib_path
 
