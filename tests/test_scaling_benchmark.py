@@ -59,7 +59,7 @@ def test_quick_scaling_benchmark_writes_outputs(tmp_path) -> None:
     assert len(json_files) == 1
 
     summary = json.loads(json_files[0].read_text())
-    assert len(summary["runs"]) == 12
+    assert len(summary["runs"]) == 14
     assert summary["exponents"]
     assert summary["group_metrics"]
     assert {"family", "model_dim", "final_loss", "overlap_times_dim"}.issubset(summary["runs"][0])

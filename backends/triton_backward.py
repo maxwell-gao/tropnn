@@ -252,11 +252,14 @@ if _HAS_TRITON:
         runner = tl.load(runner_ptr + offs_m * heads + head, mask=row_mask, other=0).to(tl.int32)
         margin = tl.load(margins_ptr + offs_m * heads + head, mask=row_mask, other=0.0)
         alpha = 0.5 / (1.0 + tl.abs(margin))
-        grad = tl.load(
-            grad_hidden_ptr + offs_m[:, None] * code_dim + offs_d[None, :],
-            mask=row_mask[:, None] & dim_mask[None, :],
-            other=0.0,
-        ) * code_scale
+        grad = (
+            tl.load(
+                grad_hidden_ptr + offs_m[:, None] * code_dim + offs_d[None, :],
+                mask=row_mask[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
+            * code_scale
+        )
 
         winner_offsets = (head * cells + winner[:, None]) * code_dim + offs_d[None, :]
         runner_offsets = (head * cells + runner[:, None]) * code_dim + offs_d[None, :]

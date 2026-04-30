@@ -1,11 +1,13 @@
 # tropnn
 
-`tropnn` is a minimal routed neural layer library with two public layers:
+`tropnn` is a minimal routed neural layer library with several public routed layers:
 
 - `TropLinear`: multi-head tropical routing with compact selected codes and a shared output projection.
 - `PairwiseLinear`: classic pairwise-comparator LUT baseline.
+- `TropFanLinear`: tropical normal-fan routing with geometry-generated values.
+- `TropDictLinear`: experimental shared-dictionary payload with sparse per-cell coefficients.
 
-Historical chamber-affine and payload-ablation implementations live in the experiment branch history. `main` keeps only the selected tropical form and the pairwise comparison path.
+Historical chamber-affine and payload-ablation implementations live in the experiment branch history. `main` keeps the selected tropical form, pairwise comparison path, fan-style controls, and the current dictionary-payload experiment.
 
 ## Core Idea
 
@@ -38,6 +40,7 @@ Inference remains fully hard.
 - `layers/tropical.py`: `TropLinear`
 - `layers/pairwise.py`: `PairwiseLinear`
 - `layers/fan.py`: `TropFanLinear`
+- `layers/dictlinear.py`: `TropDictLinear`
 - `layers/base.py`: shared routed-layer shell
 - `backend.py` and `backends/triton_scores.py`: tropical score backend dispatch
 - `backends/tilelang_route.py`: optional fused TileLang tropical route/code backend
@@ -78,7 +81,64 @@ print(pairwise_zig(x.cpu()).shape)
 
 fan_zig = TropFanLinear(256, 512, heads=32, cells=4, code_dim=32, backend="zig", fan_value_mode="basis", cpu_param_dtype="f16").eval()
 print(fan_zig(x.cpu()).shape)
+
+from tropnn import TropDictLinear
+
+dict_layer = TropDictLinear(
+    256,
+    512,
+    heads=32,
+    cells=4,
+    route_source="sketch",
+    dict_size=1024,
+    dict_sparsity=4,
+    use_route_residual=True,
+)
+print(dict_layer(x).shape)
 ```
+
+## Dictionary Payload Experiment
+
+`TropDictLinear` implements the "shared ETF dictionary + sparse cell coefficients" idea for a zero-dense or near-zero-dense payload:
+
+```text
+z           = route_project(x)
+score[h,k] = route_score(z, h, k)
+winner_h    = argmax_k score[h,k]
+code[h,k]  = sum_l coeff[h,k,l] * basis[support[h,k,l]]
+y           = bias + code_scale * sum_h code[h,winner_h]
+```
+
+It supports two route front-ends:
+
+- `route_source="anchors"`: sparse coordinate routing, closest to the original zero-dense read story.
+- `route_source="sketch"`: fixed CountSketch input projection followed by full site scoring, which gives stronger feature discrimination without introducing a learned dense input matmul.
+
+The layer exposes `dictionary_loss()` as an ETF-style mean off-diagonal squared-overlap penalty on the shared basis. The scaling benchmark includes `tropical_dict` and `tied_tropical_dict` families, plus `--dict-route-source`, `--dict-sparsity`, `--dict-ortho-weight`, and `--dict-route-residual`.
+
+### Result So Far
+
+The implementation works mechanically and is covered by tests, but the research hypothesis did not reach the target scaling exponent. On the `n_features=256`, `alpha=1.0`, `model_dim=8..128`, `steps=3000`, `seeds=0,1,2` recovery benchmark:
+
+```text
+paper                         beta ~= 1.66
+tied_tropical_lowrank          beta ~= 1.93
+tied_tropical_zero_dense       beta ~= 0.18
+tied_tropical_dict anchors     beta ~= 0.24
+tied_tropical_dict sketch      beta ~= 0.51
+tied_tropical_dict sketch+res  beta ~= 0.52
+```
+
+The failure mode is informative. Sketch routing plus dictionary codes brings `overlap * model_dim` close to paper scale (`~1.0-1.5`), so the frame geometry is not the main issue. The missing piece is recovery strength: sparse dictionary combinations do not reproduce the learned feature-specific low-rank basis that `tied_tropical_lowrank` gets from its dense projection. In short, ETF dictionary regularization fixes "features should not overlap too much", but it does not by itself learn "features should reconstruct with the right self-gain and frequency-weighted recovery".
+
+Current conclusion:
+
+```text
+Shared ETF dictionary + sparse coefficients is a useful control,
+but it is not enough to replace the learned dense low-rank body.
+```
+
+Future variants should target stronger feature-specific recovery rather than stronger dictionary orthogonality alone: learned sparse support, top-k sparse decoder rows, shared low-rank dictionary plus selected residuals, or another generated payload that preserves low-rank/tied recovery geometry without reintroducing a full dense matmul.
 
 ## EMNIST Example
 

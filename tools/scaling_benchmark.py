@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ..backend import Backend, trop_scores
-from ..layers import TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
+from ..layers import TropDictLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
 from ..layers.tropical import _minface_mix, _top2_indices
 
 FAMILIES = (
@@ -29,13 +29,22 @@ FAMILIES = (
     "tied_tropical_zero_dense",
     "tropfan_zero_dense",
     "tied_tropfan_zero_dense",
+    "tropical_dict",
+    "tied_tropical_dict",
 )
 CODE_SCALE_MODES = ("sqrt", "linear", "none")
 LOWRANK_FAMILIES = ("tropical_lowrank", "tied_tropical_lowrank")
 COORD_ZERO_DENSE_FAMILIES = ("tropical_zero_dense", "tied_tropical_zero_dense")
 FAN_ZERO_DENSE_FAMILIES = ("tropfan_zero_dense", "tied_tropfan_zero_dense")
-ZERO_DENSE_FAMILIES = COORD_ZERO_DENSE_FAMILIES + FAN_ZERO_DENSE_FAMILIES
+DICT_FAMILIES = ("tropical_dict", "tied_tropical_dict")
+ZERO_DENSE_FAMILIES = COORD_ZERO_DENSE_FAMILIES + FAN_ZERO_DENSE_FAMILIES + DICT_FAMILIES
 ROUTED_FAMILIES = LOWRANK_FAMILIES + ZERO_DENSE_FAMILIES
+TIED_RECOVERY_FAMILIES = (
+    "tied_tropical_lowrank",
+    "tied_tropical_zero_dense",
+    "tied_tropfan_zero_dense",
+    "tied_tropical_dict",
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +69,13 @@ class RunConfig:
     output_lr_mult: float = 1.0
     fan_value_mode: str = "site"
     fan_basis_rank: int = 16
+    dict_size: int = 0
+    dict_sparsity: int = 4
+    dict_init: str = "orthogonal"
+    dict_ortho_weight: float = 0.0
+    dict_route_source: str = "anchors"
+    dict_route_dim: int = 0
+    dict_route_residual: bool = False
 
 
 class PaperFeatureRecovery(nn.Module):
@@ -216,6 +232,86 @@ class TiedZeroDenseRecovery(nn.Module):
     @code_scale.setter
     def code_scale(self, value: float) -> None:
         self.router.code_scale = value
+
+    def effective_representations(self) -> tuple[Tensor, Tensor, Tensor]:
+        device = self.bias.device
+        eye = torch.eye(self.n_features, device=device)
+        reps = self.router(eye).squeeze(1).float()
+        empty_scores = torch.empty(self.n_features, self.router.heads, 0, device=device, dtype=reps.dtype)
+        return reps, reps.view(self.n_features, 1, self.model_dim), empty_scores
+
+    def encode(self, x: Tensor) -> Tensor:
+        reps, _, _ = self.effective_representations()
+        return x.to(reps.dtype) @ reps
+
+    def forward(self, x: Tensor) -> Tensor:
+        squeeze_seq = x.ndim == 3 and x.shape[1] == 1
+        if squeeze_seq:
+            x = x.squeeze(1)
+        reps, _, _ = self.effective_representations()
+        hidden = x.to(reps.dtype) @ reps
+        output = F.relu(hidden @ reps.t() + self.bias.to(dtype=reps.dtype, device=reps.device))
+        return output.unsqueeze(1) if squeeze_seq else output
+
+
+class TiedDictRecovery(nn.Module):
+    """Paper-style tied recovery whose feature vectors come from dictionary-coded routing."""
+
+    def __init__(
+        self,
+        n_features: int,
+        model_dim: int,
+        *,
+        heads: int,
+        cells: int,
+        route_terms: int,
+        dict_size: int,
+        dict_sparsity: int,
+        dict_init: str,
+        route_source: str,
+        route_dim: int,
+        use_route_residual: bool,
+        seed: int,
+    ) -> None:
+        super().__init__()
+        self.n_features = n_features
+        self.model_dim = model_dim
+        resolved_dict_size = dict_size if dict_size > 0 else max(model_dim, 2 * model_dim)
+        resolved_route_dim = route_dim if route_dim > 0 else None
+        self.router = TropDictLinear(
+            n_features,
+            model_dim,
+            heads=heads,
+            cells=cells,
+            route_source=route_source,  # type: ignore[arg-type]
+            route_terms=route_terms,
+            route_dim=resolved_route_dim,
+            dict_size=resolved_dict_size,
+            dict_sparsity=dict_sparsity,
+            dict_init=dict_init,  # type: ignore[arg-type]
+            use_route_residual=use_route_residual,
+            seed=seed,
+        )
+        self.bias = nn.Parameter(torch.zeros(n_features))
+
+    @property
+    def _last_indices(self) -> Tensor | None:
+        return self.router._last_indices
+
+    @property
+    def _last_margins(self) -> Tensor | None:
+        return self.router._last_margins
+
+    @property
+    def code_scale(self) -> float:
+        return self.router.code_scale
+
+    @code_scale.setter
+    def code_scale(self, value: float) -> None:
+        self.router.code_scale = value
+
+    def dictionary_loss(self, *, weight: float = 1.0) -> Tensor:
+        return self.router.dictionary_loss(weight=weight)
 
     def effective_representations(self) -> tuple[Tensor, Tensor, Tensor]:
         device = self.bias.device
@@ -413,6 +509,42 @@ def _build_model(config: RunConfig, device: torch.device) -> nn.Module:
         )
         model.code_scale = _code_scale(config.heads, config.code_scale_mode)
         return model.to(device)
+    if config.family == "tropical_dict":
+        resolved_dict_size = config.dict_size if config.dict_size > 0 else max(config.n_features, 2 * config.n_features)
+        resolved_route_dim = config.dict_route_dim if config.dict_route_dim > 0 else None
+        layer = TropDictLinear(
+            config.n_features,
+            config.n_features,
+            heads=config.heads,
+            cells=config.cells,
+            route_source=config.dict_route_source,  # type: ignore[arg-type]
+            route_terms=config.route_terms,
+            route_dim=resolved_route_dim,
+            dict_size=resolved_dict_size,
+            dict_sparsity=config.dict_sparsity,
+            dict_init=config.dict_init,  # type: ignore[arg-type]
+            use_route_residual=config.dict_route_residual,
+            seed=config.seed,
+        )
+        layer.code_scale = _code_scale(config.heads, config.code_scale_mode)
+        return layer.to(device)
+    if config.family == "tied_tropical_dict":
+        model = TiedDictRecovery(
+            config.n_features,
+            config.model_dim,
+            heads=config.heads,
+            cells=config.cells,
+            route_terms=config.route_terms,
+            dict_size=config.dict_size,
+            dict_sparsity=config.dict_sparsity,
+            dict_init=config.dict_init,
+            route_source=config.dict_route_source,
+            route_dim=config.dict_route_dim,
+            use_route_residual=config.dict_route_residual,
+            seed=config.seed,
+        )
+        model.code_scale = _code_scale(config.heads, config.code_scale_mode)
+        return model.to(device)
     raise ValueError(f"unknown family {config.family!r}")
 
 
@@ -450,6 +582,10 @@ def _build_optimizer(config: RunConfig, model: nn.Module, lr: float) -> torch.op
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
 
 
+def _dictionary_modules(model: nn.Module) -> list[TropDictLinear]:
+    return [module for module in model.modules() if isinstance(module, TropDictLinear)]
+
+
 def _train_one(config: RunConfig) -> tuple[nn.Module, dict[str, float | int]]:
     device = torch.device(config.device)
     torch.manual_seed(config.seed)
@@ -458,6 +594,8 @@ def _train_one(config: RunConfig) -> tuple[nn.Module, dict[str, float | int]]:
     lr = config.paper_lr if config.family in {"paper", "untied_paper"} else config.lr
     optimizer = _build_optimizer(config, model, lr)
     task_losses: list[float] = []
+    ortho_losses: list[float] = []
+    dict_modules = _dictionary_modules(model) if config.dict_ortho_weight > 0.0 else []
 
     t0 = time.perf_counter()
     model.train()
@@ -465,19 +603,31 @@ def _train_one(config: RunConfig) -> tuple[nn.Module, dict[str, float | int]]:
         x = sample_batch(probs, config.batch_size)
         optimizer.zero_grad(set_to_none=True)
         y = _squeeze_single_sequence(model(x))
-        loss = F.mse_loss(y, x)
+        task_loss = F.mse_loss(y, x)
+        if dict_modules:
+            ortho = sum(
+                (module.dictionary_loss(weight=config.dict_ortho_weight) for module in dict_modules),
+                start=torch.zeros((), device=device, dtype=task_loss.dtype),
+            )
+            loss = task_loss + ortho
+            ortho_losses.append(float(ortho.detach().item()))
+        else:
+            loss = task_loss
         loss.backward()
         _paper_weight_growth_step(model, lr=lr, weight_decay=config.weight_decay)
         optimizer.step()
-        task_losses.append(float(loss.detach().item()))
+        task_losses.append(float(task_loss.detach().item()))
     if device.type == "cuda":
         torch.cuda.synchronize(device=device)
-    return model, {
+    metrics: dict[str, float | int] = {
         "final_loss": task_losses[-1],
         "best_loss": min(task_losses),
         "train_ms": (time.perf_counter() - t0) * 1000.0,
         "params": int(sum(param.numel() for param in model.parameters())),
     }
+    if ortho_losses:
+        metrics["final_dict_ortho_loss"] = ortho_losses[-1]
+    return model, metrics
 
 
 def _lowrank_effective_representations(model: TropLinear, n_features: int, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
@@ -520,6 +670,11 @@ def _effective_representations(model: nn.Module, family: str, n_features: int, d
         return _squeeze_single_sequence(model(torch.eye(n_features, device=device))).float()
     if family == "tied_tropfan_zero_dense":
         assert isinstance(model, TiedFanZeroDenseRecovery)
+        return model.effective_representations()[0]
+    if family == "tropical_dict":
+        return _squeeze_single_sequence(model(torch.eye(n_features, device=device))).float()
+    if family == "tied_tropical_dict":
+        assert isinstance(model, TiedDictRecovery)
         return model.effective_representations()[0]
     raise ValueError(f"unknown family {family!r}")
 
@@ -600,8 +755,11 @@ def _route_metrics(model: nn.Module, family: str, n_features: int, device: torch
     if family not in ROUTED_FAMILIES:
         return {"route_unique": float("nan"), "route_collision_mean": float("nan"), "route_entropy": float("nan"), "avg_margin": float("nan")}
     model.eval()
-    if family in {"tied_tropical_lowrank", "tied_tropical_zero_dense", "tied_tropfan_zero_dense"}:
-        assert isinstance(model, (TiedTropicalLowRankRecovery, TiedZeroDenseRecovery, TiedFanZeroDenseRecovery))
+    if family in TIED_RECOVERY_FAMILIES:
+        assert isinstance(
+            model,
+            (TiedTropicalLowRankRecovery, TiedZeroDenseRecovery, TiedFanZeroDenseRecovery, TiedDictRecovery),
+        )
         model.effective_representations()  # type: ignore[union-attr]
     else:
         model(torch.eye(n_features, device=device))
@@ -645,10 +803,13 @@ def run_config(config: RunConfig) -> dict[str, float | int | str]:
     return row
 
 
-def _summary_key(row: dict[str, float | int | str]) -> tuple[str, float, int, int, int, str, float, str, int]:
+def _summary_key(
+    row: dict[str, float | int | str],
+) -> tuple[str, float, int, int, int, str, float, str, int, int, int, str, str, int, int]:
     family = str(row["family"])
     heads = int(row["heads"])
-    if family in COORD_ZERO_DENSE_FAMILIES and heads == int(row["model_dim"]):
+    sparse_route_families = COORD_ZERO_DENSE_FAMILIES + DICT_FAMILIES
+    if family in sparse_route_families and heads == int(row["model_dim"]):
         heads = -1
     return (
         family,
@@ -660,6 +821,12 @@ def _summary_key(row: dict[str, float | int | str]) -> tuple[str, float, int, in
         float(row["output_lr_mult"]),
         str(row["fan_value_mode"]),
         int(row["fan_basis_rank"]),
+        int(row.get("dict_size", 0)),
+        int(row.get("dict_sparsity", 0)),
+        str(row.get("dict_init", "-")),
+        str(row.get("dict_route_source", "-")),
+        int(row.get("dict_route_dim", 0)),
+        int(bool(row.get("dict_route_residual", False))),
     )
 
 
@@ -679,6 +846,12 @@ def _fit_exponents(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
             output_lr_mult,
             fan_value_mode,
             fan_basis_rank,
+            dict_size,
+            dict_sparsity,
+            dict_init,
+            dict_route_source,
+            dict_route_dim,
+            dict_route_residual,
         ) = key
         xs = torch.tensor([float(row["model_dim"]) for row in group])
         ys = torch.tensor([float(row["final_loss"]) for row in group])
@@ -707,6 +880,12 @@ def _fit_exponents(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
                 "output_lr_mult": float(output_lr_mult),
                 "fan_value_mode": fan_value_mode,
                 "fan_basis_rank": float(fan_basis_rank),
+                "dict_size": float(dict_size),
+                "dict_sparsity": float(dict_sparsity),
+                "dict_init": dict_init,
+                "dict_route_source": dict_route_source,
+                "dict_route_dim": float(dict_route_dim),
+                "dict_route_residual": bool(dict_route_residual),
                 "beta": beta,
                 "r2": r2,
                 "points": float(len(group)),
@@ -737,6 +916,12 @@ def _group_metrics(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
             output_lr_mult,
             fan_value_mode,
             fan_basis_rank,
+            dict_size,
+            dict_sparsity,
+            dict_init,
+            dict_route_source,
+            dict_route_dim,
+            dict_route_residual,
         ) = key
         summaries.append(
             {
@@ -749,6 +934,12 @@ def _group_metrics(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
                 "output_lr_mult": float(output_lr_mult),
                 "fan_value_mode": fan_value_mode,
                 "fan_basis_rank": float(fan_basis_rank),
+                "dict_size": float(dict_size),
+                "dict_sparsity": float(dict_sparsity),
+                "dict_init": dict_init,
+                "dict_route_source": dict_route_source,
+                "dict_route_dim": float(dict_route_dim),
+                "dict_route_residual": bool(dict_route_residual),
                 "mean_loss_per_activation": _mean_finite(group, "loss_per_activation"),
                 "mean_overlap_times_dim": _mean_finite(group, "overlap_times_dim"),
                 "mean_frequency_weighted_overlap_times_dim": _mean_finite(group, "frequency_weighted_overlap_times_dim"),
@@ -774,17 +965,18 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
     alphas = _parse_csv_numbers(args.alphas, float)
     seeds = _parse_csv_numbers(args.seeds, int)
     route_terms_values = _parse_csv_numbers(args.route_terms_list, int) if args.route_terms_list else [args.route_terms]
+    sparse_route_families = COORD_ZERO_DENSE_FAMILIES + DICT_FAMILIES
     configs: list[RunConfig] = []
     for family in families:
         if family not in FAMILIES:
             raise ValueError(f"unknown family {family!r}; expected one of {FAMILIES}")
         for alpha in alphas:
             for model_dim in model_dims:
-                if family in COORD_ZERO_DENSE_FAMILIES and args.zero_dense_heads_mode == "model_dim":
+                if family in sparse_route_families and args.zero_dense_heads_mode == "model_dim":
                     heads_values = [model_dim]
                 else:
                     heads_values = [args.heads]
-                family_route_terms = route_terms_values if family in COORD_ZERO_DENSE_FAMILIES else [args.route_terms]
+                family_route_terms = route_terms_values if family in sparse_route_families else [args.route_terms]
                 for heads in heads_values:
                     for route_terms in family_route_terms:
                         for seed in seeds:
@@ -810,6 +1002,13 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
                                     output_lr_mult=args.output_lr_mult if family == "tropical_lowrank" else 1.0,
                                     fan_value_mode=args.fan_value_mode if family in FAN_ZERO_DENSE_FAMILIES else "-",
                                     fan_basis_rank=args.fan_basis_rank if family in FAN_ZERO_DENSE_FAMILIES else 0,
+                                    dict_size=args.dict_size if family in DICT_FAMILIES else 0,
+                                    dict_sparsity=args.dict_sparsity if family in DICT_FAMILIES else 4,
+                                    dict_init=args.dict_init if family in DICT_FAMILIES else "-",
+                                    dict_ortho_weight=args.dict_ortho_weight if family in DICT_FAMILIES else 0.0,
+                                    dict_route_source=args.dict_route_source if family in DICT_FAMILIES else "-",
+                                    dict_route_dim=args.dict_route_dim if family in DICT_FAMILIES else 0,
+                                    dict_route_residual=args.dict_route_residual if family in DICT_FAMILIES else False,
                                 )
                             )
     return configs
@@ -817,11 +1016,18 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
 
 def _write_csv(rows: list[dict[str, float | int | str]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = list(rows[0].keys())
+    seen: set[str] = set()
+    fields: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                fields.append(key)
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
 
 
 def main(argv: Iterable[str] | None = None) -> None:
@@ -845,6 +1051,13 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--zero-dense-heads-mode", choices=("model_dim", "fixed"), default="model_dim")
     parser.add_argument("--fan-value-mode", choices=("site", "basis"), default="site")
     parser.add_argument("--fan-basis-rank", type=int, default=16)
+    parser.add_argument("--dict-size", type=int, default=0)
+    parser.add_argument("--dict-sparsity", type=int, default=4)
+    parser.add_argument("--dict-init", choices=("orthogonal", "gaussian"), default="orthogonal")
+    parser.add_argument("--dict-ortho-weight", type=float, default=0.0)
+    parser.add_argument("--dict-route-source", choices=("anchors", "sketch"), default="anchors")
+    parser.add_argument("--dict-route-dim", type=int, default=0)
+    parser.add_argument("--dict-route-residual", action="store_true")
     parser.add_argument("--seeds", type=str, default="0")
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
@@ -862,12 +1075,16 @@ def main(argv: Iterable[str] | None = None) -> None:
         args.model_dims = "4,8"
         args.alphas = "0.0"
         if not option_was_set("--families"):
-            args.families = "paper,untied_paper,linear,tied_tropical_lowrank,tied_tropical_zero_dense,tied_tropfan_zero_dense"
+            args.families = "paper,untied_paper,linear,tied_tropical_lowrank,tied_tropical_zero_dense,tied_tropfan_zero_dense,tied_tropical_dict"
         args.batch_size = 16
         args.steps = 3
         args.heads = 8
         args.route_terms_list = "2"
         args.fan_value_mode = "site"
+        if not option_was_set("--dict-size"):
+            args.dict_size = 16
+        if not option_was_set("--dict-sparsity"):
+            args.dict_sparsity = 2
         args.seeds = "0"
         args.device = "cpu"
         args.backend = "torch"

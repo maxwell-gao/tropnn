@@ -185,10 +185,7 @@ def main() -> None:
         for family in families
     ]
 
-    print(
-        "family   backend  mode    kernels read_mib  write_mib total_mib "
-        "time_us   bw_gb_s  dram_pct_w dram_pct_max"
-    )
+    print("family   backend  mode    kernels read_mib  write_mib total_mib time_us   bw_gb_s  dram_pct_w dram_pct_max")
     for case in cases:
         _print_row(case, _run_case(args, case))
 
