@@ -1,11 +1,14 @@
 # tropnn
 
-`tropnn` is a minimal routed neural layer library with two public layers:
+`tropnn` is a minimal routed neural layer library with stable core layers and explicit experimental variants.
 
 - `TropLinear`: multi-head tropical routing with compact selected codes and a shared output projection.
 - `PairwiseLinear`: classic pairwise-comparator LUT baseline.
 
-Historical chamber-affine and payload-ablation implementations live in the experiment branch history. `main` keeps only the selected tropical form and the pairwise comparison path.
+Research variants remain importable from the top level for compatibility, and are also grouped under `tropnn.experimental`:
+
+- `TropFanLinear`: normal-fan routing with geometry-generated values.
+- `TropZeroDenseLinear` and `TropFanZeroDenseLinear`: zero-dense controls for scaling and ablation experiments.
 
 ## Core Idea
 
@@ -35,10 +38,13 @@ Inference remains fully hard.
 
 ## Package Layout
 
-- `layers/tropical.py`: `TropLinear`
+- `layers/tropical.py`: readable `TropLinear` structure and standard route/output logic
+- `layers/tropical_exact.py`: exact fused `TropLinear` train/eval path
+- `layers/routing.py`: shared top-2 routing, min-face mixing, route packing, and margin helpers
 - `layers/pairwise.py`: `PairwiseLinear`
-- `layers/fan.py`: `TropFanLinear`
+- `layers/fan.py`: experimental normal-fan and zero-dense variants
 - `layers/base.py`: shared routed-layer shell
+- `experimental/`: explicit imports for fan and zero-dense research variants
 - `backend.py` and `backends/triton_scores.py`: tropical score backend dispatch
 - `backends/tilelang_route.py`: optional fused TileLang tropical route/code backend
 - `backends/tropical_zig.py`: optional Zig CPU tropical route/code inference backend
@@ -46,15 +52,16 @@ Inference remains fully hard.
 - `backends/pairwise_tilelang.py`: optional fused TileLang pairwise route/LUT backend
 - `backends/pairwise_zig.py`: optional Zig CPU pairwise inference backend
 - `examples/emnist.py`: EMNIST training example for `tropical` and `pairwise`
-- `tools/benchmark.py`: backend benchmark for `TropLinear`, `PairwiseLinear`, and `TropFanLinear`
-- `tools/profile.py`: forward profiler for `tropical` and `pairwise`
+- `tools/benchmarking/`: benchmark, profiler, bridge-scaling, and scaling experiment implementations
+- `tools/benchmark.py`, `tools/profile.py`, `tools/scaling_benchmark.py`: compatibility CLI entry modules
 - `tools/ncu_memory_case.py` and `tools/ncu_memory_sweep.py`: Nsight Compute DRAM profiling helpers
 
 ## Quick Start
 
 ```python
 import torch
-from tropnn import PairwiseLinear, TropFanLinear, TropLinear
+from tropnn import PairwiseLinear, TropLinear
+from tropnn.experimental import TropFanLinear
 
 x = torch.randn(8, 256)
 
@@ -143,7 +150,7 @@ uv run python -m tropnn.tools.benchmark \
 
 ## Bridge Scaling: One Capacity Unit Across Kingdoms
 
-`tools/bridge_scaling.py` is an architecture-agnostic scaling diagnostic. It addresses a structural limitation of `SuperpositionScaling`-style `log L vs log m` fits: model dim `m` is not a comparable capacity unit across architectures. A dense linear-algebra layer with width `m` and a routed comparator-LUT layer with the same `m` can have wildly different *effective* representation capacities, so their `\beta` values are not on the same axis.
+`tools/benchmarking/bridge_scaling.py` is an architecture-agnostic scaling diagnostic, with `tools/bridge_scaling.py` kept as a compatibility import. It addresses a structural limitation of `SuperpositionScaling`-style `log L vs log m` fits: model dim `m` is not a comparable capacity unit across architectures. A dense linear-algebra layer with width `m` and a routed comparator-LUT layer with the same `m` can have wildly different *effective* representation capacities, so their `\beta` values are not on the same axis.
 
 The bridge tool replaces `m` with an effective capacity `K_eff` computed from whichever representation views the model exposes:
 

@@ -42,7 +42,6 @@ tropnn-emnist = "tropnn.examples.emnist:main"
 tropnn-benchmark = "tropnn.tools.benchmark:main"
 tropnn-profile = "tropnn.tools.profile:main"
 tropnn-scaling-benchmark = "tropnn.tools.scaling_benchmark:main"
-tropnn-launch-lowrank-zero-dense = "tropnn.tools.launch_lowrank_zero_dense_sweep:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

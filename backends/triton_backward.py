@@ -5,6 +5,8 @@ from typing import Final
 import torch
 from torch import Tensor
 
+from ._utils import next_power_of_2 as _next_power_of_2
+
 try:
     import triton
     import triton.language as tl
@@ -18,12 +20,6 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 
 def has_triton_backward() -> bool:
     return _HAS_TRITON
-
-
-def _next_power_of_2(value: int) -> int:
-    if value < 1:
-        return 1
-    return 1 << (value - 1).bit_length()
 
 
 if _HAS_TRITON:

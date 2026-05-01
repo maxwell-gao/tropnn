@@ -4,17 +4,8 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from ._utils import select_block_size as _select_block_size
 from .tilelang_route import has_tilelang
-
-
-def _next_power_of_2(value: int) -> int:
-    if value < 1:
-        return 1
-    return 1 << (value - 1).bit_length()
-
-
-def _select_block_size(value: int, *, min_block: int = 32, max_block: int = 256) -> int:
-    return max(min_block, min(max_block, _next_power_of_2(value)))
 
 
 def _require_float32(*tensors: Tensor) -> None:

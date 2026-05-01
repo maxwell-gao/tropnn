@@ -4,10 +4,16 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from ._utils import (
+    can_materialize_scores as _can_materialize_scores,
+)
+from ._utils import (
+    float32_tilelang_dtype_name as _dtype_name,
+)
+from ._utils import (
+    select_block_size as _select_block_size,
+)
 from .tilelang_route import (
-    _can_materialize_scores,
-    _dtype_name,
-    _select_block_size,
     _trop_route_kernel,
     _trop_route_parallel_kernel,
     _trop_top2_scores_kernel,

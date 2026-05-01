@@ -5,6 +5,8 @@ from typing import Final
 import torch
 from torch import Tensor
 
+from ._utils import next_power_of_2 as _next_power_of_2
+
 try:
     import triton
     import triton.language as tl
@@ -389,12 +391,6 @@ def trop_scores_triton(z: Tensor, router_weight: Tensor, router_bias: Tensor) ->
 
 def _requires_grad_path(*tensors: Tensor) -> bool:
     return torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors)
-
-
-def _next_power_of_2(value: int) -> int:
-    if value < 1:
-        return 1
-    return 1 << (value - 1).bit_length()
 
 
 def trop_top2_stream_triton(z: Tensor, router_weight: Tensor, router_bias: Tensor) -> tuple[Tensor, Tensor, Tensor]:

@@ -10,7 +10,7 @@ from torch import Tensor
 
 from ..backend import Backend, trop_scores
 from .base import RoutedLinearBase
-from .tropical import _minface_mix, _top2_indices
+from .routing import _minface_mix, _top2_indices
 
 FanValueMode = Literal["site", "basis"]
 FanRecoveryMode = Literal["untied", "tied"]
