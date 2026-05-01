@@ -3,7 +3,23 @@ from __future__ import annotations
 import json
 
 import torch
-from tropnn.tools.scaling_benchmark import FAMILIES, RunConfig, feature_probabilities, main, run_config
+from tropnn.tools.scaling_benchmark import (
+    FAMILIES,
+    RunConfig,
+    _apply_quick_defaults,
+    _build_parser,
+    _configs_from_args,
+    feature_probabilities,
+    main,
+    run_config,
+)
+
+
+def _parse_benchmark_args(argv: list[str]):
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    _apply_quick_defaults(args, argv)
+    return args
 
 
 def test_feature_probabilities_match_activation_density() -> None:
@@ -48,6 +64,51 @@ def test_all_scaling_families_run_one_train_step() -> None:
         assert "self_gain_weighted_mse" in row
         assert "offdiag_weighted_energy" in row
         assert "route_entropy_norm" in row
+        assert "loss_per_activation" in row
+        assert "bridge_K_vec_a4" in row
+
+
+def test_config_expansion_normalizes_family_specific_options() -> None:
+    args = _parse_benchmark_args(
+        [
+            "--families",
+            "tied_tropical_zero_dense,tied_tropfan_zero_dense,tied_pairwise",
+            "--model-dims",
+            "4,8",
+            "--alphas",
+            "0.0",
+            "--heads",
+            "5",
+            "--route-terms-list",
+            "2,3",
+            "--fan-value-mode",
+            "basis",
+            "--fan-basis-rank",
+            "7",
+            "--tables",
+            "11",
+            "--comparisons",
+            "3",
+        ]
+    )
+
+    configs = _configs_from_args(args)
+    zero_dense = [config for config in configs if config.family == "tied_tropical_zero_dense"]
+    fan = [config for config in configs if config.family == "tied_tropfan_zero_dense"]
+    pairwise = [config for config in configs if config.family == "tied_pairwise"]
+
+    assert len(zero_dense) == 4
+    assert {(config.model_dim, config.heads, config.route_terms) for config in zero_dense} == {
+        (4, 4, 2),
+        (4, 4, 3),
+        (8, 8, 2),
+        (8, 8, 3),
+    }
+    assert {(config.model_dim, config.heads, config.fan_value_mode, config.fan_basis_rank) for config in fan} == {
+        (4, 5, "basis", 7),
+        (8, 5, "basis", 7),
+    }
+    assert {(config.model_dim, config.tables, config.comparisons) for config in pairwise} == {(4, 11, 3), (8, 11, 3)}
 
 
 def test_quick_scaling_benchmark_writes_outputs(tmp_path) -> None:
