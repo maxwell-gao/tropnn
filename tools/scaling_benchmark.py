@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ..backend import Backend, trop_scores
-from ..layers import TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
+from ..layers import PairwiseLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
 from ..layers.tropical import _minface_mix, _top2_indices
 
 FAMILIES = (
@@ -29,13 +29,22 @@ FAMILIES = (
     "tied_tropical_zero_dense",
     "tropfan_zero_dense",
     "tied_tropfan_zero_dense",
+    "pairwise",
+    "tied_pairwise",
 )
 CODE_SCALE_MODES = ("sqrt", "linear", "none")
 LOWRANK_FAMILIES = ("tropical_lowrank", "tied_tropical_lowrank")
 COORD_ZERO_DENSE_FAMILIES = ("tropical_zero_dense", "tied_tropical_zero_dense")
 FAN_ZERO_DENSE_FAMILIES = ("tropfan_zero_dense", "tied_tropfan_zero_dense")
+PAIRWISE_FAMILIES = ("pairwise", "tied_pairwise")
 ZERO_DENSE_FAMILIES = COORD_ZERO_DENSE_FAMILIES + FAN_ZERO_DENSE_FAMILIES
-ROUTED_FAMILIES = LOWRANK_FAMILIES + ZERO_DENSE_FAMILIES
+ROUTED_FAMILIES = LOWRANK_FAMILIES + ZERO_DENSE_FAMILIES + PAIRWISE_FAMILIES
+TIED_RECOVERY_FAMILIES = (
+    "tied_tropical_lowrank",
+    "tied_tropical_zero_dense",
+    "tied_tropfan_zero_dense",
+    "tied_pairwise",
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +69,8 @@ class RunConfig:
     output_lr_mult: float = 1.0
     fan_value_mode: str = "site"
     fan_basis_rank: int = 16
+    tables: int = 0
+    comparisons: int = 0
 
 
 class PaperFeatureRecovery(nn.Module):
@@ -304,6 +315,59 @@ class TiedFanZeroDenseRecovery(nn.Module):
         return output.unsqueeze(1) if squeeze_seq else output
 
 
+class TiedPairwiseRecovery(nn.Module):
+    """Paper-style tied recovery whose feature vectors come from a pairwise comparator LUT."""
+
+    def __init__(
+        self,
+        n_features: int,
+        model_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        seed: int,
+    ) -> None:
+        super().__init__()
+        self.n_features = n_features
+        self.model_dim = model_dim
+        self.router = PairwiseLinear(
+            n_features,
+            model_dim,
+            tables=tables,
+            comparisons=comparisons,
+            seed=seed,
+        )
+        self.bias = nn.Parameter(torch.zeros(n_features))
+
+    @property
+    def _last_indices(self) -> Tensor | None:
+        return self.router._last_indices
+
+    @property
+    def _last_margins(self) -> Tensor | None:
+        return self.router._last_margins
+
+    def effective_representations(self) -> tuple[Tensor, Tensor, Tensor]:
+        device = self.bias.device
+        eye = torch.eye(self.n_features, device=device)
+        reps = self.router(eye).squeeze(1).float()
+        empty_scores = torch.empty(self.n_features, 0, 0, device=device, dtype=reps.dtype)
+        return reps, reps.view(self.n_features, 1, self.model_dim), empty_scores
+
+    def encode(self, x: Tensor) -> Tensor:
+        reps, _, _ = self.effective_representations()
+        return x.to(reps.dtype) @ reps
+
+    def forward(self, x: Tensor) -> Tensor:
+        squeeze_seq = x.ndim == 3 and x.shape[1] == 1
+        if squeeze_seq:
+            x = x.squeeze(1)
+        reps, _, _ = self.effective_representations()
+        hidden = x.to(reps.dtype) @ reps
+        output = F.relu(hidden @ reps.t() + self.bias.to(dtype=reps.dtype, device=reps.device))
+        return output.unsqueeze(1) if squeeze_seq else output
+
+
 def feature_probabilities(n_features: int, alpha: float, activation_density: float, *, device: torch.device) -> Tensor:
     if n_features < 1:
         raise ValueError(f"n_features must be >= 1, got {n_features}")
@@ -413,6 +477,28 @@ def _build_model(config: RunConfig, device: torch.device) -> nn.Module:
         )
         model.code_scale = _code_scale(config.heads, config.code_scale_mode)
         return model.to(device)
+    if config.family == "pairwise":
+        tables = config.tables if config.tables > 0 else max(4, config.heads)
+        comparisons = config.comparisons if config.comparisons > 0 else 4
+        layer = PairwiseLinear(
+            config.n_features,
+            config.n_features,
+            tables=tables,
+            comparisons=comparisons,
+            seed=config.seed,
+        )
+        return layer.to(device)
+    if config.family == "tied_pairwise":
+        tables = config.tables if config.tables > 0 else max(4, config.heads)
+        comparisons = config.comparisons if config.comparisons > 0 else 4
+        model = TiedPairwiseRecovery(
+            config.n_features,
+            config.model_dim,
+            tables=tables,
+            comparisons=comparisons,
+            seed=config.seed,
+        )
+        return model.to(device)
     raise ValueError(f"unknown family {config.family!r}")
 
 
@@ -521,6 +607,11 @@ def _effective_representations(model: nn.Module, family: str, n_features: int, d
     if family == "tied_tropfan_zero_dense":
         assert isinstance(model, TiedFanZeroDenseRecovery)
         return model.effective_representations()[0]
+    if family == "pairwise":
+        return _squeeze_single_sequence(model(torch.eye(n_features, device=device))).float()
+    if family == "tied_pairwise":
+        assert isinstance(model, TiedPairwiseRecovery)
+        return model.effective_representations()[0]
     raise ValueError(f"unknown family {family!r}")
 
 
@@ -600,8 +691,11 @@ def _route_metrics(model: nn.Module, family: str, n_features: int, device: torch
     if family not in ROUTED_FAMILIES:
         return {"route_unique": float("nan"), "route_collision_mean": float("nan"), "route_entropy": float("nan"), "avg_margin": float("nan")}
     model.eval()
-    if family in {"tied_tropical_lowrank", "tied_tropical_zero_dense", "tied_tropfan_zero_dense"}:
-        assert isinstance(model, (TiedTropicalLowRankRecovery, TiedZeroDenseRecovery, TiedFanZeroDenseRecovery))
+    if family in TIED_RECOVERY_FAMILIES:
+        assert isinstance(
+            model,
+            (TiedTropicalLowRankRecovery, TiedZeroDenseRecovery, TiedFanZeroDenseRecovery, TiedPairwiseRecovery),
+        )
         model.effective_representations()  # type: ignore[union-attr]
     else:
         model(torch.eye(n_features, device=device))
@@ -620,7 +714,21 @@ def _route_metrics(model: nn.Module, family: str, n_features: int, device: torch
     }
 
 
+def _chamber_signatures(model: nn.Module, family: str) -> Tensor | None:
+    if family not in ROUTED_FAMILIES:
+        return None
+    last = getattr(model, "_last_indices", None)
+    if last is None:
+        return None
+    sigs = last.detach()
+    if sigs.ndim == 3:
+        sigs = sigs.squeeze(1)
+    return sigs.cpu()
+
+
 def run_config(config: RunConfig) -> dict[str, float | int | str]:
+    from .bridge_scaling import bridge_diagnostics
+
     model, train_metrics = _train_one(config)
     device = torch.device(config.device)
     probs = feature_probabilities(config.n_features, config.alpha, config.activation_density, device=device)
@@ -632,6 +740,13 @@ def run_config(config: RunConfig) -> dict[str, float | int | str]:
     row.update(_frequency_weighted_overlap_metrics(reps, probs))
     row.update(_recovery_operator_metrics(response, probs))
     row.update(_route_metrics(model, config.family, config.n_features, device))
+    chamber_sigs = _chamber_signatures(model, config.family)
+    row.update(
+        bridge_diagnostics(
+            reps_vector=reps.detach().float().cpu(),
+            reps_chamber=chamber_sigs,
+        )
+    )
     row["overlap_times_dim"] = float(row["mean_squared_overlap"]) * config.model_dim
     row["frequency_weighted_overlap_times_dim"] = float(row["frequency_weighted_overlap"]) * config.model_dim
     row["frequency_pair_weighted_overlap_times_dim"] = float(row["frequency_pair_weighted_overlap"]) * config.model_dim
@@ -645,7 +760,9 @@ def run_config(config: RunConfig) -> dict[str, float | int | str]:
     return row
 
 
-def _summary_key(row: dict[str, float | int | str]) -> tuple[str, float, int, int, int, str, float, str, int]:
+def _summary_key(
+    row: dict[str, float | int | str],
+) -> tuple[str, float, int, int, int, str, float, str, int, int, int]:
     family = str(row["family"])
     heads = int(row["heads"])
     if family in COORD_ZERO_DENSE_FAMILIES and heads == int(row["model_dim"]):
@@ -660,6 +777,8 @@ def _summary_key(row: dict[str, float | int | str]) -> tuple[str, float, int, in
         float(row["output_lr_mult"]),
         str(row["fan_value_mode"]),
         int(row["fan_basis_rank"]),
+        int(row.get("tables", 0)),
+        int(row.get("comparisons", 0)),
     )
 
 
@@ -679,6 +798,8 @@ def _fit_exponents(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
             output_lr_mult,
             fan_value_mode,
             fan_basis_rank,
+            tables,
+            comparisons,
         ) = key
         xs = torch.tensor([float(row["model_dim"]) for row in group])
         ys = torch.tensor([float(row["final_loss"]) for row in group])
@@ -707,6 +828,8 @@ def _fit_exponents(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
                 "output_lr_mult": float(output_lr_mult),
                 "fan_value_mode": fan_value_mode,
                 "fan_basis_rank": float(fan_basis_rank),
+                "tables": float(tables),
+                "comparisons": float(comparisons),
                 "beta": beta,
                 "r2": r2,
                 "points": float(len(group)),
@@ -737,6 +860,8 @@ def _group_metrics(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
             output_lr_mult,
             fan_value_mode,
             fan_basis_rank,
+            tables,
+            comparisons,
         ) = key
         summaries.append(
             {
@@ -749,6 +874,8 @@ def _group_metrics(rows: list[dict[str, float | int | str]]) -> list[dict[str, f
                 "output_lr_mult": float(output_lr_mult),
                 "fan_value_mode": fan_value_mode,
                 "fan_basis_rank": float(fan_basis_rank),
+                "tables": float(tables),
+                "comparisons": float(comparisons),
                 "mean_loss_per_activation": _mean_finite(group, "loss_per_activation"),
                 "mean_overlap_times_dim": _mean_finite(group, "overlap_times_dim"),
                 "mean_frequency_weighted_overlap_times_dim": _mean_finite(group, "frequency_weighted_overlap_times_dim"),
@@ -810,6 +937,8 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
                                     output_lr_mult=args.output_lr_mult if family == "tropical_lowrank" else 1.0,
                                     fan_value_mode=args.fan_value_mode if family in FAN_ZERO_DENSE_FAMILIES else "-",
                                     fan_basis_rank=args.fan_basis_rank if family in FAN_ZERO_DENSE_FAMILIES else 0,
+                                    tables=args.tables if family in PAIRWISE_FAMILIES else 0,
+                                    comparisons=args.comparisons if family in PAIRWISE_FAMILIES else 0,
                                 )
                             )
     return configs
@@ -817,11 +946,18 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
 
 def _write_csv(rows: list[dict[str, float | int | str]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = list(rows[0].keys())
+    seen: set[str] = set()
+    fields: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                fields.append(key)
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
 
 
 def main(argv: Iterable[str] | None = None) -> None:
@@ -845,6 +981,8 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--zero-dense-heads-mode", choices=("model_dim", "fixed"), default="model_dim")
     parser.add_argument("--fan-value-mode", choices=("site", "basis"), default="site")
     parser.add_argument("--fan-basis-rank", type=int, default=16)
+    parser.add_argument("--tables", type=int, default=32, help="number of pairwise comparator tables")
+    parser.add_argument("--comparisons", type=int, default=6, help="bits per pairwise table (cells = 2**comparisons)")
     parser.add_argument("--seeds", type=str, default="0")
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
@@ -893,7 +1031,22 @@ def main(argv: Iterable[str] | None = None) -> None:
     csv_path = output_dir / f"runs-{name}.csv"
     json_path = output_dir / f"summary-{name}.json"
     _write_csv(rows, csv_path)
-    summary = {"runs": rows, "exponents": _fit_exponents(rows), "group_metrics": _group_metrics(rows)}
+    from .bridge_scaling import fit_bridge_exponents_per_family
+
+    bridge_capacity_keys = (
+        "bridge_K_vec_a4",
+        "bridge_K_vec_a16",
+        "bridge_K_chamb_a4",
+        "bridge_K_chamb_a16",
+        "bridge_chamber_distinct",
+    )
+    bridge_exponents = fit_bridge_exponents_per_family(rows, capacity_keys=bridge_capacity_keys)
+    summary = {
+        "runs": rows,
+        "exponents": _fit_exponents(rows),
+        "group_metrics": _group_metrics(rows),
+        "bridge_exponents": bridge_exponents,
+    }
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(summary, indent=2))
     print(f"runs_csv={csv_path}")
