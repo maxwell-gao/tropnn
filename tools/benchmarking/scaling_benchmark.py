@@ -31,6 +31,7 @@ FAMILIES = (
     "tied_tropfan_zero_dense",
     "pairwise",
     "tied_pairwise",
+    "tied_engram",
 )
 CODE_SCALE_MODES = ("sqrt", "linear", "none")
 PAPER_FAMILIES = ("paper", "untied_paper")
@@ -38,13 +39,15 @@ LOWRANK_FAMILIES = ("tropical_lowrank", "tied_tropical_lowrank")
 COORD_ZERO_DENSE_FAMILIES = ("tropical_zero_dense", "tied_tropical_zero_dense")
 FAN_ZERO_DENSE_FAMILIES = ("tropfan_zero_dense", "tied_tropfan_zero_dense")
 PAIRWISE_FAMILIES = ("pairwise", "tied_pairwise")
+ENGRAM_FAMILIES = ("tied_engram",)
 ZERO_DENSE_FAMILIES = COORD_ZERO_DENSE_FAMILIES + FAN_ZERO_DENSE_FAMILIES
-ROUTED_FAMILIES = LOWRANK_FAMILIES + ZERO_DENSE_FAMILIES + PAIRWISE_FAMILIES
+ROUTED_FAMILIES = LOWRANK_FAMILIES + ZERO_DENSE_FAMILIES + PAIRWISE_FAMILIES + ENGRAM_FAMILIES
 TIED_RECOVERY_FAMILIES = (
     "tied_tropical_lowrank",
     "tied_tropical_zero_dense",
     "tied_tropfan_zero_dense",
     "tied_pairwise",
+    "tied_engram",
 )
 ROUTE_METRIC_FIELDS = ("route_unique", "route_collision_mean", "route_entropy", "avg_margin")
 BRIDGE_CAPACITY_KEYS = (
@@ -95,6 +98,8 @@ class RunConfig:
     fan_basis_rank: int = 16
     tables: int = 0
     comparisons: int = 0
+    engram_heads: int = 0
+    engram_table_size: int = 0
 
 
 def _eye(n_features: int, device: torch.device) -> Tensor:
@@ -340,6 +345,144 @@ class TiedPairwiseRecovery(TiedRecoveryBase):
         return self._identity_router_representations(score_heads=0)
 
 
+def _is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    if n < 4:
+        return True
+    if n % 2 == 0:
+        return False
+    i = 3
+    while i * i <= n:
+        if n % i == 0:
+            return False
+        i += 2
+    return True
+
+
+def _next_prime(n: int) -> int:
+    n = max(2, n)
+    while not _is_prime(n):
+        n += 1
+    return n
+
+
+def _consecutive_primes(start: int, count: int) -> list[int]:
+    primes: list[int] = []
+    candidate = max(2, start)
+    while len(primes) < count:
+        candidate = _next_prime(candidate)
+        primes.append(candidate)
+        candidate += 1
+    return primes
+
+
+class EngramHashRetrieval(nn.Module):
+    """Single-token Engram-style retrieval with ``K`` hash heads.
+
+    Mirrors the retrieval phase of DeepSeek's Engram module (without the
+    n-gram shifts and the gating fusion). A single multiplicative-XOR mix is
+    computed per token id; ``K`` heads then reduce that mix by ``K`` distinct
+    primes ``M_k >= table_size``. Per-head embedding tables of size ``M_k``
+    are concatenated to form the feature representation. The chamber
+    signature ``(hash_1(i), ..., hash_K(i))`` is exposed via ``_last_indices``
+    so the bridge scaling tool can read it through the existing chamber-view
+    extractor. Using distinct primes per head guarantees CRT-style
+    independence: with ``K`` heads of primes ``p_1, ..., p_K`` the joint
+    signature can take up to ``prod p_k`` values, regardless of how
+    power-of-two the original ``table_size`` would have been.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        n_heads: int,
+        table_size: int,
+        seed: int,
+    ) -> None:
+        super().__init__()
+        if n_heads < 1:
+            raise ValueError(f"n_heads must be >= 1, got {n_heads}")
+        if table_size < 2:
+            raise ValueError(f"table_size must be >= 2, got {table_size}")
+        if out_features % n_heads != 0:
+            raise ValueError(f"out_features ({out_features}) must be divisible by n_heads ({n_heads})")
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.n_heads = n_heads
+        self.table_size = table_size
+        self.per_head_dim = out_features // n_heads
+
+        gen = torch.Generator().manual_seed(seed)
+        multiplier = int(torch.randint(0, 1 << 30, (1,), generator=gen).item() | 1)
+        shift = int(torch.randint(1, 16, (1,), generator=gen).item())
+        self.register_buffer("multiplier", torch.tensor(multiplier, dtype=torch.long))
+        self.register_buffer("shift", torch.tensor(shift, dtype=torch.long))
+
+        primes = _consecutive_primes(table_size, n_heads)
+        self.register_buffer("table_sizes", torch.tensor(primes, dtype=torch.long))
+
+        self.tables = nn.ModuleList([nn.Embedding(primes[k], self.per_head_dim) for k in range(n_heads)])
+        for emb in self.tables:
+            nn.init.normal_(emb.weight, std=1.0 / math.sqrt(max(1, self.per_head_dim)))
+
+        self._last_indices: Tensor | None = None
+        self._last_margins: Tensor | None = None
+
+    def hash_signatures(self, token_ids: Tensor) -> Tensor:
+        ids = token_ids.long()
+        mix = (self.multiplier.long() * ids) ^ (ids << self.shift.long())
+        return mix.view(-1, 1) % self.table_sizes.view(1, -1).long()
+
+    def _stitched_embeddings(self, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        token_ids = torch.arange(self.in_features, device=device)
+        sigs = self.hash_signatures(token_ids)
+        head_embeds = [self.tables[k](sigs[:, k]) for k in range(self.n_heads)]
+        return torch.cat(head_embeds, dim=-1).to(dtype=dtype), sigs
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+        device = x.device
+        rep_matrix, sigs = self._stitched_embeddings(device, torch.float32)
+        output = x.float() @ rep_matrix
+        argmax_ids = x.argmax(dim=-1)
+        self._last_indices = sigs[argmax_ids]
+        self._last_margins = torch.zeros((*argmax_ids.shape, 0), device=device, dtype=output.dtype)
+        return output.to(x.dtype)
+
+
+class TiedEngramRecovery(TiedRecoveryBase):
+    """Paper-style tied recovery backed by Engram-style hash retrieval."""
+
+    router: EngramHashRetrieval
+
+    def __init__(
+        self,
+        n_features: int,
+        model_dim: int,
+        *,
+        n_heads: int,
+        table_size: int,
+        seed: int,
+    ) -> None:
+        super().__init__(n_features, model_dim)
+        self.router = EngramHashRetrieval(
+            n_features,
+            model_dim,
+            n_heads=n_heads,
+            table_size=table_size,
+            seed=seed,
+        )
+
+    def effective_representations(self, *, training: bool | None = None) -> tuple[Tensor, Tensor, Tensor]:
+        del training
+        return self._identity_router_representations(score_heads=0)
+
+
 def feature_probabilities(n_features: int, alpha: float, activation_density: float, *, device: torch.device) -> Tensor:
     if n_features < 1:
         raise ValueError(f"n_features must be >= 1, got {n_features}")
@@ -381,6 +524,14 @@ def _pairwise_shape(config: RunConfig) -> tuple[int, int]:
     tables = config.tables if config.tables > 0 else max(4, config.heads)
     comparisons = config.comparisons if config.comparisons > 0 else 4
     return tables, comparisons
+
+
+def _engram_shape(config: RunConfig) -> tuple[int, int]:
+    n_heads = config.engram_heads if config.engram_heads > 0 else 8
+    table_size = config.engram_table_size if config.engram_table_size > 0 else 256
+    while config.model_dim % n_heads != 0 and n_heads > 1:
+        n_heads -= 1
+    return n_heads, table_size
 
 
 def _build_paper(config: RunConfig) -> nn.Module:
@@ -493,6 +644,17 @@ def _build_tied_pairwise(config: RunConfig) -> nn.Module:
     )
 
 
+def _build_tied_engram(config: RunConfig) -> nn.Module:
+    n_heads, table_size = _engram_shape(config)
+    return TiedEngramRecovery(
+        config.n_features,
+        config.model_dim,
+        n_heads=n_heads,
+        table_size=table_size,
+        seed=config.seed,
+    )
+
+
 MODEL_BUILDERS: dict[str, ModelBuilder] = {
     "paper": _build_paper,
     "untied_paper": _build_untied_paper,
@@ -505,6 +667,7 @@ MODEL_BUILDERS: dict[str, ModelBuilder] = {
     "tied_tropfan_zero_dense": _build_tied_tropfan_zero_dense,
     "pairwise": _build_pairwise,
     "tied_pairwise": _build_tied_pairwise,
+    "tied_engram": _build_tied_engram,
 }
 
 
@@ -629,6 +792,7 @@ REPRESENTATION_EXTRACTORS: dict[str, RepresentationExtractor] = {
     "tied_tropfan_zero_dense": _tied_representations,
     "pairwise": _identity_model_representations,
     "tied_pairwise": _tied_representations,
+    "tied_engram": _tied_representations,
 }
 
 
@@ -792,7 +956,7 @@ def run_config(config: RunConfig) -> BenchmarkRow:
     return row
 
 
-SummaryKey = tuple[str, float, int, int, int, str, float, str, int, int, int]
+SummaryKey = tuple[str, float, int, int, int, str, float, str, int, int, int, int, int]
 
 
 def _summary_key(row: BenchmarkRow) -> SummaryKey:
@@ -812,11 +976,27 @@ def _summary_key(row: BenchmarkRow) -> SummaryKey:
         int(row["fan_basis_rank"]),
         int(row.get("tables", 0)),
         int(row.get("comparisons", 0)),
+        int(row.get("engram_heads", 0)),
+        int(row.get("engram_table_size", 0)),
     )
 
 
 def _summary_fields(key: SummaryKey) -> dict[str, float | str]:
-    family, alpha, heads, cells, route_terms, code_scale_mode, output_lr_mult, fan_value_mode, fan_basis_rank, tables, comparisons = key
+    (
+        family,
+        alpha,
+        heads,
+        cells,
+        route_terms,
+        code_scale_mode,
+        output_lr_mult,
+        fan_value_mode,
+        fan_basis_rank,
+        tables,
+        comparisons,
+        engram_heads,
+        engram_table_size,
+    ) = key
     return {
         "family": family,
         "alpha": alpha,
@@ -829,6 +1009,8 @@ def _summary_fields(key: SummaryKey) -> dict[str, float | str]:
         "fan_basis_rank": float(fan_basis_rank),
         "tables": float(tables),
         "comparisons": float(comparisons),
+        "engram_heads": float(engram_heads),
+        "engram_table_size": float(engram_table_size),
     }
 
 
@@ -907,6 +1089,18 @@ def _route_terms_for_family(args: argparse.Namespace, family: str, route_terms_v
     return [args.route_terms]
 
 
+def _engram_heads_for_family(args: argparse.Namespace, family: str, engram_heads_values: list[int]) -> list[int]:
+    if family in ENGRAM_FAMILIES:
+        return engram_heads_values
+    return [0]
+
+
+def _engram_table_sizes_for_family(args: argparse.Namespace, family: str, engram_table_sizes: list[int]) -> list[int]:
+    if family in ENGRAM_FAMILIES:
+        return engram_table_sizes
+    return [0]
+
+
 def _run_config_from_args(
     args: argparse.Namespace,
     *,
@@ -916,6 +1110,8 @@ def _run_config_from_args(
     heads: int,
     route_terms: int,
     seed: int,
+    engram_heads: int,
+    engram_table_size: int,
 ) -> RunConfig:
     return RunConfig(
         family=family,
@@ -940,6 +1136,8 @@ def _run_config_from_args(
         fan_basis_rank=args.fan_basis_rank if family in FAN_ZERO_DENSE_FAMILIES else 0,
         tables=args.tables if family in PAIRWISE_FAMILIES else 0,
         comparisons=args.comparisons if family in PAIRWISE_FAMILIES else 0,
+        engram_heads=engram_heads if family in ENGRAM_FAMILIES else 0,
+        engram_table_size=engram_table_size if family in ENGRAM_FAMILIES else 0,
     )
 
 
@@ -949,6 +1147,8 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
     alphas = _parse_csv_numbers(args.alphas, float)
     seeds = _parse_csv_numbers(args.seeds, int)
     route_terms_values = _parse_csv_numbers(args.route_terms_list, int) if args.route_terms_list else [args.route_terms]
+    engram_heads_values = _parse_csv_numbers(args.engram_heads_list, int) if args.engram_heads_list else [args.engram_heads]
+    engram_table_sizes = _parse_csv_numbers(args.engram_table_sizes, int) if args.engram_table_sizes else [args.engram_table_size]
     configs: list[RunConfig] = []
     for family in families:
         _validate_family(family)
@@ -956,20 +1156,26 @@ def _configs_from_args(args: argparse.Namespace) -> list[RunConfig]:
             for model_dim in model_dims:
                 heads_values = _heads_for_family(args, family, model_dim)
                 family_route_terms = _route_terms_for_family(args, family, route_terms_values)
+                family_engram_heads = _engram_heads_for_family(args, family, engram_heads_values)
+                family_engram_tables = _engram_table_sizes_for_family(args, family, engram_table_sizes)
                 for heads in heads_values:
                     for route_terms in family_route_terms:
-                        for seed in seeds:
-                            configs.append(
-                                _run_config_from_args(
-                                    args,
-                                    family=family,
-                                    model_dim=model_dim,
-                                    alpha=alpha,
-                                    heads=heads,
-                                    route_terms=route_terms,
-                                    seed=seed,
-                                )
-                            )
+                        for engram_heads in family_engram_heads:
+                            for engram_table_size in family_engram_tables:
+                                for seed in seeds:
+                                    configs.append(
+                                        _run_config_from_args(
+                                            args,
+                                            family=family,
+                                            model_dim=model_dim,
+                                            alpha=alpha,
+                                            heads=heads,
+                                            route_terms=route_terms,
+                                            seed=seed,
+                                            engram_heads=engram_heads,
+                                            engram_table_size=engram_table_size,
+                                        )
+                                    )
     return configs
 
 
@@ -1011,6 +1217,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fan-basis-rank", type=int, default=16)
     parser.add_argument("--tables", type=int, default=32, help="number of pairwise comparator tables")
     parser.add_argument("--comparisons", type=int, default=6, help="bits per pairwise table (cells = 2**comparisons)")
+    parser.add_argument("--engram-heads", type=int, default=8, help="number of Engram hash heads K")
+    parser.add_argument("--engram-table-size", type=int, default=256, help="Engram embedding rows per head M")
+    parser.add_argument("--engram-heads-list", type=str, default="", help="comma-separated K sweep for Engram")
+    parser.add_argument("--engram-table-sizes", type=str, default="", help="comma-separated M sweep for Engram")
     parser.add_argument("--seeds", type=str, default="0")
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
@@ -1044,9 +1254,18 @@ def _apply_quick_defaults(args: argparse.Namespace, raw_argv: list[str]) -> None
 
 
 def _print_run_start(idx: int, total: int, config: RunConfig) -> None:
+    extras = []
+    if config.family in PAIRWISE_FAMILIES:
+        extras.append(f"T={config.tables}")
+        extras.append(f"L={config.comparisons}")
+    if config.family in ENGRAM_FAMILIES:
+        extras.append(f"K={config.engram_heads}")
+        extras.append(f"M={config.engram_table_size}")
+    extras_str = (" " + " ".join(extras)) if extras else ""
     print(
         f"[{idx}/{total}] family={config.family} n={config.n_features} m={config.model_dim} "
-        f"alpha={config.alpha} heads={config.heads} cells={config.cells} route_terms={config.route_terms} seed={config.seed}"
+        f"alpha={config.alpha} heads={config.heads} cells={config.cells} route_terms={config.route_terms}"
+        f"{extras_str} seed={config.seed}"
     )
 
 
