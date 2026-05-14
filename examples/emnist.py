@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..layers import PairwiseLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
+from ..layers import PairwiseLinear, PairwiseWalshLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
 
 IDX_DTYPES = {
     0x08: np.uint8,
@@ -28,7 +28,7 @@ IDX_DTYPES = {
     0x0E: np.dtype(">f8"),
 }
 EMNIST_SPLITS = ("byclass", "bymerge", "balanced", "letters", "digits", "mnist")
-ROUTED_FAMILIES = ("tropical", "tropical_lowrank", "tropical_zero_dense", "tropfan_zero_dense", "pairwise")
+ROUTED_FAMILIES = ("tropical", "tropical_lowrank", "tropical_zero_dense", "tropfan_zero_dense", "pairwise", "pairwise_walsh")
 TROPICAL_FAMILIES = ("tropical", "tropical_lowrank")
 HEAD_ROUTED_FAMILIES = ("tropical", "tropical_lowrank", "tropical_zero_dense", "tropfan_zero_dense")
 
@@ -97,6 +97,7 @@ def _make_layer(
     fan_basis_rank: int,
     comparisons: int,
     pairwise_tables: int,
+    walsh_order: int,
     backend: str,
     seed: int,
 ) -> nn.Module:
@@ -113,6 +114,16 @@ def _make_layer(
             code_dim=code_dim,
             fan_value_mode=fan_value_mode,  # type: ignore[arg-type]
             fan_basis_rank=fan_basis_rank,
+            seed=seed,
+        )
+    if family == "pairwise_walsh":
+        return PairwiseWalshLinear(
+            d_in,
+            d_out,
+            tables=pairwise_tables,
+            comparisons=comparisons,
+            walsh_order=walsh_order,  # type: ignore[arg-type]
+            backend=backend,
             seed=seed,
         )
     return PairwiseLinear(d_in, d_out, tables=pairwise_tables, comparisons=comparisons, backend=backend, seed=seed)
@@ -135,6 +146,7 @@ class EmnistRoutedClassifier(nn.Module):
         fan_basis_rank: int,
         comparisons: int,
         pairwise_tables: int,
+        walsh_order: int,
         backend: str,
         seed: int,
     ) -> None:
@@ -160,6 +172,7 @@ class EmnistRoutedClassifier(nn.Module):
                     fan_basis_rank=fan_basis_rank,
                     comparisons=comparisons,
                     pairwise_tables=pairwise_tables,
+                    walsh_order=walsh_order,
                     backend=backend,
                     seed=seed + idx,
                 )
@@ -198,6 +211,11 @@ class EmnistTropFanZeroDenseClassifier(EmnistRoutedClassifier):
 class EmnistPairwiseClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
         super().__init__(family="pairwise", **kwargs)
+
+
+class EmnistPairwiseWalshClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="pairwise_walsh", **kwargs)
 
 
 def _run_epoch(
@@ -256,6 +274,7 @@ def main() -> None:
         ("--comparisons", int, 6),
     ):
         parser.add_argument(name, type=arg_type, default=default)
+    parser.add_argument("--walsh-order", type=int, choices=(1, 2), default=2)
     parser.add_argument("--backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
     parser.add_argument("--fan-value-mode", choices=("site", "basis"), default="site")
     parser.add_argument("--max-train", type=int, default=None)
@@ -302,6 +321,7 @@ def main() -> None:
         fan_basis_rank=args.fan_basis_rank,
         comparisons=args.comparisons,
         pairwise_tables=args.pairwise_tables,
+        walsh_order=args.walsh_order,
         backend=args.backend,
         seed=args.seed,
     ).to(device)
@@ -320,9 +340,10 @@ def main() -> None:
         "route_terms": args.route_terms if args.family == "tropical_zero_dense" else "-",
         "fan_value_mode": args.fan_value_mode if args.family == "tropfan_zero_dense" else "-",
         "fan_basis_rank": args.fan_basis_rank if args.family == "tropfan_zero_dense" else "-",
-        "pairwise_tables": args.pairwise_tables if args.family == "pairwise" else "-",
-        "comparisons": args.comparisons if args.family == "pairwise" else "-",
-        "backend": args.backend if args.family in TROPICAL_FAMILIES or args.family == "pairwise" else "torch",
+        "pairwise_tables": args.pairwise_tables if args.family in {"pairwise", "pairwise_walsh"} else "-",
+        "comparisons": args.comparisons if args.family in {"pairwise", "pairwise_walsh"} else "-",
+        "walsh_order": args.walsh_order if args.family == "pairwise_walsh" else "-",
+        "backend": args.backend if args.family in TROPICAL_FAMILIES or args.family in {"pairwise", "pairwise_walsh"} else "torch",
         "train/test": f"{len(x_train)}/{len(x_test)}",
         "device": device.type,
         "params": sum(param.numel() for param in model.parameters()),
