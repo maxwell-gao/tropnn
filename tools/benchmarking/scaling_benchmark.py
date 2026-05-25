@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ...backend import Backend, trop_scores
-from ...layers import PairwiseLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
+from ...layers import PairwiseLinear, PairwiseWalshLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
 from ...layers.routing import _minface_mix, _top2_indices
 
 FAMILIES = (
@@ -31,6 +31,8 @@ FAMILIES = (
     "tied_tropfan_zero_dense",
     "pairwise",
     "tied_pairwise",
+    "pairwise_walsh",
+    "tied_pairwise_walsh",
     "tied_engram",
 )
 CODE_SCALE_MODES = ("sqrt", "linear", "none")
@@ -38,7 +40,8 @@ PAPER_FAMILIES = ("paper", "untied_paper")
 LOWRANK_FAMILIES = ("tropical_lowrank", "tied_tropical_lowrank")
 COORD_ZERO_DENSE_FAMILIES = ("tropical_zero_dense", "tied_tropical_zero_dense")
 FAN_ZERO_DENSE_FAMILIES = ("tropfan_zero_dense", "tied_tropfan_zero_dense")
-PAIRWISE_FAMILIES = ("pairwise", "tied_pairwise")
+PAIRWISE_FAMILIES = ("pairwise", "tied_pairwise", "pairwise_walsh", "tied_pairwise_walsh")
+WALSH_PAIRWISE_FAMILIES = ("pairwise_walsh", "tied_pairwise_walsh")
 ENGRAM_FAMILIES = ("tied_engram",)
 ZERO_DENSE_FAMILIES = COORD_ZERO_DENSE_FAMILIES + FAN_ZERO_DENSE_FAMILIES
 ROUTED_FAMILIES = LOWRANK_FAMILIES + ZERO_DENSE_FAMILIES + PAIRWISE_FAMILIES + ENGRAM_FAMILIES
@@ -47,6 +50,7 @@ TIED_RECOVERY_FAMILIES = (
     "tied_tropical_zero_dense",
     "tied_tropfan_zero_dense",
     "tied_pairwise",
+    "tied_pairwise_walsh",
     "tied_engram",
 )
 ROUTE_METRIC_FIELDS = ("route_unique", "route_collision_mean", "route_entropy", "avg_margin")
@@ -98,6 +102,7 @@ class RunConfig:
     fan_basis_rank: int = 16
     tables: int = 0
     comparisons: int = 0
+    walsh_order: int = 0
     engram_heads: int = 0
     engram_table_size: int = 0
 
@@ -337,6 +342,36 @@ class TiedPairwiseRecovery(TiedRecoveryBase):
             model_dim,
             tables=tables,
             comparisons=comparisons,
+            seed=seed,
+        )
+
+    def effective_representations(self, *, training: bool | None = None) -> tuple[Tensor, Tensor, Tensor]:
+        del training
+        return self._identity_router_representations(score_heads=0)
+
+
+class TiedPairwiseWalshRecovery(TiedRecoveryBase):
+    """Paper-style tied recovery whose feature vectors come from a structured pairwise Walsh LUT."""
+
+    router: PairwiseWalshLinear
+
+    def __init__(
+        self,
+        n_features: int,
+        model_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        walsh_order: int,
+        seed: int,
+    ) -> None:
+        super().__init__(n_features, model_dim)
+        self.router = PairwiseWalshLinear(
+            n_features,
+            model_dim,
+            tables=tables,
+            comparisons=comparisons,
+            walsh_order=walsh_order,  # type: ignore[arg-type]
             seed=seed,
         )
 
@@ -633,6 +668,19 @@ def _build_pairwise(config: RunConfig) -> nn.Module:
     )
 
 
+def _build_pairwise_walsh(config: RunConfig) -> nn.Module:
+    tables, comparisons = _pairwise_shape(config)
+    walsh_order = config.walsh_order if config.walsh_order > 0 else 2
+    return PairwiseWalshLinear(
+        config.n_features,
+        config.n_features,
+        tables=tables,
+        comparisons=comparisons,
+        walsh_order=walsh_order,
+        seed=config.seed,
+    )
+
+
 def _build_tied_pairwise(config: RunConfig) -> nn.Module:
     tables, comparisons = _pairwise_shape(config)
     return TiedPairwiseRecovery(
@@ -640,6 +688,19 @@ def _build_tied_pairwise(config: RunConfig) -> nn.Module:
         config.model_dim,
         tables=tables,
         comparisons=comparisons,
+        seed=config.seed,
+    )
+
+
+def _build_tied_pairwise_walsh(config: RunConfig) -> nn.Module:
+    tables, comparisons = _pairwise_shape(config)
+    walsh_order = config.walsh_order if config.walsh_order > 0 else 2
+    return TiedPairwiseWalshRecovery(
+        config.n_features,
+        config.model_dim,
+        tables=tables,
+        comparisons=comparisons,
+        walsh_order=walsh_order,
         seed=config.seed,
     )
 
@@ -667,6 +728,8 @@ MODEL_BUILDERS: dict[str, ModelBuilder] = {
     "tied_tropfan_zero_dense": _build_tied_tropfan_zero_dense,
     "pairwise": _build_pairwise,
     "tied_pairwise": _build_tied_pairwise,
+    "pairwise_walsh": _build_pairwise_walsh,
+    "tied_pairwise_walsh": _build_tied_pairwise_walsh,
     "tied_engram": _build_tied_engram,
 }
 
@@ -792,6 +855,8 @@ REPRESENTATION_EXTRACTORS: dict[str, RepresentationExtractor] = {
     "tied_tropfan_zero_dense": _tied_representations,
     "pairwise": _identity_model_representations,
     "tied_pairwise": _tied_representations,
+    "pairwise_walsh": _identity_model_representations,
+    "tied_pairwise_walsh": _tied_representations,
     "tied_engram": _tied_representations,
 }
 
@@ -956,7 +1021,7 @@ def run_config(config: RunConfig) -> BenchmarkRow:
     return row
 
 
-SummaryKey = tuple[str, float, int, int, int, str, float, str, int, int, int, int, int]
+SummaryKey = tuple[str, float, int, int, int, str, float, str, int, int, int, int, int, int]
 
 
 def _summary_key(row: BenchmarkRow) -> SummaryKey:
@@ -976,6 +1041,7 @@ def _summary_key(row: BenchmarkRow) -> SummaryKey:
         int(row["fan_basis_rank"]),
         int(row.get("tables", 0)),
         int(row.get("comparisons", 0)),
+        int(row.get("walsh_order", 0)),
         int(row.get("engram_heads", 0)),
         int(row.get("engram_table_size", 0)),
     )
@@ -994,6 +1060,7 @@ def _summary_fields(key: SummaryKey) -> dict[str, float | str]:
         fan_basis_rank,
         tables,
         comparisons,
+        walsh_order,
         engram_heads,
         engram_table_size,
     ) = key
@@ -1009,6 +1076,7 @@ def _summary_fields(key: SummaryKey) -> dict[str, float | str]:
         "fan_basis_rank": float(fan_basis_rank),
         "tables": float(tables),
         "comparisons": float(comparisons),
+        "walsh_order": float(walsh_order),
         "engram_heads": float(engram_heads),
         "engram_table_size": float(engram_table_size),
     }
@@ -1136,6 +1204,7 @@ def _run_config_from_args(
         fan_basis_rank=args.fan_basis_rank if family in FAN_ZERO_DENSE_FAMILIES else 0,
         tables=args.tables if family in PAIRWISE_FAMILIES else 0,
         comparisons=args.comparisons if family in PAIRWISE_FAMILIES else 0,
+        walsh_order=args.walsh_order if family in WALSH_PAIRWISE_FAMILIES else 0,
         engram_heads=engram_heads if family in ENGRAM_FAMILIES else 0,
         engram_table_size=engram_table_size if family in ENGRAM_FAMILIES else 0,
     )
@@ -1217,6 +1286,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fan-basis-rank", type=int, default=16)
     parser.add_argument("--tables", type=int, default=32, help="number of pairwise comparator tables")
     parser.add_argument("--comparisons", type=int, default=6, help="bits per pairwise table (cells = 2**comparisons)")
+    parser.add_argument("--walsh-order", type=int, choices=(1, 2), default=2, help="Walsh order for pairwise_walsh families")
     parser.add_argument("--engram-heads", type=int, default=8, help="number of Engram hash heads K")
     parser.add_argument("--engram-table-size", type=int, default=256, help="Engram embedding rows per head M")
     parser.add_argument("--engram-heads-list", type=str, default="", help="comma-separated K sweep for Engram")
@@ -1258,6 +1328,8 @@ def _print_run_start(idx: int, total: int, config: RunConfig) -> None:
     if config.family in PAIRWISE_FAMILIES:
         extras.append(f"T={config.tables}")
         extras.append(f"L={config.comparisons}")
+    if config.family in WALSH_PAIRWISE_FAMILIES:
+        extras.append(f"O={config.walsh_order}")
     if config.family in ENGRAM_FAMILIES:
         extras.append(f"K={config.engram_heads}")
         extras.append(f"M={config.engram_table_size}")
