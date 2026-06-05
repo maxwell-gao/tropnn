@@ -97,6 +97,7 @@ def _make_layer(
     fan_basis_rank: int,
     comparisons: int,
     pairwise_tables: int,
+    fixed_zero_threshold: bool,
     walsh_order: int,
     backend: str,
     seed: int,
@@ -126,7 +127,15 @@ def _make_layer(
             backend=backend,
             seed=seed,
         )
-    return PairwiseLinear(d_in, d_out, tables=pairwise_tables, comparisons=comparisons, backend=backend, seed=seed)
+    return PairwiseLinear(
+        d_in,
+        d_out,
+        tables=pairwise_tables,
+        comparisons=comparisons,
+        backend=backend,
+        seed=seed,
+        fixed_zero_threshold=fixed_zero_threshold,
+    )
 
 
 class EmnistRoutedClassifier(nn.Module):
@@ -146,18 +155,23 @@ class EmnistRoutedClassifier(nn.Module):
         fan_basis_rank: int,
         comparisons: int,
         pairwise_tables: int,
+        fixed_zero_threshold: bool,
         walsh_order: int,
         backend: str,
         seed: int,
+        residual: bool = False,
     ) -> None:
         super().__init__()
         self.family = family
+        self.residual = residual
         dims = [input_dim]
         if depth == 1:
             dims.append(num_classes)
         else:
             dims.extend([hidden_dim] * (depth - 1))
             dims.append(num_classes)
+        layer_count = len(dims) - 1
+        self.residual_mask = [residual and idx < layer_count - 1 for idx in range(layer_count)]
         self.layers = nn.ModuleList(
             [
                 _make_layer(
@@ -172,6 +186,7 @@ class EmnistRoutedClassifier(nn.Module):
                     fan_basis_rank=fan_basis_rank,
                     comparisons=comparisons,
                     pairwise_tables=pairwise_tables,
+                    fixed_zero_threshold=fixed_zero_threshold,
                     walsh_order=walsh_order,
                     backend=backend,
                     seed=seed + idx,
@@ -180,11 +195,21 @@ class EmnistRoutedClassifier(nn.Module):
             ]
         )
 
+    @staticmethod
+    def _adapt_residual(x: Tensor, out_features: int) -> Tensor:
+        in_features = x.shape[-1]
+        if in_features == out_features:
+            return x
+        if in_features > out_features:
+            return x[..., :out_features]
+        return F.pad(x, (0, out_features - in_features))
+
     def forward(self, x: Tensor) -> Tensor:
         if x.ndim == 2:
             x = x.unsqueeze(1)
-        for layer in self.layers:
-            x = layer(x)
+        for use_residual, layer in zip(self.residual_mask, self.layers):
+            y = layer(x)
+            x = self._adapt_residual(x, y.shape[-1]) + y if use_residual else y
         return x.squeeze(1)
 
 
@@ -281,6 +306,8 @@ def main() -> None:
     parser.add_argument("--max-test", type=int, default=None)
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--residual", action="store_true", help="Add a fixed crop/pad residual path on all non-output layers.")
+    parser.add_argument("--fixed-zero-threshold", action="store_true", help="Use fixed zero pairwise thresholds instead of learnable offsets.")
     parser.add_argument("--permute", action="store_true")
     parser.add_argument("--permute-seed", type=int, default=0)
     parser.add_argument("--raw-orientation", action="store_true")
@@ -321,9 +348,11 @@ def main() -> None:
         fan_basis_rank=args.fan_basis_rank,
         comparisons=args.comparisons,
         pairwise_tables=args.pairwise_tables,
+        fixed_zero_threshold=args.fixed_zero_threshold,
         walsh_order=args.walsh_order,
         backend=args.backend,
         seed=args.seed,
+        residual=args.residual,
     ).to(device)
     train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(TensorDataset(x_test, y_test), batch_size=args.batch_size, shuffle=False)
@@ -342,8 +371,10 @@ def main() -> None:
         "fan_basis_rank": args.fan_basis_rank if args.family == "tropfan_zero_dense" else "-",
         "pairwise_tables": args.pairwise_tables if args.family in {"pairwise", "pairwise_walsh"} else "-",
         "comparisons": args.comparisons if args.family in {"pairwise", "pairwise_walsh"} else "-",
+        "fixed_zero_threshold": args.fixed_zero_threshold if args.family == "pairwise" else "-",
         "walsh_order": args.walsh_order if args.family == "pairwise_walsh" else "-",
         "backend": args.backend if args.family in TROPICAL_FAMILIES or args.family in {"pairwise", "pairwise_walsh"} else "torch",
+        "residual": args.residual,
         "train/test": f"{len(x_train)}/{len(x_test)}",
         "device": device.type,
         "params": sum(param.numel() for param in model.parameters()),
