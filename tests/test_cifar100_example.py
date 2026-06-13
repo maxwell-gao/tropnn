@@ -5,7 +5,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
 from tropnn.examples.cifar100 import Cifar100RoutedClassifier, load_cifar100_label_names, load_cifar100_split
 
 

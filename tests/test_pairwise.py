@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tropnn import PairwiseLinear, PairwiseWalshLinear
+from tropnn import AbsDiffLUT, PairwiseLinear, PairwiseWalshLinear
 from tropnn.examples.emnist import EmnistPairwiseWalshClassifier
 from tropnn.layers.surrogate import surrogate_gradient
 
@@ -21,6 +21,58 @@ def test_pairwise_zig_backend_is_inference_only() -> None:
 
     with pytest.raises(RuntimeError, match="inference-only"):
         layer(torch.randn(4, 8))
+
+
+def test_absdiff_lut_selects_rows_from_coordinate_closeness() -> None:
+    layer = AbsDiffLUT(3, 2, tables=1, comparisons=2, width_init=0.5, use_output_scaling=False, seed=0, lut_init_std=0.0)
+    with torch.no_grad():
+        layer.coords[0] = torch.tensor([0, 1])
+        layer.log_widths.fill_(AbsDiffLUT._inverse_softplus(0.5))
+        layer.lut[0].copy_(
+            torch.tensor(
+                [
+                    [0.0, 0.0],
+                    [1.0, 10.0],
+                    [2.0, 20.0],
+                    [3.0, 30.0],
+                ]
+            )
+        )
+
+    query = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    key = torch.tensor([[0.1, 1.0, 0.0], [1.0, 0.1, 0.0]])
+
+    out = layer(query, key)
+
+    assert torch.allclose(out, torch.tensor([[1.0, 10.0], [2.0, 20.0]]))
+    assert torch.equal(layer._last_indices, torch.tensor([[1], [2]]))
+
+
+def test_absdiff_lut_min_margin_ste_routes_credit_to_query_key_and_width() -> None:
+    layer = AbsDiffLUT(2, 1, tables=1, comparisons=2, width_init=0.5, use_output_scaling=False, seed=0, lut_init_std=0.0)
+    with torch.no_grad():
+        layer.coords[0] = torch.tensor([0, 1])
+        layer.log_widths.fill_(AbsDiffLUT._inverse_softplus(0.5))
+        layer.lut[0, :, 0] = torch.tensor([5.0, 2.0, 7.0, 11.0])
+
+    query = torch.tensor([[0.4, 2.0]], requires_grad=True)
+    key = torch.tensor([[0.0, 0.0]], requires_grad=True)
+    out = layer(query, key)
+    out.sum().backward()
+
+    current = layer.lut[0, 1, 0].detach()
+    neighbor = layer.lut[0, 0, 0].detach()
+    corr = neighbor - current
+    u = torch.tensor(0.1)
+    expected_q0 = -surrogate_gradient(u) * corr
+    expected_k0 = surrogate_gradient(u) * corr
+    expected_width = surrogate_gradient(u) * corr * torch.sigmoid(layer.log_widths.detach()[0, 0])
+
+    assert torch.allclose(out.detach().reshape(()), current)
+    assert torch.allclose(query.grad[0, 0], expected_q0)
+    assert torch.allclose(key.grad[0, 0], expected_k0)
+    assert torch.allclose(layer.log_widths.grad[0, 0], expected_width)
+    assert layer.log_widths.grad[0, 1] == 0
 
 
 def test_pairwise_walsh_materializes_order2_rows() -> None:

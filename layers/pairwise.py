@@ -31,6 +31,8 @@ class PairwiseLinear(RoutedLinearBase):
         fixed_zero_threshold: bool = False,
         surrogate: str = "fast_sigmoid_odd",
         cpu_lut_dtype: Literal["f32", "f16"] = "f32",
+        accumulation: Literal["sum", "two_bank_max"] = "sum",
+        max_group_size: int = 4,
     ) -> None:
         if tables < 1:
             raise ValueError(f"tables must be >= 1, got {tables}")
@@ -40,9 +42,19 @@ class PairwiseLinear(RoutedLinearBase):
             raise ValueError(f"PairwiseLinear currently supports backend='torch', 'tilelang', or 'zig', got {backend!r}")
         if cpu_lut_dtype not in {"f32", "f16"}:
             raise ValueError(f"cpu_lut_dtype must be 'f32' or 'f16', got {cpu_lut_dtype!r}")
+        if accumulation not in {"sum", "two_bank_max"}:
+            raise ValueError(f"accumulation must be 'sum' or 'two_bank_max', got {accumulation!r}")
+        if max_group_size < 1:
+            raise ValueError(f"max_group_size must be >= 1, got {max_group_size}")
+        if accumulation == "two_bank_max" and backend != "torch":
+            raise ValueError("PairwiseLinear accumulation='two_bank_max' currently supports backend='torch' only")
+        if accumulation == "two_bank_max" and not use_min_margin_ste:
+            raise ValueError("PairwiseLinear accumulation='two_bank_max' currently supports min-margin STE only")
         surrogate_gradient(torch.zeros((), dtype=torch.float32), surrogate)
 
-        output_scale = 1.0 / math.sqrt(tables) if use_output_scaling else 1.0
+        max_groups = (tables + max_group_size - 1) // max_group_size
+        scale_terms = max_groups if accumulation == "two_bank_max" else tables
+        output_scale = 1.0 / math.sqrt(scale_terms) if use_output_scaling else 1.0
         super().__init__(in_features, out_features, backend=backend, output_scale=output_scale)
 
         self.tables = tables
@@ -52,6 +64,9 @@ class PairwiseLinear(RoutedLinearBase):
         self.fixed_zero_threshold = fixed_zero_threshold
         self.surrogate = surrogate
         self.cpu_lut_dtype = cpu_lut_dtype
+        self.accumulation = accumulation
+        self.max_group_size = max_group_size
+        self.max_groups = max_groups
         self._zig_lut_f16_cache: Tensor | None = None
         self._zig_lut_f16_cache_version = -1
 
@@ -71,7 +86,14 @@ class PairwiseLinear(RoutedLinearBase):
             self.register_buffer("thresholds", thresholds)
         else:
             self.thresholds = nn.Parameter(thresholds)
-        if lut_init_std == 0.0:
+        if accumulation == "two_bank_max":
+            if lut_init_std == 0.0:
+                self.lut_pos = nn.Parameter(torch.zeros(tables, self.table_size, out_features))
+                self.lut_neg = nn.Parameter(torch.zeros(tables, self.table_size, out_features))
+            else:
+                self.lut_pos = nn.Parameter(torch.randn(tables, self.table_size, out_features) * lut_init_std)
+                self.lut_neg = nn.Parameter(torch.randn(tables, self.table_size, out_features) * lut_init_std)
+        elif lut_init_std == 0.0:
             self.lut = nn.Parameter(torch.zeros(tables, self.table_size, out_features))
         else:
             self.lut = nn.Parameter(torch.randn(tables, self.table_size, out_features) * lut_init_std)
@@ -81,7 +103,8 @@ class PairwiseLinear(RoutedLinearBase):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, tables={self.tables}, "
             f"comparisons={self.comparisons}, backend={self.backend!r}, use_min_margin_ste={self.use_min_margin_ste}, "
-            f"fixed_zero_threshold={self.fixed_zero_threshold}, surrogate={self.surrogate!r}, cpu_lut_dtype={self.cpu_lut_dtype!r}"
+            f"fixed_zero_threshold={self.fixed_zero_threshold}, surrogate={self.surrogate!r}, cpu_lut_dtype={self.cpu_lut_dtype!r}, "
+            f"accumulation={self.accumulation!r}, max_group_size={self.max_group_size}"
         )
 
     def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
@@ -133,6 +156,31 @@ class PairwiseLinear(RoutedLinearBase):
 
     def _lookup_sum(self, indices: Tensor, compute_dtype: torch.dtype) -> Tensor:
         return self._lookup_chunked(indices, compute_dtype=compute_dtype)
+
+    def _lookup_two_bank_max(self, indices: Tensor, compute_dtype: torch.dtype) -> Tensor:
+        batch, seq, route_count = indices.shape
+        item_count = batch * seq
+        indices_flat = indices.reshape(item_count, route_count)
+        pos_table = self.lut_pos.to(dtype=compute_dtype, device=indices.device).reshape(
+            route_count * self.table_size,
+            self.out_features,
+        )
+        neg_table = self.lut_neg.to(dtype=compute_dtype, device=indices.device).reshape(
+            route_count * self.table_size,
+            self.out_features,
+        )
+        output = torch.zeros(item_count, self.out_features, device=indices.device, dtype=compute_dtype)
+
+        for route_start in range(0, route_count, self.max_group_size):
+            route_stop = min(route_start + self.max_group_size, route_count)
+            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
+            linear_idx = (indices_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
+            group_width = route_stop - route_start
+            pos = pos_table.index_select(0, linear_idx).view(item_count, group_width, self.out_features)
+            neg = neg_table.index_select(0, linear_idx).view(item_count, group_width, self.out_features)
+            output = output + pos.max(dim=1).values - neg.max(dim=1).values
+
+        return output.view(batch, seq, self.out_features)
 
     def _compute_indices(self, latent: Tensor) -> tuple[Tensor, Tensor]:
         batch, seq, _ = latent.shape
@@ -209,6 +257,49 @@ class PairwiseLinear(RoutedLinearBase):
 
         return corr.view(batch, seq, self.out_features)
 
+    def _two_bank_min_margin_ste(self, indices: Tensor, margins: Tensor) -> Tensor:
+        r_mins = margins.abs().argmin(dim=-1)
+        u_mins = margins.gather(dim=-1, index=r_mins.unsqueeze(-1)).squeeze(-1)
+        neighbor_indices = indices ^ (2**r_mins).long()
+        ste_delta = ste_heaviside(u_mins, self.surrogate) - (u_mins > 0).to(u_mins.dtype)
+
+        batch, seq, route_count = indices.shape
+        item_count = batch * seq
+        current_flat = indices.reshape(item_count, route_count)
+        neighbor_flat = neighbor_indices.reshape(item_count, route_count)
+        ste_flat = ste_delta.reshape(item_count, route_count, 1).float()
+        pos_table = self.lut_pos.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
+        neg_table = self.lut_neg.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
+        corr = torch.zeros(item_count, self.out_features, device=indices.device, dtype=torch.float32)
+
+        for route_start in range(0, route_count, self.max_group_size):
+            route_stop = min(route_start + self.max_group_size, route_count)
+            group_width = route_stop - route_start
+            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
+            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
+            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
+            pos_current = pos_table.index_select(0, current_idx).view(item_count, group_width, self.out_features)
+            pos_neighbor = pos_table.index_select(0, neighbor_idx).view(item_count, group_width, self.out_features)
+            neg_current = neg_table.index_select(0, current_idx).view(item_count, group_width, self.out_features)
+            neg_neighbor = neg_table.index_select(0, neighbor_idx).view(item_count, group_width, self.out_features)
+
+            def bank_delta(current: Tensor, neighbor: Tensor) -> Tensor:
+                base = current.max(dim=1).values
+                if group_width == 1:
+                    alt = neighbor
+                else:
+                    mask = torch.eye(group_width, device=indices.device, dtype=torch.bool).view(1, group_width, group_width, 1)
+                    expanded = current.unsqueeze(1).expand(-1, group_width, -1, -1)
+                    other = expanded.masked_fill(mask, -torch.inf).max(dim=2).values
+                    alt = torch.maximum(other, neighbor)
+                return alt - base.unsqueeze(1)
+
+            pos_delta = bank_delta(pos_current, pos_neighbor)
+            neg_delta = bank_delta(neg_current, neg_neighbor)
+            corr = corr + (ste_flat[:, route_start:route_stop] * (pos_delta - neg_delta)).sum(dim=1)
+
+        return corr.view(batch, seq, self.out_features)
+
     def _route_output(
         self,
         latent: Tensor,
@@ -251,6 +342,12 @@ class PairwiseLinear(RoutedLinearBase):
             )
 
         indices, margins = self._compute_indices(latent)
+        if self.accumulation == "two_bank_max":
+            output = self._lookup_two_bank_max(indices, compute_dtype)
+            if training and (latent.requires_grad or self.thresholds.requires_grad):
+                output = output + self._two_bank_min_margin_ste(indices, margins).to(output.dtype)
+            return output, indices, margins
+
         output = self._lookup_sum(indices, compute_dtype)
         if training and (latent.requires_grad or self.thresholds.requires_grad):
             ste_corr = self._min_margin_ste(indices, margins) if self.use_min_margin_ste else self._full_ste(indices, margins)

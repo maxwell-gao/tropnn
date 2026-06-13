@@ -2,8 +2,9 @@ from __future__ import annotations
 
 
 def test_top_level_layer_imports_remain_available() -> None:
-    from tropnn import PairwiseLinear, TropFanLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
+    from tropnn import AbsDiffLUT, PairwiseLinear, TropFanLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
 
+    assert AbsDiffLUT.__name__ == "AbsDiffLUT"
     assert PairwiseLinear.__name__ == "PairwiseLinear"
     assert TropLinear.__name__ == "TropLinear"
     assert TropZeroDenseLinear.__name__ == "TropZeroDenseLinear"
@@ -12,8 +13,9 @@ def test_top_level_layer_imports_remain_available() -> None:
 
 
 def test_layers_package_imports_remain_available() -> None:
-    from tropnn.layers import PairwiseLinear, TropFanLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
+    from tropnn.layers import AbsDiffLUT, PairwiseLinear, TropFanLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
 
+    assert AbsDiffLUT.__name__ == "AbsDiffLUT"
     assert PairwiseLinear.__name__ == "PairwiseLinear"
     assert TropLinear.__name__ == "TropLinear"
     assert TropZeroDenseLinear.__name__ == "TropZeroDenseLinear"

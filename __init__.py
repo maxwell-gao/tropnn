@@ -1,6 +1,7 @@
 from .layers import (
     FAN_RECOVERY_MODES,
     FAN_VALUE_MODES,
+    AbsDiffLUT,
     PairwiseLinear,
     PairwiseWalshLinear,
     RoutedLinearBase,
@@ -12,6 +13,7 @@ from .layers import (
 
 __all__ = [
     "RoutedLinearBase",
+    "AbsDiffLUT",
     "PairwiseLinear",
     "PairwiseWalshLinear",
     "TropLinear",

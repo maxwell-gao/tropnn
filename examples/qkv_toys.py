@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..layers import PairwiseLinear
+from ..layers import AbsDiffLUT, PairwiseLinear
 from ..layers.surrogate import ste_heaviside
 
 ScoreFamily = Literal[
@@ -522,6 +522,23 @@ class SameCoordinateScoreLUT(nn.Module, RelationLookupMixin):
             return _index_stats(idx, self.cells)
 
 
+class AbsDiffScoreLUT(nn.Module):
+    def __init__(self, dim: int, tables: int, comparisons: int, *, seed: int) -> None:
+        super().__init__()
+        self.layer = AbsDiffLUT(dim, 1, tables=tables, comparisons=comparisons, seed=seed)
+
+    def forward(self, x_i: Tensor, x_j: Tensor) -> Tensor:
+        return self.layer(x_i, x_j).squeeze(-1)
+
+    def chamber_stats(self, x_i: Tensor, x_j: Tensor) -> dict[str, float]:
+        with torch.no_grad():
+            _ = self.layer(x_i, x_j)
+            indices = self.layer._last_indices
+            if indices is None:
+                raise RuntimeError("AbsDiffLUT did not cache route indices")
+            return _index_stats(indices, self.layer.table_size)
+
+
 class RelationWalshScore(nn.Module):
     """Low-order score over cross relation bits.
 
@@ -624,7 +641,7 @@ def build_scorer(
     if family == "same_coord_bidir_lut":
         return SameCoordinateScoreLUT(cfg.dim, cfg.tables, cfg.comparisons, seed=cfg.seed, mode="bidir")
     if family == "absdiff_lut":
-        return SameCoordinateScoreLUT(cfg.dim, cfg.tables, cfg.comparisons, seed=cfg.seed, mode="absdiff")
+        return AbsDiffScoreLUT(cfg.dim, cfg.tables, cfg.comparisons, seed=cfg.seed)
     if family == "relation_walsh":
         return RelationWalshScore(cfg.dim, cfg.tables, cfg.comparisons, seed=cfg.seed)
     if family == "binary_code":
