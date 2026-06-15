@@ -33,6 +33,9 @@ class PairwiseLinear(RoutedLinearBase):
         cpu_lut_dtype: Literal["f32", "f16"] = "f32",
         accumulation: Literal["sum", "two_bank_max"] = "sum",
         max_group_size: int = 4,
+        slope_bank_rank: int = 0,
+        slope_bank_atom_init_std: float = 0.02,
+        slope_bank_coeff_init_std: float = 0.0,
     ) -> None:
         if tables < 1:
             raise ValueError(f"tables must be >= 1, got {tables}")
@@ -50,6 +53,16 @@ class PairwiseLinear(RoutedLinearBase):
             raise ValueError("PairwiseLinear accumulation='two_bank_max' currently supports backend='torch' only")
         if accumulation == "two_bank_max" and not use_min_margin_ste:
             raise ValueError("PairwiseLinear accumulation='two_bank_max' currently supports min-margin STE only")
+        if slope_bank_rank < 0:
+            raise ValueError(f"slope_bank_rank must be >= 0, got {slope_bank_rank}")
+        if slope_bank_rank > 0 and backend != "torch":
+            raise ValueError("PairwiseLinear slope bank currently supports backend='torch' only")
+        if slope_bank_rank > 0 and not use_min_margin_ste:
+            raise ValueError("PairwiseLinear slope bank currently supports min-margin STE only")
+        if slope_bank_atom_init_std < 0:
+            raise ValueError(f"slope_bank_atom_init_std must be >= 0, got {slope_bank_atom_init_std}")
+        if slope_bank_coeff_init_std < 0:
+            raise ValueError(f"slope_bank_coeff_init_std must be >= 0, got {slope_bank_coeff_init_std}")
         surrogate_gradient(torch.zeros((), dtype=torch.float32), surrogate)
 
         max_groups = (tables + max_group_size - 1) // max_group_size
@@ -67,6 +80,9 @@ class PairwiseLinear(RoutedLinearBase):
         self.accumulation = accumulation
         self.max_group_size = max_group_size
         self.max_groups = max_groups
+        self.slope_bank_rank = slope_bank_rank
+        self.slope_bank_atom_init_std = slope_bank_atom_init_std
+        self.slope_bank_coeff_init_std = slope_bank_coeff_init_std
         self._zig_lut_f16_cache: Tensor | None = None
         self._zig_lut_f16_cache_version = -1
 
@@ -97,6 +113,13 @@ class PairwiseLinear(RoutedLinearBase):
             self.lut = nn.Parameter(torch.zeros(tables, self.table_size, out_features))
         else:
             self.lut = nn.Parameter(torch.randn(tables, self.table_size, out_features) * lut_init_std)
+        if slope_bank_rank > 0:
+            self.slope_u = nn.Parameter(torch.randn(slope_bank_rank, in_features) * slope_bank_atom_init_std)
+            self.slope_v = nn.Parameter(torch.randn(slope_bank_rank, out_features) * slope_bank_atom_init_std)
+            if slope_bank_coeff_init_std == 0.0:
+                self.slope_coeff = nn.Parameter(torch.zeros(tables, self.table_size, slope_bank_rank))
+            else:
+                self.slope_coeff = nn.Parameter(torch.randn(tables, self.table_size, slope_bank_rank) * slope_bank_coeff_init_std)
         self.register_buffer("powers", 2 ** torch.arange(comparisons, dtype=torch.long))
 
     def extra_repr(self) -> str:
@@ -104,7 +127,7 @@ class PairwiseLinear(RoutedLinearBase):
             f"in_features={self.in_features}, out_features={self.out_features}, tables={self.tables}, "
             f"comparisons={self.comparisons}, backend={self.backend!r}, use_min_margin_ste={self.use_min_margin_ste}, "
             f"fixed_zero_threshold={self.fixed_zero_threshold}, surrogate={self.surrogate!r}, cpu_lut_dtype={self.cpu_lut_dtype!r}, "
-            f"accumulation={self.accumulation!r}, max_group_size={self.max_group_size}"
+            f"accumulation={self.accumulation!r}, max_group_size={self.max_group_size}, slope_bank_rank={self.slope_bank_rank}"
         )
 
     def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
@@ -156,6 +179,35 @@ class PairwiseLinear(RoutedLinearBase):
 
     def _lookup_sum(self, indices: Tensor, compute_dtype: torch.dtype) -> Tensor:
         return self._lookup_chunked(indices, compute_dtype=compute_dtype)
+
+    def _lookup_slope_bank(self, latent: Tensor, indices: Tensor, compute_dtype: torch.dtype) -> Tensor:
+        batch, seq, route_count = indices.shape
+        item_count = batch * seq
+        indices_flat = indices.reshape(item_count, route_count)
+        coeff_table = self.slope_coeff.to(dtype=compute_dtype, device=indices.device).reshape(
+            route_count * self.table_size,
+            self.slope_bank_rank,
+        )
+        route_chunk = self._route_chunk_size(
+            item_count=item_count,
+            payload_width=self.slope_bank_rank,
+            compute_dtype=compute_dtype,
+            route_count=route_count,
+        )
+        coeff_sum = torch.zeros(item_count, self.slope_bank_rank, device=indices.device, dtype=compute_dtype)
+
+        for route_start in range(0, route_count, route_chunk):
+            route_stop = min(route_start + route_chunk, route_count)
+            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
+            linear_idx = (indices_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
+            selected = coeff_table.index_select(0, linear_idx).view(item_count, route_stop - route_start, self.slope_bank_rank)
+            coeff_sum = coeff_sum + selected.sum(dim=1)
+
+        latent_flat = latent.reshape(item_count, self.in_features).to(dtype=compute_dtype)
+        atom_scalar = latent_flat.matmul(self.slope_u.to(dtype=compute_dtype, device=indices.device).t())
+        weighted = coeff_sum * atom_scalar
+        out = weighted.matmul(self.slope_v.to(dtype=compute_dtype, device=indices.device))
+        return out.view(batch, seq, self.out_features)
 
     def _lookup_two_bank_max(self, indices: Tensor, compute_dtype: torch.dtype) -> Tensor:
         batch, seq, route_count = indices.shape
@@ -222,6 +274,44 @@ class PairwiseLinear(RoutedLinearBase):
             corr = corr + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=1)
 
         return corr.view(batch, seq, self.out_features)
+
+    def _slope_bank_min_margin_ste(self, latent: Tensor, indices: Tensor, margins: Tensor) -> Tensor:
+        r_mins = margins.abs().argmin(dim=-1)
+        u_mins = margins.gather(dim=-1, index=r_mins.unsqueeze(-1)).squeeze(-1)
+        neighbor_indices = indices ^ (2**r_mins).long()
+        ste_delta = ste_heaviside(u_mins, self.surrogate) - (u_mins > 0).to(u_mins.dtype)
+
+        batch, seq, route_count = indices.shape
+        item_count = batch * seq
+        current_flat = indices.reshape(item_count, route_count)
+        neighbor_flat = neighbor_indices.reshape(item_count, route_count)
+        ste_flat = ste_delta.reshape(item_count, route_count, 1).float()
+        coeff_table = self.slope_coeff.to(dtype=torch.float32, device=indices.device).reshape(
+            route_count * self.table_size,
+            self.slope_bank_rank,
+        )
+        atom_scalar = latent.reshape(item_count, self.in_features).float().matmul(
+            self.slope_u.to(dtype=torch.float32, device=indices.device).t()
+        )
+        route_chunk = self._route_chunk_size(
+            item_count=item_count,
+            payload_width=self.slope_bank_rank,
+            compute_dtype=torch.float32,
+            route_count=route_count,
+        )
+        coeff_delta = torch.zeros(item_count, self.slope_bank_rank, device=indices.device, dtype=torch.float32)
+
+        for route_start in range(0, route_count, route_chunk):
+            route_stop = min(route_start + route_chunk, route_count)
+            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
+            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
+            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
+            current = coeff_table.index_select(0, current_idx).view(item_count, route_stop - route_start, self.slope_bank_rank)
+            neighbor = coeff_table.index_select(0, neighbor_idx).view(item_count, route_stop - route_start, self.slope_bank_rank)
+            coeff_delta = coeff_delta + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=1)
+
+        out = (coeff_delta * atom_scalar).matmul(self.slope_v.to(dtype=torch.float32, device=indices.device))
+        return out.view(batch, seq, self.out_features)
 
     def _full_ste(self, indices: Tensor, margins: Tensor) -> Tensor:
         batch, seq, route_count = indices.shape
@@ -344,14 +434,22 @@ class PairwiseLinear(RoutedLinearBase):
         indices, margins = self._compute_indices(latent)
         if self.accumulation == "two_bank_max":
             output = self._lookup_two_bank_max(indices, compute_dtype)
+            if self.slope_bank_rank > 0:
+                output = output + self._lookup_slope_bank(latent, indices, compute_dtype)
             if training and (latent.requires_grad or self.thresholds.requires_grad):
                 output = output + self._two_bank_min_margin_ste(indices, margins).to(output.dtype)
+                if self.slope_bank_rank > 0:
+                    output = output + self._slope_bank_min_margin_ste(latent, indices, margins).to(output.dtype)
             return output, indices, margins
 
         output = self._lookup_sum(indices, compute_dtype)
+        if self.slope_bank_rank > 0:
+            output = output + self._lookup_slope_bank(latent, indices, compute_dtype)
         if training and (latent.requires_grad or self.thresholds.requires_grad):
             ste_corr = self._min_margin_ste(indices, margins) if self.use_min_margin_ste else self._full_ste(indices, margins)
             output = output + ste_corr.to(output.dtype)
+            if self.slope_bank_rank > 0:
+                output = output + self._slope_bank_min_margin_ste(latent, indices, margins).to(output.dtype)
         return output, indices, margins
 
 

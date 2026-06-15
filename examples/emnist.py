@@ -113,6 +113,9 @@ def _make_layer(
     pairwise_lut_init_std: float,
     pairwise_lut_accumulation: str,
     pairwise_max_group_size: int,
+    pairwise_slope_bank_rank: int,
+    pairwise_slope_bank_atom_init_std: float,
+    pairwise_slope_bank_coeff_init_std: float,
     fixed_zero_threshold: bool,
     pairwise_route_premix: str,
     route_premix_block_size: int,
@@ -159,6 +162,9 @@ def _make_layer(
         lut_init_std=pairwise_lut_init_std,
         accumulation=pairwise_lut_accumulation,  # type: ignore[arg-type]
         max_group_size=pairwise_max_group_size,
+        slope_bank_rank=pairwise_slope_bank_rank,
+        slope_bank_atom_init_std=pairwise_slope_bank_atom_init_std,
+        slope_bank_coeff_init_std=pairwise_slope_bank_coeff_init_std,
         fixed_zero_threshold=fixed_zero_threshold,
         route_premix=pairwise_route_premix,
         block_size=route_premix_block_size,
@@ -435,6 +441,9 @@ class MultiHashStructuredPairwiseLayer(nn.Module):
         lut_init_std: float,
         accumulation: str,
         max_group_size: int,
+        slope_bank_rank: int,
+        slope_bank_atom_init_std: float,
+        slope_bank_coeff_init_std: float,
         fixed_zero_threshold: bool,
         block_size: int,
         hashes: int,
@@ -455,6 +464,9 @@ class MultiHashStructuredPairwiseLayer(nn.Module):
                 lut_init_std=lut_init_std,
                 accumulation=accumulation,  # type: ignore[arg-type]
                 max_group_size=max_group_size,
+                slope_bank_rank=slope_bank_rank,
+                slope_bank_atom_init_std=slope_bank_atom_init_std,
+                slope_bank_coeff_init_std=slope_bank_coeff_init_std,
                 fixed_zero_threshold=fixed_zero_threshold,
             )
             mix = BlockHadamardRouteMix(in_features, block_size=block_size, seed=branch_seed + 17)
@@ -480,6 +492,9 @@ def _make_pairwise_route_layer(
     lut_init_std: float,
     accumulation: str,
     max_group_size: int,
+    slope_bank_rank: int,
+    slope_bank_atom_init_std: float,
+    slope_bank_coeff_init_std: float,
     fixed_zero_threshold: bool,
     route_premix: str,
     block_size: int,
@@ -499,6 +514,9 @@ def _make_pairwise_route_layer(
             lut_init_std=lut_init_std,
             accumulation=accumulation,
             max_group_size=max_group_size,
+            slope_bank_rank=slope_bank_rank,
+            slope_bank_atom_init_std=slope_bank_atom_init_std,
+            slope_bank_coeff_init_std=slope_bank_coeff_init_std,
             fixed_zero_threshold=fixed_zero_threshold,
             block_size=block_size,
             hashes=hashes,
@@ -514,6 +532,9 @@ def _make_pairwise_route_layer(
         lut_init_std=lut_init_std,
         accumulation=accumulation,  # type: ignore[arg-type]
         max_group_size=max_group_size,
+        slope_bank_rank=slope_bank_rank,
+        slope_bank_atom_init_std=slope_bank_atom_init_std,
+        slope_bank_coeff_init_std=slope_bank_coeff_init_std,
         fixed_zero_threshold=fixed_zero_threshold,
     )
     if route_premix == "none":
@@ -571,6 +592,9 @@ class EmnistRoutedClassifier(nn.Module):
         pairwise_lut_init_std: float,
         pairwise_lut_accumulation: str,
         pairwise_max_group_size: int,
+        pairwise_slope_bank_rank: int,
+        pairwise_slope_bank_atom_init_std: float,
+        pairwise_slope_bank_coeff_init_std: float,
         fixed_zero_threshold: bool,
         pairwise_route_premix: str,
         route_premix_block_size: int,
@@ -612,6 +636,9 @@ class EmnistRoutedClassifier(nn.Module):
                 pairwise_lut_init_std=pairwise_lut_init_std,
                 pairwise_lut_accumulation=pairwise_lut_accumulation,
                 pairwise_max_group_size=pairwise_max_group_size,
+                pairwise_slope_bank_rank=pairwise_slope_bank_rank,
+                pairwise_slope_bank_atom_init_std=pairwise_slope_bank_atom_init_std,
+                pairwise_slope_bank_coeff_init_std=pairwise_slope_bank_coeff_init_std,
                 fixed_zero_threshold=fixed_zero_threshold,
                 pairwise_route_premix=pairwise_route_premix,
                 route_premix_block_size=route_premix_block_size,
@@ -646,34 +673,95 @@ class EmnistRoutedClassifier(nn.Module):
         return x.squeeze(1)
 
 
+def _emnist_routed_compat_kwargs(kwargs: dict) -> dict:
+    """Fill legacy EMNIST classifier wrapper kwargs used by tests/examples."""
+    kwargs = dict(kwargs)
+    if "heads" not in kwargs and "tables" in kwargs:
+        kwargs["heads"] = kwargs.pop("tables")
+    if "code_dim" not in kwargs and "rank" in kwargs:
+        kwargs["code_dim"] = kwargs.pop("rank")
+    kwargs.pop("groups", None)
+    kwargs.setdefault("heads", 4)
+    kwargs.setdefault("cells", 4)
+    kwargs.setdefault("code_dim", 16)
+    kwargs.setdefault("route_terms", 4)
+    kwargs.setdefault("fan_value_mode", "site")
+    kwargs.setdefault("fan_basis_rank", 4)
+    kwargs.setdefault("comparisons", 6)
+    kwargs.setdefault("pairwise_tables", kwargs.pop("tables", 72) if "tables" in kwargs else 72)
+    kwargs.setdefault("pairwise_lut_init_std", 0.0)
+    kwargs.setdefault("pairwise_lut_accumulation", "sum")
+    kwargs.setdefault("pairwise_max_group_size", 4)
+    kwargs.setdefault("pairwise_slope_bank_rank", 0)
+    kwargs.setdefault("pairwise_slope_bank_atom_init_std", 0.02)
+    kwargs.setdefault("pairwise_slope_bank_coeff_init_std", 0.0)
+    kwargs.setdefault("fixed_zero_threshold", False)
+    kwargs.setdefault("pairwise_route_premix", "none")
+    kwargs.setdefault("route_premix_block_size", 64)
+    kwargs.setdefault("route_premix_expander_fanout", 4)
+    kwargs.setdefault("route_premix_sparse_stages", 2)
+    kwargs.setdefault("route_premix_lowrank_rank", 4)
+    kwargs.setdefault("pairwise_hashes", 1)
+    kwargs.setdefault("walsh_order", 2)
+    kwargs.setdefault("backend", "torch")
+    return kwargs
+
+
+class EmnistLinearClassifier(nn.Module):
+    def __init__(self, *, input_dim: int, hidden_dim: int, num_classes: int, depth: int, seed: int = 0) -> None:
+        super().__init__()
+        torch.manual_seed(seed)
+        dims = [input_dim]
+        if depth == 1:
+            dims.append(num_classes)
+        else:
+            dims.extend([hidden_dim] * (depth - 1))
+            dims.append(num_classes)
+        layers: list[nn.Module] = []
+        for idx, (d_in, d_out) in enumerate(zip(dims[:-1], dims[1:])):
+            layers.append(nn.Linear(d_in, d_out))
+            if idx < len(dims) - 2:
+                layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
 class EmnistTropClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="tropical", **kwargs)
+        super().__init__(family="tropical", **_emnist_routed_compat_kwargs(kwargs))
 
 
 class EmnistTropLowRankClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="tropical_lowrank", **kwargs)
+        super().__init__(family="tropical_lowrank", **_emnist_routed_compat_kwargs(kwargs))
 
 
 class EmnistTropZeroDenseClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="tropical_zero_dense", **kwargs)
+        super().__init__(family="tropical_zero_dense", **_emnist_routed_compat_kwargs(kwargs))
 
 
 class EmnistTropFanZeroDenseClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="tropfan_zero_dense", **kwargs)
+        super().__init__(family="tropfan_zero_dense", **_emnist_routed_compat_kwargs(kwargs))
 
 
 class EmnistPairwiseClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="pairwise", **kwargs)
+        kwargs = dict(kwargs)
+        if "pairwise_tables" not in kwargs and "tables" in kwargs:
+            kwargs["pairwise_tables"] = kwargs.pop("tables")
+        super().__init__(family="pairwise", **_emnist_routed_compat_kwargs(kwargs))
 
 
 class EmnistPairwiseWalshClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
-        super().__init__(family="pairwise_walsh", **kwargs)
+        kwargs = dict(kwargs)
+        if "pairwise_tables" not in kwargs and "tables" in kwargs:
+            kwargs["pairwise_tables"] = kwargs.pop("tables")
+        super().__init__(family="pairwise_walsh", **_emnist_routed_compat_kwargs(kwargs))
 
 
 def _run_epoch(
@@ -731,6 +819,9 @@ def main() -> None:
         ("--pairwise-tables", int, 72),
         ("--pairwise-lut-init-std", float, 0.0),
         ("--pairwise-max-group-size", int, 4),
+        ("--pairwise-slope-bank-rank", int, 0),
+        ("--pairwise-slope-bank-atom-init-std", float, 0.02),
+        ("--pairwise-slope-bank-coeff-init-std", float, 0.0),
         ("--comparisons", int, 6),
     ):
         parser.add_argument(name, type=arg_type, default=default)
@@ -794,6 +885,9 @@ def main() -> None:
         pairwise_lut_init_std=args.pairwise_lut_init_std,
         pairwise_lut_accumulation=args.pairwise_lut_accumulation,
         pairwise_max_group_size=args.pairwise_max_group_size,
+        pairwise_slope_bank_rank=args.pairwise_slope_bank_rank,
+        pairwise_slope_bank_atom_init_std=args.pairwise_slope_bank_atom_init_std,
+        pairwise_slope_bank_coeff_init_std=args.pairwise_slope_bank_coeff_init_std,
         fixed_zero_threshold=args.fixed_zero_threshold,
         pairwise_route_premix=args.pairwise_route_premix,
         route_premix_block_size=args.route_premix_block_size,
@@ -826,6 +920,9 @@ def main() -> None:
         "pairwise_lut_init_std": args.pairwise_lut_init_std if args.family == "pairwise" else "-",
         "pairwise_lut_accum": args.pairwise_lut_accumulation if args.family == "pairwise" else "-",
         "pairwise_max_group": args.pairwise_max_group_size if args.family == "pairwise" and args.pairwise_lut_accumulation == "two_bank_max" else "-",
+        "slope_bank_rank": args.pairwise_slope_bank_rank if args.family == "pairwise" else "-",
+        "slope_atom_std": args.pairwise_slope_bank_atom_init_std if args.family == "pairwise" and args.pairwise_slope_bank_rank > 0 else "-",
+        "slope_coeff_std": args.pairwise_slope_bank_coeff_init_std if args.family == "pairwise" and args.pairwise_slope_bank_rank > 0 else "-",
         "comparisons": args.comparisons if args.family in {"pairwise", "pairwise_walsh"} else "-",
         "fixed_zero_threshold": args.fixed_zero_threshold if args.family == "pairwise" else "-",
         "common_bypass": args.common_mode_bypass if args.family == "pairwise" else "-",
