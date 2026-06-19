@@ -18,7 +18,19 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..layers import PairwiseLinear, PairwiseWalshLinear, TropFanZeroDenseLinear, TropLinear, TropZeroDenseLinear
+from ..layers import (
+    PairwiseAffineTwoBankLinear,
+    PairwiseDelayedHeadLinear,
+    PairwiseDelayedTableLinear,
+    PairwiseFoldingLinear,
+    PairwiseLinear,
+    PairwiseTableMixLinear,
+    PairwiseWalshLinear,
+    TropFanZeroDenseLinear,
+    TropLinear,
+    TropicalSawtoothLinear,
+    TropZeroDenseLinear,
+)
 
 IDX_DTYPES = {
     0x08: np.uint8,
@@ -29,9 +41,31 @@ IDX_DTYPES = {
     0x0E: np.dtype(">f8"),
 }
 EMNIST_SPLITS = ("byclass", "bymerge", "balanced", "letters", "digits", "mnist")
-ROUTED_FAMILIES = ("tropical", "tropical_lowrank", "tropical_zero_dense", "tropfan_zero_dense", "pairwise", "pairwise_walsh")
+ROUTED_FAMILIES = (
+    "mlp",
+    "tropical",
+    "tropical_lowrank",
+    "tropical_zero_dense",
+    "tropfan_zero_dense",
+    "tropical_sawtooth",
+    "pairwise",
+    "pairwise_folding",
+    "pairwise_affine_two_bank",
+    "pairwise_delayed_head",
+    "pairwise_delayed_table",
+    "pairwise_table_mix",
+    "pairwise_walsh",
+)
 TROPICAL_FAMILIES = ("tropical", "tropical_lowrank")
 HEAD_ROUTED_FAMILIES = ("tropical", "tropical_lowrank", "tropical_zero_dense", "tropfan_zero_dense")
+PAIRWISE_LUT_FAMILIES = (
+    "pairwise",
+    "pairwise_folding",
+    "pairwise_affine_two_bank",
+    "pairwise_delayed_head",
+    "pairwise_delayed_table",
+    "pairwise_table_mix",
+)
 PAIRWISE_ROUTE_PREMIXES = (
     "none",
     "block_hadamard",
@@ -108,6 +142,9 @@ def _make_layer(
     route_terms: int,
     fan_value_mode: str,
     fan_basis_rank: int,
+    sawtooth_bins: int,
+    sawtooth_bound: float,
+    sawtooth_slope_init: float,
     comparisons: int,
     pairwise_tables: int,
     pairwise_lut_init_std: float,
@@ -116,6 +153,16 @@ def _make_layer(
     pairwise_slope_bank_rank: int,
     pairwise_slope_bank_atom_init_std: float,
     pairwise_slope_bank_coeff_init_std: float,
+    pairwise_folding_alpha: float,
+    pairwise_folding_block_size: int,
+    pairwise_folding_sign_init_std: float,
+    pairwise_folding_mode: str,
+    pairwise_folding_perm_banks: int,
+    pairwise_delayed_head_dim: int,
+    pairwise_delayed_table_dim: int,
+    pairwise_table_mix: str,
+    pairwise_table_mix_rank: int,
+    pairwise_table_mix_init_std: float,
     fixed_zero_threshold: bool,
     pairwise_route_premix: str,
     route_premix_block_size: int,
@@ -142,6 +189,16 @@ def _make_layer(
             fan_basis_rank=fan_basis_rank,
             seed=seed,
         )
+    if family == "tropical_sawtooth":
+        return TropicalSawtoothLinear(
+            d_in,
+            d_out,
+            bins=sawtooth_bins,
+            bound=sawtooth_bound,
+            slope_init=sawtooth_slope_init,
+            backend=backend,
+            seed=seed,
+        )
     if family == "pairwise_walsh":
         return PairwiseWalshLinear(
             d_in,
@@ -151,6 +208,56 @@ def _make_layer(
             walsh_order=walsh_order,  # type: ignore[arg-type]
             backend=backend,
             seed=seed,
+        )
+    if family == "pairwise_delayed_head":
+        return PairwiseDelayedHeadLinear(
+            d_in,
+            d_out,
+            tables=pairwise_tables,
+            comparisons=comparisons,
+            head_dim=pairwise_delayed_head_dim,
+            backend=backend,
+            seed=seed,
+            lut_init_std=pairwise_lut_init_std,
+            fixed_zero_threshold=fixed_zero_threshold,
+            fold_alpha=pairwise_folding_alpha,
+            sign_init_std=pairwise_folding_sign_init_std,
+        )
+    if family == "pairwise_delayed_table":
+        return PairwiseDelayedTableLinear(
+            d_in,
+            d_out,
+            tables=pairwise_tables,
+            comparisons=comparisons,
+            head_dim=pairwise_delayed_table_dim,
+            table_mix=pairwise_table_mix,  # type: ignore[arg-type]
+            table_mix_rank=pairwise_table_mix_rank,
+            table_mix_init_std=pairwise_table_mix_init_std,
+            backend=backend,
+            seed=seed,
+            lut_init_std=pairwise_lut_init_std,
+            fixed_zero_threshold=fixed_zero_threshold,
+            fold_alpha=pairwise_folding_alpha,
+            sign_init_std=pairwise_folding_sign_init_std,
+        )
+    if family == "pairwise_table_mix":
+        return PairwiseTableMixLinear(
+            d_in,
+            d_out,
+            tables=pairwise_tables,
+            comparisons=comparisons,
+            table_mix=pairwise_table_mix,  # type: ignore[arg-type]
+            table_mix_rank=pairwise_table_mix_rank,
+            table_mix_init_std=pairwise_table_mix_init_std,
+            backend=backend,
+            seed=seed,
+            lut_init_std=pairwise_lut_init_std,
+            accumulation=pairwise_lut_accumulation,  # type: ignore[arg-type]
+            max_group_size=pairwise_max_group_size,
+            slope_bank_rank=pairwise_slope_bank_rank,
+            slope_bank_atom_init_std=pairwise_slope_bank_atom_init_std,
+            slope_bank_coeff_init_std=pairwise_slope_bank_coeff_init_std,
+            fixed_zero_threshold=fixed_zero_threshold,
         )
     return _make_pairwise_route_layer(
         d_in,
@@ -165,6 +272,13 @@ def _make_layer(
         slope_bank_rank=pairwise_slope_bank_rank,
         slope_bank_atom_init_std=pairwise_slope_bank_atom_init_std,
         slope_bank_coeff_init_std=pairwise_slope_bank_coeff_init_std,
+        affine_two_bank=family == "pairwise_affine_two_bank",
+        folding=family == "pairwise_folding",
+        folding_alpha=pairwise_folding_alpha,
+        folding_block_size=pairwise_folding_block_size,
+        folding_sign_init_std=pairwise_folding_sign_init_std,
+        folding_mode=pairwise_folding_mode,
+        folding_perm_banks=pairwise_folding_perm_banks,
         fixed_zero_threshold=fixed_zero_threshold,
         route_premix=pairwise_route_premix,
         block_size=route_premix_block_size,
@@ -444,6 +558,13 @@ class MultiHashStructuredPairwiseLayer(nn.Module):
         slope_bank_rank: int,
         slope_bank_atom_init_std: float,
         slope_bank_coeff_init_std: float,
+        affine_two_bank: bool,
+        folding: bool,
+        folding_alpha: float,
+        folding_block_size: int,
+        folding_sign_init_std: float,
+        folding_mode: str,
+        folding_perm_banks: int,
         fixed_zero_threshold: bool,
         block_size: int,
         hashes: int,
@@ -454,21 +575,60 @@ class MultiHashStructuredPairwiseLayer(nn.Module):
         branches: list[nn.Module] = []
         for hash_idx in range(hashes):
             branch_seed = seed + hash_idx * 1009
-            layer = PairwiseLinear(
-                in_features,
-                out_features,
-                tables=tables,
-                comparisons=comparisons,
-                backend=backend,
-                seed=branch_seed,
-                lut_init_std=lut_init_std,
-                accumulation=accumulation,  # type: ignore[arg-type]
-                max_group_size=max_group_size,
-                slope_bank_rank=slope_bank_rank,
-                slope_bank_atom_init_std=slope_bank_atom_init_std,
-                slope_bank_coeff_init_std=slope_bank_coeff_init_std,
-                fixed_zero_threshold=fixed_zero_threshold,
-            )
+            if affine_two_bank:
+                layer = PairwiseAffineTwoBankLinear(
+                    in_features,
+                    out_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    backend=backend,
+                    seed=branch_seed,
+                    lut_init_std=lut_init_std,
+                    max_group_size=max_group_size,
+                    fixed_zero_threshold=fixed_zero_threshold,
+                    fold_alpha=folding_alpha,
+                    fold_block_size=folding_block_size,
+                    fold_sign_init_std=folding_sign_init_std,
+                )
+            elif folding:
+                layer_kwargs = dict(
+                    tables=tables,
+                    comparisons=comparisons,
+                    backend=backend,
+                    seed=branch_seed,
+                    lut_init_std=lut_init_std,
+                    accumulation=accumulation,  # type: ignore[arg-type]
+                    max_group_size=max_group_size,
+                    slope_bank_rank=slope_bank_rank,
+                    slope_bank_atom_init_std=slope_bank_atom_init_std,
+                    slope_bank_coeff_init_std=slope_bank_coeff_init_std,
+                    fixed_zero_threshold=fixed_zero_threshold,
+                )
+                layer = PairwiseFoldingLinear(
+                    in_features,
+                    out_features,
+                    **layer_kwargs,
+                    fold_alpha=folding_alpha,
+                    fold_block_size=folding_block_size,
+                    fold_sign_init_std=folding_sign_init_std,
+                    fold_mode=folding_mode,  # type: ignore[arg-type]
+                    fold_perm_banks=folding_perm_banks,
+                )
+            else:
+                layer_kwargs = dict(
+                    tables=tables,
+                    comparisons=comparisons,
+                    backend=backend,
+                    seed=branch_seed,
+                    lut_init_std=lut_init_std,
+                    accumulation=accumulation,  # type: ignore[arg-type]
+                    max_group_size=max_group_size,
+                    slope_bank_rank=slope_bank_rank,
+                    slope_bank_atom_init_std=slope_bank_atom_init_std,
+                    slope_bank_coeff_init_std=slope_bank_coeff_init_std,
+                    fixed_zero_threshold=fixed_zero_threshold,
+                )
+                layer = PairwiseLinear(in_features, out_features, **layer_kwargs)
             mix = BlockHadamardRouteMix(in_features, block_size=block_size, seed=branch_seed + 17)
             branches.append(RoutePreMixPairwiseLayer(mix, layer))
         self.branches = nn.ModuleList(branches)
@@ -495,6 +655,13 @@ def _make_pairwise_route_layer(
     slope_bank_rank: int,
     slope_bank_atom_init_std: float,
     slope_bank_coeff_init_std: float,
+    affine_two_bank: bool,
+    folding: bool,
+    folding_alpha: float,
+    folding_block_size: int,
+    folding_sign_init_std: float,
+    folding_mode: str,
+    folding_perm_banks: int,
     fixed_zero_threshold: bool,
     route_premix: str,
     block_size: int,
@@ -517,26 +684,72 @@ def _make_pairwise_route_layer(
             slope_bank_rank=slope_bank_rank,
             slope_bank_atom_init_std=slope_bank_atom_init_std,
             slope_bank_coeff_init_std=slope_bank_coeff_init_std,
+            affine_two_bank=affine_two_bank,
+            folding=folding,
+            folding_alpha=folding_alpha,
+            folding_block_size=folding_block_size,
+            folding_sign_init_std=folding_sign_init_std,
+            folding_mode=folding_mode,
+            folding_perm_banks=folding_perm_banks,
             fixed_zero_threshold=fixed_zero_threshold,
             block_size=block_size,
             hashes=hashes,
         )
 
-    layer = PairwiseLinear(
-        d_in,
-        d_out,
-        tables=tables,
-        comparisons=comparisons,
-        backend=backend,
-        seed=seed,
-        lut_init_std=lut_init_std,
-        accumulation=accumulation,  # type: ignore[arg-type]
-        max_group_size=max_group_size,
-        slope_bank_rank=slope_bank_rank,
-        slope_bank_atom_init_std=slope_bank_atom_init_std,
-        slope_bank_coeff_init_std=slope_bank_coeff_init_std,
-        fixed_zero_threshold=fixed_zero_threshold,
-    )
+    if affine_two_bank:
+        layer = PairwiseAffineTwoBankLinear(
+            d_in,
+            d_out,
+            tables=tables,
+            comparisons=comparisons,
+            backend=backend,
+            seed=seed,
+            lut_init_std=lut_init_std,
+            max_group_size=max_group_size,
+            fixed_zero_threshold=fixed_zero_threshold,
+            fold_alpha=folding_alpha,
+            fold_block_size=folding_block_size,
+            fold_sign_init_std=folding_sign_init_std,
+        )
+    elif folding:
+        layer_kwargs = dict(
+            tables=tables,
+            comparisons=comparisons,
+            backend=backend,
+            seed=seed,
+            lut_init_std=lut_init_std,
+            accumulation=accumulation,  # type: ignore[arg-type]
+            max_group_size=max_group_size,
+            slope_bank_rank=slope_bank_rank,
+            slope_bank_atom_init_std=slope_bank_atom_init_std,
+            slope_bank_coeff_init_std=slope_bank_coeff_init_std,
+            fixed_zero_threshold=fixed_zero_threshold,
+        )
+        layer = PairwiseFoldingLinear(
+            d_in,
+            d_out,
+            **layer_kwargs,
+            fold_alpha=folding_alpha,
+            fold_block_size=folding_block_size,
+            fold_sign_init_std=folding_sign_init_std,
+            fold_mode=folding_mode,  # type: ignore[arg-type]
+            fold_perm_banks=folding_perm_banks,
+        )
+    else:
+        layer_kwargs = dict(
+            tables=tables,
+            comparisons=comparisons,
+            backend=backend,
+            seed=seed,
+            lut_init_std=lut_init_std,
+            accumulation=accumulation,  # type: ignore[arg-type]
+            max_group_size=max_group_size,
+            slope_bank_rank=slope_bank_rank,
+            slope_bank_atom_init_std=slope_bank_atom_init_std,
+            slope_bank_coeff_init_std=slope_bank_coeff_init_std,
+            fixed_zero_threshold=fixed_zero_threshold,
+        )
+        layer = PairwiseLinear(d_in, d_out, **layer_kwargs)
     if route_premix == "none":
         return layer
     if route_premix == "block_hadamard":
@@ -587,6 +800,9 @@ class EmnistRoutedClassifier(nn.Module):
         route_terms: int,
         fan_value_mode: str,
         fan_basis_rank: int,
+        sawtooth_bins: int,
+        sawtooth_bound: float,
+        sawtooth_slope_init: float,
         comparisons: int,
         pairwise_tables: int,
         pairwise_lut_init_std: float,
@@ -595,6 +811,16 @@ class EmnistRoutedClassifier(nn.Module):
         pairwise_slope_bank_rank: int,
         pairwise_slope_bank_atom_init_std: float,
         pairwise_slope_bank_coeff_init_std: float,
+        pairwise_folding_alpha: float,
+        pairwise_folding_block_size: int,
+        pairwise_folding_sign_init_std: float,
+        pairwise_folding_mode: str,
+        pairwise_folding_perm_banks: int,
+        pairwise_delayed_head_dim: int,
+        pairwise_delayed_table_dim: int,
+        pairwise_table_mix: str,
+        pairwise_table_mix_rank: int,
+        pairwise_table_mix_init_std: float,
         fixed_zero_threshold: bool,
         pairwise_route_premix: str,
         route_premix_block_size: int,
@@ -631,6 +857,9 @@ class EmnistRoutedClassifier(nn.Module):
                 route_terms=route_terms,
                 fan_value_mode=fan_value_mode,
                 fan_basis_rank=fan_basis_rank,
+                sawtooth_bins=sawtooth_bins,
+                sawtooth_bound=sawtooth_bound,
+                sawtooth_slope_init=sawtooth_slope_init,
                 comparisons=comparisons,
                 pairwise_tables=pairwise_tables,
                 pairwise_lut_init_std=pairwise_lut_init_std,
@@ -639,6 +868,16 @@ class EmnistRoutedClassifier(nn.Module):
                 pairwise_slope_bank_rank=pairwise_slope_bank_rank,
                 pairwise_slope_bank_atom_init_std=pairwise_slope_bank_atom_init_std,
                 pairwise_slope_bank_coeff_init_std=pairwise_slope_bank_coeff_init_std,
+                pairwise_folding_alpha=pairwise_folding_alpha,
+                pairwise_folding_block_size=pairwise_folding_block_size,
+                pairwise_folding_sign_init_std=pairwise_folding_sign_init_std,
+                pairwise_folding_mode=pairwise_folding_mode,
+                pairwise_folding_perm_banks=pairwise_folding_perm_banks,
+                pairwise_delayed_head_dim=pairwise_delayed_head_dim,
+                pairwise_delayed_table_dim=pairwise_delayed_table_dim,
+                pairwise_table_mix=pairwise_table_mix,
+                pairwise_table_mix_rank=pairwise_table_mix_rank,
+                pairwise_table_mix_init_std=pairwise_table_mix_init_std,
                 fixed_zero_threshold=fixed_zero_threshold,
                 pairwise_route_premix=pairwise_route_premix,
                 route_premix_block_size=route_premix_block_size,
@@ -650,7 +889,7 @@ class EmnistRoutedClassifier(nn.Module):
                 backend=backend,
                 seed=seed + idx,
             )
-            if common_mode_bypass and family == "pairwise":
+            if common_mode_bypass and family in PAIRWISE_LUT_FAMILIES:
                 layer = CommonModeBypassLayer(layer, out_features=d_out)
             layers.append(layer)
         self.layers = nn.ModuleList(layers)
@@ -687,6 +926,9 @@ def _emnist_routed_compat_kwargs(kwargs: dict) -> dict:
     kwargs.setdefault("route_terms", 4)
     kwargs.setdefault("fan_value_mode", "site")
     kwargs.setdefault("fan_basis_rank", 4)
+    kwargs.setdefault("sawtooth_bins", 8)
+    kwargs.setdefault("sawtooth_bound", 2.0)
+    kwargs.setdefault("sawtooth_slope_init", 1.0)
     kwargs.setdefault("comparisons", 6)
     kwargs.setdefault("pairwise_tables", kwargs.pop("tables", 72) if "tables" in kwargs else 72)
     kwargs.setdefault("pairwise_lut_init_std", 0.0)
@@ -695,6 +937,16 @@ def _emnist_routed_compat_kwargs(kwargs: dict) -> dict:
     kwargs.setdefault("pairwise_slope_bank_rank", 0)
     kwargs.setdefault("pairwise_slope_bank_atom_init_std", 0.02)
     kwargs.setdefault("pairwise_slope_bank_coeff_init_std", 0.0)
+    kwargs.setdefault("pairwise_folding_alpha", 0.1)
+    kwargs.setdefault("pairwise_folding_block_size", 8)
+    kwargs.setdefault("pairwise_folding_sign_init_std", 0.02)
+    kwargs.setdefault("pairwise_folding_mode", "sign")
+    kwargs.setdefault("pairwise_folding_perm_banks", 8)
+    kwargs.setdefault("pairwise_delayed_head_dim", 8)
+    kwargs.setdefault("pairwise_delayed_table_dim", 8)
+    kwargs.setdefault("pairwise_table_mix", "none")
+    kwargs.setdefault("pairwise_table_mix_rank", 4)
+    kwargs.setdefault("pairwise_table_mix_init_std", 0.02)
     kwargs.setdefault("fixed_zero_threshold", False)
     kwargs.setdefault("pairwise_route_premix", "none")
     kwargs.setdefault("route_premix_block_size", 64)
@@ -748,12 +1000,57 @@ class EmnistTropFanZeroDenseClassifier(EmnistRoutedClassifier):
         super().__init__(family="tropfan_zero_dense", **_emnist_routed_compat_kwargs(kwargs))
 
 
+class EmnistTropicalSawtoothClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(family="tropical_sawtooth", **_emnist_routed_compat_kwargs(kwargs))
+
+
 class EmnistPairwiseClassifier(EmnistRoutedClassifier):
     def __init__(self, **kwargs) -> None:
         kwargs = dict(kwargs)
         if "pairwise_tables" not in kwargs and "tables" in kwargs:
             kwargs["pairwise_tables"] = kwargs.pop("tables")
         super().__init__(family="pairwise", **_emnist_routed_compat_kwargs(kwargs))
+
+
+class EmnistPairwiseFoldingClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        kwargs = dict(kwargs)
+        if "pairwise_tables" not in kwargs and "tables" in kwargs:
+            kwargs["pairwise_tables"] = kwargs.pop("tables")
+        super().__init__(family="pairwise_folding", **_emnist_routed_compat_kwargs(kwargs))
+
+
+class EmnistPairwiseAffineTwoBankClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        kwargs = dict(kwargs)
+        if "pairwise_tables" not in kwargs and "tables" in kwargs:
+            kwargs["pairwise_tables"] = kwargs.pop("tables")
+        super().__init__(family="pairwise_affine_two_bank", **_emnist_routed_compat_kwargs(kwargs))
+
+
+class EmnistPairwiseDelayedHeadClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        kwargs = dict(kwargs)
+        if "pairwise_tables" not in kwargs and "tables" in kwargs:
+            kwargs["pairwise_tables"] = kwargs.pop("tables")
+        super().__init__(family="pairwise_delayed_head", **_emnist_routed_compat_kwargs(kwargs))
+
+
+class EmnistPairwiseDelayedTableClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        kwargs = dict(kwargs)
+        if "pairwise_tables" not in kwargs and "tables" in kwargs:
+            kwargs["pairwise_tables"] = kwargs.pop("tables")
+        super().__init__(family="pairwise_delayed_table", **_emnist_routed_compat_kwargs(kwargs))
+
+
+class EmnistPairwiseTableMixClassifier(EmnistRoutedClassifier):
+    def __init__(self, **kwargs) -> None:
+        kwargs = dict(kwargs)
+        if "pairwise_tables" not in kwargs and "tables" in kwargs:
+            kwargs["pairwise_tables"] = kwargs.pop("tables")
+        super().__init__(family="pairwise_table_mix", **_emnist_routed_compat_kwargs(kwargs))
 
 
 class EmnistPairwiseWalshClassifier(EmnistRoutedClassifier):
@@ -816,15 +1113,28 @@ def main() -> None:
         ("--code-dim", int, 32),
         ("--route-terms", int, 2),
         ("--fan-basis-rank", int, 16),
+        ("--sawtooth-bins", int, 8),
+        ("--sawtooth-bound", float, 2.0),
+        ("--sawtooth-slope-init", float, 1.0),
         ("--pairwise-tables", int, 72),
         ("--pairwise-lut-init-std", float, 0.0),
         ("--pairwise-max-group-size", int, 4),
         ("--pairwise-slope-bank-rank", int, 0),
         ("--pairwise-slope-bank-atom-init-std", float, 0.02),
         ("--pairwise-slope-bank-coeff-init-std", float, 0.0),
+        ("--pairwise-folding-alpha", float, 0.1),
+        ("--pairwise-folding-block-size", int, 8),
+        ("--pairwise-folding-sign-init-std", float, 0.02),
+        ("--pairwise-folding-perm-banks", int, 8),
+        ("--pairwise-delayed-head-dim", int, 8),
+        ("--pairwise-delayed-table-dim", int, 8),
+        ("--pairwise-table-mix-rank", int, 4),
+        ("--pairwise-table-mix-init-std", float, 0.02),
         ("--comparisons", int, 6),
     ):
         parser.add_argument(name, type=arg_type, default=default)
+    parser.add_argument("--pairwise-folding-mode", choices=("sign", "perm_bank"), default="sign")
+    parser.add_argument("--pairwise-table-mix", choices=("none", "random_scatter", "diag", "butterfly", "lowrank", "dense"), default="none")
     parser.add_argument("--walsh-order", type=int, choices=(1, 2), default=2)
     parser.add_argument("--backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
     parser.add_argument("--fan-value-mode", choices=("site", "basis"), default="site")
@@ -868,39 +1178,61 @@ def main() -> None:
         permute_seed=args.permute_seed,
     )
     num_classes = int(max(y_train.max().item(), y_test.max().item()) + 1)
-    model = EmnistRoutedClassifier(
-        family=args.family,
-        input_dim=x_train.shape[1],
-        hidden_dim=args.hidden_dim,
-        num_classes=num_classes,
-        depth=args.depth,
-        heads=args.heads,
-        cells=args.cells,
-        code_dim=args.code_dim,
-        route_terms=args.route_terms,
-        fan_value_mode=args.fan_value_mode,
-        fan_basis_rank=args.fan_basis_rank,
-        comparisons=args.comparisons,
-        pairwise_tables=args.pairwise_tables,
-        pairwise_lut_init_std=args.pairwise_lut_init_std,
-        pairwise_lut_accumulation=args.pairwise_lut_accumulation,
-        pairwise_max_group_size=args.pairwise_max_group_size,
-        pairwise_slope_bank_rank=args.pairwise_slope_bank_rank,
-        pairwise_slope_bank_atom_init_std=args.pairwise_slope_bank_atom_init_std,
-        pairwise_slope_bank_coeff_init_std=args.pairwise_slope_bank_coeff_init_std,
-        fixed_zero_threshold=args.fixed_zero_threshold,
-        pairwise_route_premix=args.pairwise_route_premix,
-        route_premix_block_size=args.route_premix_block_size,
-        route_premix_expander_fanout=args.route_premix_expander_fanout,
-        route_premix_sparse_stages=args.route_premix_sparse_stages,
-        route_premix_lowrank_rank=args.route_premix_lowrank_rank,
-        pairwise_hashes=args.pairwise_hashes,
-        walsh_order=args.walsh_order,
-        backend=args.backend,
-        seed=args.seed,
-        residual=args.residual,
-        common_mode_bypass=args.common_mode_bypass,
-    ).to(device)
+    if args.family == "mlp":
+        model = EmnistLinearClassifier(
+            input_dim=x_train.shape[1],
+            hidden_dim=args.hidden_dim,
+            num_classes=num_classes,
+            depth=args.depth,
+            seed=args.seed,
+        ).to(device)
+    else:
+        model = EmnistRoutedClassifier(
+            family=args.family,
+            input_dim=x_train.shape[1],
+            hidden_dim=args.hidden_dim,
+            num_classes=num_classes,
+            depth=args.depth,
+            heads=args.heads,
+            cells=args.cells,
+            code_dim=args.code_dim,
+            route_terms=args.route_terms,
+            fan_value_mode=args.fan_value_mode,
+            fan_basis_rank=args.fan_basis_rank,
+            sawtooth_bins=args.sawtooth_bins,
+            sawtooth_bound=args.sawtooth_bound,
+            sawtooth_slope_init=args.sawtooth_slope_init,
+            comparisons=args.comparisons,
+            pairwise_tables=args.pairwise_tables,
+            pairwise_lut_init_std=args.pairwise_lut_init_std,
+            pairwise_lut_accumulation=args.pairwise_lut_accumulation,
+            pairwise_max_group_size=args.pairwise_max_group_size,
+            pairwise_slope_bank_rank=args.pairwise_slope_bank_rank,
+            pairwise_slope_bank_atom_init_std=args.pairwise_slope_bank_atom_init_std,
+            pairwise_slope_bank_coeff_init_std=args.pairwise_slope_bank_coeff_init_std,
+            pairwise_folding_alpha=args.pairwise_folding_alpha,
+            pairwise_folding_block_size=args.pairwise_folding_block_size,
+            pairwise_folding_sign_init_std=args.pairwise_folding_sign_init_std,
+            pairwise_folding_mode=args.pairwise_folding_mode,
+            pairwise_folding_perm_banks=args.pairwise_folding_perm_banks,
+            pairwise_delayed_head_dim=args.pairwise_delayed_head_dim,
+            pairwise_delayed_table_dim=args.pairwise_delayed_table_dim,
+            pairwise_table_mix=args.pairwise_table_mix,
+            pairwise_table_mix_rank=args.pairwise_table_mix_rank,
+            pairwise_table_mix_init_std=args.pairwise_table_mix_init_std,
+            fixed_zero_threshold=args.fixed_zero_threshold,
+            pairwise_route_premix=args.pairwise_route_premix,
+            route_premix_block_size=args.route_premix_block_size,
+            route_premix_expander_fanout=args.route_premix_expander_fanout,
+            route_premix_sparse_stages=args.route_premix_sparse_stages,
+            route_premix_lowrank_rank=args.route_premix_lowrank_rank,
+            pairwise_hashes=args.pairwise_hashes,
+            walsh_order=args.walsh_order,
+            backend=args.backend,
+            seed=args.seed,
+            residual=args.residual,
+            common_mode_bypass=args.common_mode_bypass,
+        ).to(device)
     train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(TensorDataset(x_test, y_test), batch_size=args.batch_size, shuffle=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
@@ -916,24 +1248,62 @@ def main() -> None:
         "route_terms": args.route_terms if args.family == "tropical_zero_dense" else "-",
         "fan_value_mode": args.fan_value_mode if args.family == "tropfan_zero_dense" else "-",
         "fan_basis_rank": args.fan_basis_rank if args.family == "tropfan_zero_dense" else "-",
-        "pairwise_tables": args.pairwise_tables if args.family in {"pairwise", "pairwise_walsh"} else "-",
-        "pairwise_lut_init_std": args.pairwise_lut_init_std if args.family == "pairwise" else "-",
-        "pairwise_lut_accum": args.pairwise_lut_accumulation if args.family == "pairwise" else "-",
-        "pairwise_max_group": args.pairwise_max_group_size if args.family == "pairwise" and args.pairwise_lut_accumulation == "two_bank_max" else "-",
-        "slope_bank_rank": args.pairwise_slope_bank_rank if args.family == "pairwise" else "-",
-        "slope_atom_std": args.pairwise_slope_bank_atom_init_std if args.family == "pairwise" and args.pairwise_slope_bank_rank > 0 else "-",
-        "slope_coeff_std": args.pairwise_slope_bank_coeff_init_std if args.family == "pairwise" and args.pairwise_slope_bank_rank > 0 else "-",
-        "comparisons": args.comparisons if args.family in {"pairwise", "pairwise_walsh"} else "-",
-        "fixed_zero_threshold": args.fixed_zero_threshold if args.family == "pairwise" else "-",
-        "common_bypass": args.common_mode_bypass if args.family == "pairwise" else "-",
-        "route_premix": args.pairwise_route_premix if args.family == "pairwise" else "-",
-        "premix_block": args.route_premix_block_size if args.family == "pairwise" else "-",
-        "premix_fanout": args.route_premix_expander_fanout if args.family == "pairwise" else "-",
-        "premix_stages": args.route_premix_sparse_stages if args.family == "pairwise" and args.pairwise_route_premix == "sparse_product" else "-",
-        "premix_rank": args.route_premix_lowrank_rank if args.family == "pairwise" and args.pairwise_route_premix == "lowrank" else "-",
-        "pairwise_hashes": args.pairwise_hashes if args.family == "pairwise" and args.pairwise_route_premix == "multi_hash_structured" else "-",
+        "sawtooth_bins": args.sawtooth_bins if args.family == "tropical_sawtooth" else "-",
+        "sawtooth_bound": args.sawtooth_bound if args.family == "tropical_sawtooth" else "-",
+        "sawtooth_slope": args.sawtooth_slope_init if args.family == "tropical_sawtooth" else "-",
+        "pairwise_tables": args.pairwise_tables if args.family in PAIRWISE_LUT_FAMILIES or args.family == "pairwise_walsh" else "-",
+        "pairwise_lut_init_std": args.pairwise_lut_init_std if args.family in PAIRWISE_LUT_FAMILIES else "-",
+        "pairwise_lut_accum": args.pairwise_lut_accumulation if args.family in PAIRWISE_LUT_FAMILIES else "-",
+        "pairwise_max_group": args.pairwise_max_group_size
+        if args.family in PAIRWISE_LUT_FAMILIES and args.pairwise_lut_accumulation == "two_bank_max"
+        else "-",
+        "slope_bank_rank": args.pairwise_slope_bank_rank if args.family in PAIRWISE_LUT_FAMILIES else "-",
+        "slope_atom_std": args.pairwise_slope_bank_atom_init_std
+        if args.family in PAIRWISE_LUT_FAMILIES and args.pairwise_slope_bank_rank > 0
+        else "-",
+        "slope_coeff_std": args.pairwise_slope_bank_coeff_init_std
+        if args.family in PAIRWISE_LUT_FAMILIES and args.pairwise_slope_bank_rank > 0
+        else "-",
+        "affine_two_bank": args.family == "pairwise_affine_two_bank" if args.family in PAIRWISE_LUT_FAMILIES else "-",
+        "folding_alpha": args.pairwise_folding_alpha
+        if args.family in {"pairwise_folding", "pairwise_affine_two_bank", "pairwise_delayed_head", "pairwise_delayed_table"}
+        else "-",
+        "folding_block": args.pairwise_folding_block_size if args.family in {"pairwise_folding", "pairwise_affine_two_bank"} else "-",
+        "folding_sign_std": args.pairwise_folding_sign_init_std
+        if args.family in {"pairwise_folding", "pairwise_affine_two_bank", "pairwise_delayed_head", "pairwise_delayed_table"}
+        else "-",
+        "folding_mode": args.pairwise_folding_mode if args.family == "pairwise_folding" else "-",
+        "folding_perm_banks": args.pairwise_folding_perm_banks
+        if args.family == "pairwise_folding" and args.pairwise_folding_mode == "perm_bank"
+        else "-",
+        "delayed_head_dim": args.pairwise_delayed_head_dim if args.family == "pairwise_delayed_head" else "-",
+        "delayed_table_dim": args.pairwise_delayed_table_dim if args.family == "pairwise_delayed_table" else "-",
+        "table_mix": args.pairwise_table_mix if args.family in {"pairwise_delayed_table", "pairwise_table_mix"} else "-",
+        "table_mix_rank": args.pairwise_table_mix_rank
+        if args.family in {"pairwise_delayed_table", "pairwise_table_mix"} and args.pairwise_table_mix == "lowrank"
+        else "-",
+        "table_mix_std": args.pairwise_table_mix_init_std
+        if args.family in {"pairwise_delayed_table", "pairwise_table_mix"} and args.pairwise_table_mix == "butterfly"
+        else "-",
+        "comparisons": args.comparisons if args.family in PAIRWISE_LUT_FAMILIES or args.family == "pairwise_walsh" else "-",
+        "fixed_zero_threshold": args.fixed_zero_threshold if args.family in PAIRWISE_LUT_FAMILIES else "-",
+        "common_bypass": args.common_mode_bypass if args.family in PAIRWISE_LUT_FAMILIES else "-",
+        "route_premix": args.pairwise_route_premix if args.family in PAIRWISE_LUT_FAMILIES else "-",
+        "premix_block": args.route_premix_block_size if args.family in PAIRWISE_LUT_FAMILIES else "-",
+        "premix_fanout": args.route_premix_expander_fanout if args.family in PAIRWISE_LUT_FAMILIES else "-",
+        "premix_stages": args.route_premix_sparse_stages
+        if args.family in PAIRWISE_LUT_FAMILIES and args.pairwise_route_premix == "sparse_product"
+        else "-",
+        "premix_rank": args.route_premix_lowrank_rank
+        if args.family in PAIRWISE_LUT_FAMILIES and args.pairwise_route_premix == "lowrank"
+        else "-",
+        "pairwise_hashes": args.pairwise_hashes
+        if args.family in PAIRWISE_LUT_FAMILIES and args.pairwise_route_premix == "multi_hash_structured"
+        else "-",
         "walsh_order": args.walsh_order if args.family == "pairwise_walsh" else "-",
-        "backend": args.backend if args.family in TROPICAL_FAMILIES or args.family in {"pairwise", "pairwise_walsh"} else "torch",
+        "backend": args.backend
+        if args.family in TROPICAL_FAMILIES or args.family in PAIRWISE_LUT_FAMILIES or args.family == "pairwise_walsh"
+        else "torch",
         "residual": args.residual,
         "train/test": f"{len(x_train)}/{len(x_test)}",
         "device": device.type,

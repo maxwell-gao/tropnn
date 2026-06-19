@@ -2,6 +2,9 @@ from .layers import (
     FAN_RECOVERY_MODES,
     FAN_VALUE_MODES,
     AbsDiffLUT,
+    PairwiseAffineTwoBankLinear,
+    PairwiseDelayedHeadLinear,
+    PairwiseFoldingLinear,
     PairwiseLinear,
     PairwiseWalshLinear,
     RoutedLinearBase,
@@ -9,13 +12,18 @@ from .layers import (
     TropFanZeroDenseLinear,
     TropLinear,
     TropZeroDenseLinear,
+    TropicalSawtoothLinear,
 )
 
 __all__ = [
     "RoutedLinearBase",
     "AbsDiffLUT",
+    "PairwiseAffineTwoBankLinear",
+    "PairwiseDelayedHeadLinear",
+    "PairwiseFoldingLinear",
     "PairwiseLinear",
     "PairwiseWalshLinear",
+    "TropicalSawtoothLinear",
     "TropLinear",
     "TropZeroDenseLinear",
     "TropFanLinear",
