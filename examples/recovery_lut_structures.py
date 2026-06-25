@@ -20,6 +20,23 @@ from tropnn.tools.benchmarking.scaling_benchmark import feature_probabilities, s
 Variant = Literal["free", "walsh1", "walsh2", "coarse"]
 
 
+@dataclass(frozen=True)
+class CoarseToFineSpec:
+    comparisons: int
+    coarse_comparisons: int
+
+    @classmethod
+    def from_args(cls, comparisons: int, coarse_comparisons: int) -> "CoarseToFineSpec":
+        spec = cls(comparisons=int(comparisons), coarse_comparisons=int(coarse_comparisons))
+        if spec.coarse_comparisons < 1 or spec.coarse_comparisons >= spec.comparisons:
+            raise ValueError("coarse_comparisons must satisfy 1 <= coarse < comparisons")
+        return spec
+
+    @property
+    def coarse_table_size(self) -> int:
+        return 1 << self.coarse_comparisons
+
+
 class CoarseToFinePairwiseLUT(PairwiseLUT):
     """PairwiseLUT whose payload table is coarse table plus fine residual."""
 
@@ -37,8 +54,7 @@ class CoarseToFinePairwiseLUT(PairwiseLUT):
         use_output_scaling: bool = True,
         surrogate: str = "fast_sigmoid_odd",
     ) -> None:
-        if coarse_comparisons < 1 or coarse_comparisons >= comparisons:
-            raise ValueError("coarse_comparisons must satisfy 1 <= coarse < comparisons")
+        coarse = CoarseToFineSpec.from_args(comparisons, coarse_comparisons)
         super().__init__(
             input_dim,
             output_dim,
@@ -52,11 +68,18 @@ class CoarseToFinePairwiseLUT(PairwiseLUT):
             surrogate=surrogate,
         )
         del self.lut
-        self.coarse_comparisons = int(coarse_comparisons)
-        self.coarse_table_size = 1 << self.coarse_comparisons
+        self.coarse = coarse
         generator = torch.Generator(device="cpu").manual_seed(seed + 1)
         self.coarse_lut = nn.Parameter(torch.randn(tables, self.coarse_table_size, output_dim, generator=generator) * init_std)
         self.fine_lut = nn.Parameter(torch.randn(tables, self.table_size, output_dim, generator=generator) * init_std)
+
+    @property
+    def coarse_comparisons(self) -> int:
+        return self.coarse.coarse_comparisons
+
+    @property
+    def coarse_table_size(self) -> int:
+        return self.coarse.coarse_table_size
 
     def materialize_lut(self, *, dtype: torch.dtype | None = None, device: torch.device | None = None) -> Tensor:
         compute_dtype = dtype if dtype is not None else self.fine_lut.dtype
@@ -67,8 +90,11 @@ class CoarseToFinePairwiseLUT(PairwiseLUT):
         fine = self.fine_lut.to(device=compute_device, dtype=compute_dtype)
         return coarse + fine
 
-    def payload_table(self, *, dtype: torch.dtype, device: torch.device) -> Tensor:
+    def lut_payload(self, *, dtype: torch.dtype, device: torch.device) -> Tensor:
         return self.materialize_lut(dtype=dtype, device=device)
+
+    def payload_table(self, *, dtype: torch.dtype, device: torch.device) -> Tensor:
+        return self.lut_payload(dtype=dtype, device=device)
 
 
 @dataclass(frozen=True)
