@@ -78,6 +78,15 @@ PAIRWISE_ROUTE_PREMIXES = (
     "sparse_product",
     "lowrank",
 )
+PAIRWISE_ANCHOR_POLICIES = (
+    "random",
+    "random_no_replace",
+    "local",
+    "cyclic",
+    "block",
+    "expander",
+    "permuted",
+)
 
 
 def _read_idx(path: Path) -> np.ndarray:
@@ -153,6 +162,8 @@ def _make_layer(
     pairwise_slope_bank_rank: int,
     pairwise_slope_bank_atom_init_std: float,
     pairwise_slope_bank_coeff_init_std: float,
+    pairwise_anchor_policy: str,
+    pairwise_anchor_seed: int | None,
     pairwise_folding_alpha: float,
     pairwise_folding_block_size: int,
     pairwise_folding_sign_init_std: float,
@@ -198,6 +209,8 @@ def _make_layer(
             slope_init=sawtooth_slope_init,
             backend=backend,
             seed=seed,
+            anchor_policy=pairwise_anchor_policy,
+            anchor_seed=pairwise_anchor_seed,
         )
     if family == "pairwise_walsh":
         return PairwiseWalshLinear(
@@ -222,6 +235,8 @@ def _make_layer(
             fixed_zero_threshold=fixed_zero_threshold,
             fold_alpha=pairwise_folding_alpha,
             sign_init_std=pairwise_folding_sign_init_std,
+            anchor_policy=pairwise_anchor_policy,
+            anchor_seed=pairwise_anchor_seed,
         )
     if family == "pairwise_delayed_table":
         return PairwiseDelayedTableLinear(
@@ -239,6 +254,8 @@ def _make_layer(
             fixed_zero_threshold=fixed_zero_threshold,
             fold_alpha=pairwise_folding_alpha,
             sign_init_std=pairwise_folding_sign_init_std,
+            anchor_policy=pairwise_anchor_policy,
+            anchor_seed=pairwise_anchor_seed,
         )
     if family == "pairwise_table_mix":
         return PairwiseTableMixLinear(
@@ -258,6 +275,8 @@ def _make_layer(
             slope_bank_atom_init_std=pairwise_slope_bank_atom_init_std,
             slope_bank_coeff_init_std=pairwise_slope_bank_coeff_init_std,
             fixed_zero_threshold=fixed_zero_threshold,
+            anchor_policy=pairwise_anchor_policy,
+            anchor_seed=pairwise_anchor_seed,
         )
     return _make_pairwise_route_layer(
         d_in,
@@ -272,6 +291,8 @@ def _make_layer(
         slope_bank_rank=pairwise_slope_bank_rank,
         slope_bank_atom_init_std=pairwise_slope_bank_atom_init_std,
         slope_bank_coeff_init_std=pairwise_slope_bank_coeff_init_std,
+        anchor_policy=pairwise_anchor_policy,
+        anchor_seed=pairwise_anchor_seed,
         affine_two_bank=family == "pairwise_affine_two_bank",
         folding=family == "pairwise_folding",
         folding_alpha=pairwise_folding_alpha,
@@ -655,6 +676,8 @@ def _make_pairwise_route_layer(
     slope_bank_rank: int,
     slope_bank_atom_init_std: float,
     slope_bank_coeff_init_std: float,
+    anchor_policy: str,
+    anchor_seed: int | None,
     affine_two_bank: bool,
     folding: bool,
     folding_alpha: float,
@@ -684,6 +707,8 @@ def _make_pairwise_route_layer(
             slope_bank_rank=slope_bank_rank,
             slope_bank_atom_init_std=slope_bank_atom_init_std,
             slope_bank_coeff_init_std=slope_bank_coeff_init_std,
+            anchor_policy=anchor_policy,
+            anchor_seed=anchor_seed,
             affine_two_bank=affine_two_bank,
             folding=folding,
             folding_alpha=folding_alpha,
@@ -710,6 +735,8 @@ def _make_pairwise_route_layer(
             fold_alpha=folding_alpha,
             fold_block_size=folding_block_size,
             fold_sign_init_std=folding_sign_init_std,
+            anchor_policy=anchor_policy,
+            anchor_seed=anchor_seed,
         )
     elif folding:
         layer_kwargs = dict(
@@ -724,6 +751,8 @@ def _make_pairwise_route_layer(
             slope_bank_atom_init_std=slope_bank_atom_init_std,
             slope_bank_coeff_init_std=slope_bank_coeff_init_std,
             fixed_zero_threshold=fixed_zero_threshold,
+            anchor_policy=anchor_policy,
+            anchor_seed=anchor_seed,
         )
         layer = PairwiseFoldingLinear(
             d_in,
@@ -748,6 +777,8 @@ def _make_pairwise_route_layer(
             slope_bank_atom_init_std=slope_bank_atom_init_std,
             slope_bank_coeff_init_std=slope_bank_coeff_init_std,
             fixed_zero_threshold=fixed_zero_threshold,
+            anchor_policy=anchor_policy,
+            anchor_seed=anchor_seed,
         )
         layer = PairwiseLinear(d_in, d_out, **layer_kwargs)
     if route_premix == "none":
@@ -811,6 +842,8 @@ class EmnistRoutedClassifier(nn.Module):
         pairwise_slope_bank_rank: int,
         pairwise_slope_bank_atom_init_std: float,
         pairwise_slope_bank_coeff_init_std: float,
+        pairwise_anchor_policy: str,
+        pairwise_anchor_seed: int | None,
         pairwise_folding_alpha: float,
         pairwise_folding_block_size: int,
         pairwise_folding_sign_init_std: float,
@@ -868,6 +901,8 @@ class EmnistRoutedClassifier(nn.Module):
                 pairwise_slope_bank_rank=pairwise_slope_bank_rank,
                 pairwise_slope_bank_atom_init_std=pairwise_slope_bank_atom_init_std,
                 pairwise_slope_bank_coeff_init_std=pairwise_slope_bank_coeff_init_std,
+                pairwise_anchor_policy=pairwise_anchor_policy,
+                pairwise_anchor_seed=pairwise_anchor_seed,
                 pairwise_folding_alpha=pairwise_folding_alpha,
                 pairwise_folding_block_size=pairwise_folding_block_size,
                 pairwise_folding_sign_init_std=pairwise_folding_sign_init_std,
@@ -937,6 +972,8 @@ def _emnist_routed_compat_kwargs(kwargs: dict) -> dict:
     kwargs.setdefault("pairwise_slope_bank_rank", 0)
     kwargs.setdefault("pairwise_slope_bank_atom_init_std", 0.02)
     kwargs.setdefault("pairwise_slope_bank_coeff_init_std", 0.0)
+    kwargs.setdefault("pairwise_anchor_policy", "random")
+    kwargs.setdefault("pairwise_anchor_seed", None)
     kwargs.setdefault("pairwise_folding_alpha", 0.1)
     kwargs.setdefault("pairwise_folding_block_size", 8)
     kwargs.setdefault("pairwise_folding_sign_init_std", 0.02)
@@ -1135,6 +1172,8 @@ def main() -> None:
         parser.add_argument(name, type=arg_type, default=default)
     parser.add_argument("--pairwise-folding-mode", choices=("sign", "perm_bank"), default="sign")
     parser.add_argument("--pairwise-table-mix", choices=("none", "random_scatter", "diag", "butterfly", "lowrank", "dense"), default="none")
+    parser.add_argument("--pairwise-anchor-policy", choices=PAIRWISE_ANCHOR_POLICIES, default="random")
+    parser.add_argument("--pairwise-anchor-seed", type=int, default=None)
     parser.add_argument("--walsh-order", type=int, choices=(1, 2), default=2)
     parser.add_argument("--backend", choices=("torch", "auto", "triton", "tilelang"), default="torch")
     parser.add_argument("--fan-value-mode", choices=("site", "basis"), default="site")
@@ -1210,6 +1249,8 @@ def main() -> None:
             pairwise_slope_bank_rank=args.pairwise_slope_bank_rank,
             pairwise_slope_bank_atom_init_std=args.pairwise_slope_bank_atom_init_std,
             pairwise_slope_bank_coeff_init_std=args.pairwise_slope_bank_coeff_init_std,
+            pairwise_anchor_policy=args.pairwise_anchor_policy,
+            pairwise_anchor_seed=args.pairwise_anchor_seed,
             pairwise_folding_alpha=args.pairwise_folding_alpha,
             pairwise_folding_block_size=args.pairwise_folding_block_size,
             pairwise_folding_sign_init_std=args.pairwise_folding_sign_init_std,
@@ -1264,6 +1305,8 @@ def main() -> None:
         "slope_coeff_std": args.pairwise_slope_bank_coeff_init_std
         if args.family in PAIRWISE_LUT_FAMILIES and args.pairwise_slope_bank_rank > 0
         else "-",
+        "anchor_policy": args.pairwise_anchor_policy if args.family in PAIRWISE_LUT_FAMILIES or args.family == "pairwise_walsh" else "-",
+        "anchor_seed": args.pairwise_anchor_seed if args.family in PAIRWISE_LUT_FAMILIES or args.family == "pairwise_walsh" else "-",
         "affine_two_bank": args.family == "pairwise_affine_two_bank" if args.family in PAIRWISE_LUT_FAMILIES else "-",
         "folding_alpha": args.pairwise_folding_alpha
         if args.family in {"pairwise_folding", "pairwise_affine_two_bank", "pairwise_delayed_head", "pairwise_delayed_table"}

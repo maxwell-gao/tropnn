@@ -13,8 +13,85 @@ from .base import RoutedLinearBase
 from .surrogate import ste_heaviside, surrogate_gradient
 
 
+PAIRWISE_ANCHOR_POLICIES = (
+    "random",
+    "random_no_replace",
+    "local",
+    "cyclic",
+    "block",
+    "expander",
+    "permuted",
+)
+
+
 def _next_power_of_two(n: int) -> int:
     return 1 << (max(1, n) - 1).bit_length()
+
+
+def _make_pairwise_anchors(
+    in_features: int,
+    tables: int,
+    comparisons: int,
+    *,
+    policy: str,
+    seed: int | None,
+) -> Tensor:
+    if in_features < 2:
+        raise ValueError(f"Pairwise anchors require in_features >= 2, got {in_features}")
+    if policy not in PAIRWISE_ANCHOR_POLICIES:
+        raise ValueError(f"unsupported pairwise anchor policy {policy!r}; expected one of {PAIRWISE_ANCHOR_POLICIES}")
+
+    route_count = tables * comparisons
+    flat = torch.arange(route_count, dtype=torch.long)
+    gen = torch.Generator(device="cpu")
+    if seed is not None:
+        gen.manual_seed(int(seed))
+
+    if policy == "random":
+        a = torch.randint(0, in_features, (route_count,), generator=gen)
+        b = torch.randint(0, in_features - 1, (route_count,), generator=gen)
+        b = b + (b >= a).long()
+    elif policy == "random_no_replace":
+        pair_count = in_features * (in_features - 1)
+        if route_count <= pair_count and pair_count <= 2_000_000:
+            raw = torch.randperm(pair_count, generator=gen)[:route_count]
+            a = raw // (in_features - 1)
+            b = raw % (in_features - 1)
+            b = b + (b >= a).long()
+        else:
+            a = torch.randint(0, in_features, (route_count,), generator=gen)
+            b = torch.randint(0, in_features - 1, (route_count,), generator=gen)
+            b = b + (b >= a).long()
+    elif policy == "local":
+        a = flat.remainder(in_features)
+        b = (a + 1).remainder(in_features)
+    elif policy == "cyclic":
+        a = flat.remainder(in_features)
+        stride = ((flat // in_features) + (flat % comparisons) + 1).remainder(in_features - 1) + 1
+        b = (a + stride).remainder(in_features)
+    elif policy == "block":
+        block = min(in_features, max(2, int(math.sqrt(in_features))))
+        block_count = (in_features + block - 1) // block
+        block_id = (flat // block).remainder(block_count)
+        within = flat.remainder(block)
+        a = (block_id * block + within).remainder(in_features)
+        offset = ((flat // max(1, block_count)) % (block - 1)) + 1
+        b = (block_id * block + within + offset).remainder(in_features)
+    elif policy == "expander":
+        a = (flat * 37 + 17).remainder(in_features)
+        stride = ((flat * 53 + 19) % (in_features - 1)) + 1
+        b = (a + stride).remainder(in_features)
+    elif policy == "permuted":
+        perm_a = torch.randperm(in_features, generator=gen)
+        perm_b = torch.randperm(in_features, generator=gen)
+        a = perm_a[flat.remainder(in_features)]
+        b = perm_b[(flat * 7 + flat // max(1, in_features)).remainder(in_features)]
+        b = torch.where(a == b, (b + 1).remainder(in_features), b)
+    else:
+        raise AssertionError(f"unreachable anchor policy {policy!r}")
+
+    b = torch.where(a == b, (b + 1).remainder(in_features), b)
+    return torch.stack((a, b), dim=-1).view(tables, comparisons, 2)
 
 
 def _fwht_last_dim(x: Tensor) -> Tensor:
@@ -55,6 +132,8 @@ class PairwiseLinear(RoutedLinearBase):
         slope_bank_rank: int = 0,
         slope_bank_atom_init_std: float = 0.02,
         slope_bank_coeff_init_std: float = 0.0,
+        anchor_policy: str = "random",
+        anchor_seed: int | None = None,
     ) -> None:
         if tables < 1:
             raise ValueError(f"tables must be >= 1, got {tables}")
@@ -102,19 +181,19 @@ class PairwiseLinear(RoutedLinearBase):
         self.slope_bank_rank = slope_bank_rank
         self.slope_bank_atom_init_std = slope_bank_atom_init_std
         self.slope_bank_coeff_init_std = slope_bank_coeff_init_std
+        self.anchor_policy = anchor_policy
+        self.anchor_seed = seed if anchor_seed is None else int(anchor_seed)
         self._zig_lut_f16_cache: Tensor | None = None
         self._zig_lut_f16_cache_version = -1
 
         torch.manual_seed(seed)
-        anchors = torch.zeros(tables, comparisons, 2, dtype=torch.long)
-        for table_idx in range(tables):
-            for comp_idx in range(comparisons):
-                a = torch.randint(0, in_features, (1,)).item()
-                b = torch.randint(0, in_features, (1,)).item()
-                while a == b:
-                    b = torch.randint(0, in_features, (1,)).item()
-                anchors[table_idx, comp_idx, 0] = a
-                anchors[table_idx, comp_idx, 1] = b
+        anchors = _make_pairwise_anchors(
+            in_features,
+            tables,
+            comparisons,
+            policy=anchor_policy,
+            seed=self.anchor_seed,
+        )
         self.register_buffer("anchors", anchors)
         thresholds = torch.zeros(tables, comparisons)
         if fixed_zero_threshold:
@@ -146,7 +225,8 @@ class PairwiseLinear(RoutedLinearBase):
             f"in_features={self.in_features}, out_features={self.out_features}, tables={self.tables}, "
             f"comparisons={self.comparisons}, backend={self.backend!r}, use_min_margin_ste={self.use_min_margin_ste}, "
             f"fixed_zero_threshold={self.fixed_zero_threshold}, surrogate={self.surrogate!r}, cpu_lut_dtype={self.cpu_lut_dtype!r}, "
-            f"accumulation={self.accumulation!r}, max_group_size={self.max_group_size}, slope_bank_rank={self.slope_bank_rank}"
+            f"accumulation={self.accumulation!r}, max_group_size={self.max_group_size}, slope_bank_rank={self.slope_bank_rank}, "
+            f"anchor_policy={self.anchor_policy!r}, anchor_seed={self.anchor_seed}"
         )
 
     def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
@@ -513,6 +593,8 @@ class PairwiseTableMixLinear(PairwiseLinear):
         slope_bank_rank: int = 0,
         slope_bank_atom_init_std: float = 0.02,
         slope_bank_coeff_init_std: float = 0.0,
+        anchor_policy: str = "random",
+        anchor_seed: int | None = None,
     ) -> None:
         if table_mix == "random_scatter":
             table_mix = "none"
@@ -548,6 +630,8 @@ class PairwiseTableMixLinear(PairwiseLinear):
             slope_bank_rank=slope_bank_rank,
             slope_bank_atom_init_std=slope_bank_atom_init_std,
             slope_bank_coeff_init_std=slope_bank_coeff_init_std,
+            anchor_policy=anchor_policy,
+            anchor_seed=anchor_seed,
         )
         self.table_mix = table_mix
         self.table_mix_rank = int(table_mix_rank)
@@ -738,6 +822,8 @@ class PairwiseFoldingLinear(PairwiseLinear):
         fold_mode: Literal["sign", "perm_bank"] = "sign",
         fold_perm_banks: int = 8,
         hard_fold_sign: bool = True,
+        anchor_policy: str = "random",
+        anchor_seed: int | None = None,
     ) -> None:
         if backend != "torch":
             raise ValueError(f"PairwiseFoldingLinear currently supports backend='torch' only, got {backend!r}")
@@ -767,6 +853,8 @@ class PairwiseFoldingLinear(PairwiseLinear):
             slope_bank_rank=slope_bank_rank,
             slope_bank_atom_init_std=slope_bank_atom_init_std,
             slope_bank_coeff_init_std=slope_bank_coeff_init_std,
+            anchor_policy=anchor_policy,
+            anchor_seed=anchor_seed,
         )
         self.fold_block_size = int(fold_block_size)
         self.fold_blocks = (out_features + fold_block_size - 1) // fold_block_size
@@ -980,6 +1068,8 @@ class PairwiseAffineTwoBankLinear(PairwiseFoldingLinear):
         fold_block_size: int = 8,
         fold_sign_init_std: float = 0.02,
         hard_fold_sign: bool = True,
+        anchor_policy: str = "random",
+        anchor_seed: int | None = None,
     ) -> None:
         super().__init__(
             in_features,
@@ -1002,6 +1092,8 @@ class PairwiseAffineTwoBankLinear(PairwiseFoldingLinear):
             fold_sign_init_std=fold_sign_init_std,
             fold_mode="sign",
             hard_fold_sign=hard_fold_sign,
+            anchor_policy=anchor_policy,
+            anchor_seed=anchor_seed,
         )
         gen = torch.Generator(device="cpu").manual_seed(seed + 104729)
         self.fold_sign_logits_neg = nn.Parameter(
@@ -1099,6 +1191,8 @@ class PairwiseDelayedHeadLinear(RoutedLinearBase):
         fixed_zero_threshold: bool = False,
         fold_alpha: float = 0.1,
         sign_init_std: float = 0.02,
+        anchor_policy: str = "random",
+        anchor_seed: int | None = None,
     ) -> None:
         if tables < 1:
             raise ValueError(f"tables must be >= 1, got {tables}")
@@ -1118,17 +1212,17 @@ class PairwiseDelayedHeadLinear(RoutedLinearBase):
         self.head_dim = int(head_dim)
         self.fixed_zero_threshold = bool(fixed_zero_threshold)
         self.fold_alpha = nn.Parameter(torch.tensor(float(fold_alpha), dtype=torch.float32))
+        self.anchor_policy = anchor_policy
+        self.anchor_seed = seed if anchor_seed is None else int(anchor_seed)
 
         gen = torch.Generator(device="cpu").manual_seed(seed)
-        anchors = torch.zeros(tables, comparisons, 2, dtype=torch.long)
-        for table_idx in range(tables):
-            for comp_idx in range(comparisons):
-                a = torch.randint(0, in_features, (1,), generator=gen).item()
-                b = torch.randint(0, in_features, (1,), generator=gen).item()
-                while a == b:
-                    b = torch.randint(0, in_features, (1,), generator=gen).item()
-                anchors[table_idx, comp_idx, 0] = a
-                anchors[table_idx, comp_idx, 1] = b
+        anchors = _make_pairwise_anchors(
+            in_features,
+            tables,
+            comparisons,
+            policy=anchor_policy,
+            seed=self.anchor_seed,
+        )
         self.register_buffer("anchors", anchors)
         thresholds = torch.zeros(tables, comparisons)
         if fixed_zero_threshold:
@@ -1152,7 +1246,8 @@ class PairwiseDelayedHeadLinear(RoutedLinearBase):
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, tables={self.tables}, "
-            f"comparisons={self.comparisons}, head_dim={self.head_dim}, fixed_zero_threshold={self.fixed_zero_threshold}"
+            f"comparisons={self.comparisons}, head_dim={self.head_dim}, fixed_zero_threshold={self.fixed_zero_threshold}, "
+            f"anchor_policy={self.anchor_policy!r}, anchor_seed={self.anchor_seed}"
         )
 
     def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
@@ -1248,6 +1343,8 @@ class PairwiseDelayedTableLinear(PairwiseDelayedHeadLinear):
         fixed_zero_threshold: bool = False,
         fold_alpha: float = 0.1,
         sign_init_std: float = 0.02,
+        anchor_policy: str = "random",
+        anchor_seed: int | None = None,
     ) -> None:
         if table_mix == "random_scatter":
             table_mix = "none"
@@ -1270,6 +1367,8 @@ class PairwiseDelayedTableLinear(PairwiseDelayedHeadLinear):
             fixed_zero_threshold=fixed_zero_threshold,
             fold_alpha=fold_alpha,
             sign_init_std=sign_init_std,
+            anchor_policy=anchor_policy,
+            anchor_seed=anchor_seed,
         )
         self.table_mix = table_mix
         self.table_mix_rank = int(table_mix_rank)
@@ -1509,6 +1608,8 @@ class AbsDiffLUT(nn.Module):
         use_min_margin_ste: bool = True,
         use_output_scaling: bool = True,
         surrogate: str = "fast_sigmoid_odd",
+        anchor_policy: str = "random",
+        anchor_seed: int | None = None,
     ) -> None:
         super().__init__()
         if features < 1:
@@ -1734,6 +1835,8 @@ class PairwiseWalshLinear(PairwiseLinear):
             use_min_margin_ste=use_min_margin_ste,
             use_output_scaling=use_output_scaling,
             surrogate=surrogate,
+            anchor_policy=anchor_policy,
+            anchor_seed=anchor_seed,
         )
         del self.lut
 
