@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...layers import PairwiseLinear, PairwiseWalshLinear
+from ...layers import PairwiseLUT, PairwiseWalshLUT
 
 FAMILIES = (
     "paper",
@@ -122,12 +122,12 @@ def _pairwise_shape(config: RunConfig) -> tuple[int, int]:
 
 def _build_pairwise(config: RunConfig) -> nn.Module:
     tables, comparisons = _pairwise_shape(config)
-    return PairwiseLinear(config.n_features, config.n_features, tables=tables, comparisons=comparisons, seed=config.seed)
+    return PairwiseLUT(config.n_features, config.n_features, tables=tables, comparisons=comparisons, seed=config.seed)
 
 
 def _build_pairwise_walsh(config: RunConfig) -> nn.Module:
     tables, comparisons = _pairwise_shape(config)
-    return PairwiseWalshLinear(
+    return PairwiseWalshLUT(
         config.n_features,
         config.n_features,
         tables=tables,

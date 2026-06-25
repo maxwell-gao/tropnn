@@ -41,11 +41,11 @@ def pairwise_zig_forward(
     lut_dtype: Literal["f32", "f16"] = "f32",
 ) -> Tensor:
     if latent.device.type != "cpu":
-        raise ValueError("PairwiseLinear backend='zig' requires CPU input tensors")
+        raise ValueError("PairwiseLUT backend='zig' requires CPU input tensors")
     if latent.dtype != torch.float32:
-        raise TypeError(f"PairwiseLinear backend='zig' requires float32 compute tensors, got {latent.dtype}")
+        raise TypeError(f"PairwiseLUT backend='zig' requires float32 compute tensors, got {latent.dtype}")
     if anchors.dtype != torch.long:
-        raise TypeError(f"PairwiseLinear backend='zig' requires int64 anchors, got {anchors.dtype}")
+        raise TypeError(f"PairwiseLUT backend='zig' requires int64 anchors, got {anchors.dtype}")
     if thresholds.dtype != torch.float32:
         thresholds = thresholds.to(torch.float32)
     if lut_dtype not in {"f32", "f16"}:

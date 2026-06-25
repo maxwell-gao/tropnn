@@ -1,3 +1,3 @@
-from .layers import PairwiseLinear
+from .layers import PairwiseLUT
 
-__all__ = ["PairwiseLinear"]
+__all__ = ["PairwiseLUT"]

@@ -1,6 +1,6 @@
 # tropnn
 
-`tropnn` is a small demonstration package for PC-LUT networks: pairwise comparison, lookup table read, and accumulation. The public model layer intentionally avoids GEMM in its forward operator.
+`tropnn` is a small demonstration package for PC-LUT networks: pairwise comparison, lookup table read, and accumulation. The public PC-LUT operator intentionally avoids GEMM in its forward path.
 
 ## Core operator
 
@@ -19,16 +19,16 @@ Training uses a finite-difference straight-through estimator. The selected LUT r
 
 ```python
 import torch
-from tropnn import AbsDiffLUT, PairwiseLinear, PairwiseWalshLinear
+from tropnn import AbsDiffLUT, PairwiseLUT, PairwiseWalshLUT
 
 x = torch.randn(8, 256)
-layer = PairwiseLinear(256, 512, tables=64, comparisons=6)
-print(layer(x).shape)
+lut = PairwiseLUT(256, 512, tables=64, comparisons=6)
+print(lut(x).shape)
 
 relation = AbsDiffLUT(256, 1, tables=16, comparisons=4)
 print(relation(x, x).shape)
 
-walsh = PairwiseWalshLinear(256, 512, tables=64, comparisons=6, walsh_order=2)
+walsh = PairwiseWalshLUT(256, 512, tables=64, comparisons=6, walsh_order=2)
 print(walsh(x).shape)
 ```
 
@@ -36,7 +36,7 @@ print(walsh(x).shape)
 
 - `backend="torch"`: reference implementation.
 - `backend="tilelang"`: CUDA fused pairwise compare/LUT path.
-- `backend="zig"`: CPU inference path for `PairwiseLinear`.
+- `backend="zig"`: CPU inference path for `PairwiseLUT`.
 
 ## EMNIST demo
 

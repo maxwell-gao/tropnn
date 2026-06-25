@@ -13,30 +13,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from tropnn.layers import PairwiseLinear, PairwiseWalshLinear
+from tropnn.layers import PairwiseLUT, PairwiseWalshLUT
 from tropnn.layers.surrogate import ste_heaviside
 from tropnn.tools.benchmarking.scaling_benchmark import feature_probabilities, sample_batch
 
 Variant = Literal["free", "walsh1", "walsh2", "coarse"]
 
 
-class CoarseToFinePairwiseLinear(PairwiseLinear):
-    """Pairwise LUT with a shared coarse table plus full-resolution residual table.
-
-    The hash and anchors are identical to ``PairwiseLinear``.  The first
-    ``coarse_comparisons`` low-order bits address the coarse table, while all
-    bits address the fine table:
-
-        S[j] = S_coarse[j & (2**coarse_comparisons - 1)] + S_fine[j]
-
-    This keeps the forward primitive as compare -> index -> lookup -> add, but
-    adds a low-frequency chamber component for the recovery diagnostic.
-    """
+class CoarseToFinePairwiseLUT(PairwiseLUT):
+    """PairwiseLUT whose payload table is coarse table plus fine residual."""
 
     def __init__(
         self,
-        in_features: int,
-        out_features: int,
+        input_dim: int,
+        output_dim: int,
         *,
         tables: int,
         comparisons: int,
@@ -48,28 +38,25 @@ class CoarseToFinePairwiseLinear(PairwiseLinear):
         surrogate: str = "fast_sigmoid_odd",
     ) -> None:
         if coarse_comparisons < 1 or coarse_comparisons >= comparisons:
-            raise ValueError(
-                f"coarse_comparisons must satisfy 1 <= coarse < comparisons, got coarse={coarse_comparisons}, "
-                f"comparisons={comparisons}"
-            )
+            raise ValueError("coarse_comparisons must satisfy 1 <= coarse < comparisons")
         super().__init__(
-            in_features,
-            out_features,
+            input_dim,
+            output_dim,
             tables=tables,
             comparisons=comparisons,
             backend="torch",
             seed=seed,
-            lut_init_std=init_std,
+            lut_init_std=0.0,
             use_min_margin_ste=use_min_margin_ste,
             use_output_scaling=use_output_scaling,
             surrogate=surrogate,
         )
         del self.lut
-        self.coarse_comparisons = coarse_comparisons
-        self.coarse_table_size = 1 << coarse_comparisons
+        self.coarse_comparisons = int(coarse_comparisons)
+        self.coarse_table_size = 1 << self.coarse_comparisons
         generator = torch.Generator(device="cpu").manual_seed(seed + 1)
-        self.coarse_lut = nn.Parameter(torch.randn(tables, self.coarse_table_size, out_features, generator=generator) * init_std)
-        self.fine_lut = nn.Parameter(torch.randn(tables, self.table_size, out_features, generator=generator) * init_std)
+        self.coarse_lut = nn.Parameter(torch.randn(tables, self.coarse_table_size, output_dim, generator=generator) * init_std)
+        self.fine_lut = nn.Parameter(torch.randn(tables, self.table_size, output_dim, generator=generator) * init_std)
 
     def materialize_lut(self, *, dtype: torch.dtype | None = None, device: torch.device | None = None) -> Tensor:
         compute_dtype = dtype if dtype is not None else self.fine_lut.dtype
@@ -80,72 +67,8 @@ class CoarseToFinePairwiseLinear(PairwiseLinear):
         fine = self.fine_lut.to(device=compute_device, dtype=compute_dtype)
         return coarse + fine
 
-    def _lookup_chunked_with_lut(self, indices: Tensor, lut: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
-        batch, seq, route_count = indices.shape
-        item_count = batch * seq
-        indices_flat = indices.reshape(item_count, route_count)
-        lut_table = lut.reshape(route_count * self.table_size, self.out_features)
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features,
-            compute_dtype=compute_dtype,
-            route_count=route_count,
-        )
-        output = torch.zeros(item_count, self.out_features, device=indices.device, dtype=compute_dtype)
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            linear_idx = (indices_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            selected = lut_table.index_select(0, linear_idx).view(item_count, route_stop - route_start, self.out_features)
-            output = output + selected.sum(dim=1)
-        return output.view(batch, seq, self.out_features)
-
-    def _min_margin_ste_with_lut(self, indices: Tensor, margins: Tensor, lut: Tensor) -> Tensor:
-        r_mins = margins.abs().argmin(dim=-1)
-        u_mins = margins.gather(dim=-1, index=r_mins.unsqueeze(-1)).squeeze(-1)
-        neighbor_indices = indices ^ (2**r_mins).long()
-        ste_delta = ste_heaviside(u_mins, self.surrogate) - (u_mins > 0).to(u_mins.dtype)
-
-        batch, seq, route_count = indices.shape
-        item_count = batch * seq
-        current_flat = indices.reshape(item_count, route_count)
-        neighbor_flat = neighbor_indices.reshape(item_count, route_count)
-        ste_flat = ste_delta.reshape(item_count, route_count, 1).float()
-        lut_table = lut.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features,
-            compute_dtype=torch.float32,
-            route_count=route_count,
-        )
-        corr = torch.zeros(item_count, self.out_features, device=indices.device, dtype=torch.float32)
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            current = lut_table.index_select(0, current_idx).view(item_count, route_stop - route_start, self.out_features)
-            neighbor = lut_table.index_select(0, neighbor_idx).view(item_count, route_stop - route_start, self.out_features)
-            corr = corr + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=1)
-        return corr.view(batch, seq, self.out_features)
-
-    def _route_output(
-        self,
-        latent: Tensor,
-        *,
-        input_device: torch.device,
-        compute_dtype: torch.dtype,
-        training: bool,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        del input_device
-        indices, margins = self._compute_indices(latent)
-        lut = self.materialize_lut(dtype=compute_dtype, device=indices.device)
-        output = self._lookup_chunked_with_lut(indices, lut, compute_dtype=compute_dtype)
-        if training and (latent.requires_grad or self.thresholds.requires_grad):
-            if not self.use_min_margin_ste:
-                raise NotImplementedError("CoarseToFinePairwiseLinear currently supports min-margin STE only")
-            output = output + self._min_margin_ste_with_lut(indices, margins, lut).to(output.dtype)
-        return output, indices, margins
+    def payload_table(self, *, dtype: torch.dtype, device: torch.device) -> Tensor:
+        return self.materialize_lut(dtype=dtype, device=device)
 
 
 @dataclass(frozen=True)
@@ -191,8 +114,8 @@ def _tables_for_budget(variant: Variant, cfg: ExperimentConfig, target_params: i
 
 def _build_model(variant: Variant, cfg: ExperimentConfig, tables: int) -> nn.Module:
     common = dict(
-        in_features=cfg.n_features,
-        out_features=cfg.n_features,
+        input_dim=cfg.n_features,
+        output_dim=cfg.n_features,
         tables=tables,
         comparisons=cfg.comparisons,
         seed=cfg.seed,
@@ -200,13 +123,13 @@ def _build_model(variant: Variant, cfg: ExperimentConfig, tables: int) -> nn.Mod
         use_output_scaling=True,
     )
     if variant == "free":
-        return PairwiseLinear(**common, lut_init_std=cfg.init_std)
+        return PairwiseLUT(**common, lut_init_std=cfg.init_std)
     if variant == "walsh1":
-        return PairwiseWalshLinear(**common, walsh_order=1, coeff_init_std=cfg.init_std)
+        return PairwiseWalshLUT(**common, walsh_order=1, coeff_init_std=cfg.init_std)
     if variant == "walsh2":
-        return PairwiseWalshLinear(**common, walsh_order=2, coeff_init_std=cfg.init_std)
+        return PairwiseWalshLUT(**common, walsh_order=2, coeff_init_std=cfg.init_std)
     if variant == "coarse":
-        return CoarseToFinePairwiseLinear(
+        return CoarseToFinePairwiseLUT(
             **common,
             coarse_comparisons=cfg.coarse_comparisons,
             init_std=cfg.init_std,

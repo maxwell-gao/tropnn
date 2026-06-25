@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, Subset
 
-from tropnn import PairwiseLinear, PairwiseWalshLinear
+from tropnn import PairwiseLUT, PairwiseWalshLUT
 
 
 class LinearImageClassifier(nn.Module):
@@ -38,7 +38,7 @@ class PairwiseImageClassifier(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
-        self.layer = PairwiseLinear(
+        self.layer = PairwiseLUT(
             image_features,
             classes,
             tables=tables,
@@ -67,7 +67,7 @@ class PairwiseWalshImageClassifier(nn.Module):
         anchor_policy: str,
     ) -> None:
         super().__init__()
-        self.layer = PairwiseWalshLinear(
+        self.layer = PairwiseWalshLUT(
             image_features,
             classes,
             tables=tables,

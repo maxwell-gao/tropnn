@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -9,7 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ..backend import Backend
-from .base import RoutedLinearBase
+from .base import LUTModuleBase
 from .surrogate import ste_heaviside, surrogate_gradient
 
 PAIRWISE_ANCHOR_POLICIES = (
@@ -23,18 +24,31 @@ PAIRWISE_ANCHOR_POLICIES = (
 )
 
 
-def _make_pairwise_anchors(
-    in_features: int,
-    tables: int,
-    comparisons: int,
+@dataclass(frozen=True)
+class PairwiseRoute:
+    """Discrete table address and its continuous comparison margins."""
+
+    indices: Tensor
+    margins: Tensor
+
+
+def _route_chunk_size(
     *,
-    policy: str,
-    seed: int | None,
-) -> Tensor:
-    if in_features < 2:
-        raise ValueError(f"Pairwise anchors require in_features >= 2, got {in_features}")
+    item_count: int,
+    payload_width: int,
+    compute_dtype: torch.dtype,
+    route_count: int,
+    target_bytes: int = 16 * 1024 * 1024,
+) -> int:
+    bytes_per_route = item_count * payload_width * torch.finfo(compute_dtype).bits // 8
+    return max(1, min(route_count, target_bytes // max(1, bytes_per_route)))
+
+
+def _make_pairwise_anchors(input_dim: int, tables: int, comparisons: int, *, policy: str, seed: int | None) -> Tensor:
+    if input_dim < 2:
+        raise ValueError(f"Pairwise anchors require input_dim >= 2, got {input_dim}")
     if policy not in PAIRWISE_ANCHOR_POLICIES:
-        raise ValueError(f"unsupported pairwise anchor policy {policy!r}; expected one of {PAIRWISE_ANCHOR_POLICIES}")
+        raise ValueError(f"unsupported anchor policy {policy!r}")
 
     route_count = tables * comparisons
     flat = torch.arange(route_count, dtype=torch.long)
@@ -43,65 +57,165 @@ def _make_pairwise_anchors(
         gen.manual_seed(int(seed))
 
     if policy == "random":
-        a = torch.randint(0, in_features, (route_count,), generator=gen)
-        b = torch.randint(0, in_features - 1, (route_count,), generator=gen)
+        a = torch.randint(0, input_dim, (route_count,), generator=gen)
+        b = torch.randint(0, input_dim - 1, (route_count,), generator=gen)
         b = b + (b >= a).long()
     elif policy == "random_no_replace":
-        pair_count = in_features * (in_features - 1)
+        pair_count = input_dim * (input_dim - 1)
         if route_count <= pair_count and pair_count <= 2_000_000:
             raw = torch.randperm(pair_count, generator=gen)[:route_count]
-            a = raw // (in_features - 1)
-            b = raw % (in_features - 1)
+            a = raw // (input_dim - 1)
+            b = raw % (input_dim - 1)
             b = b + (b >= a).long()
         else:
-            a = torch.randint(0, in_features, (route_count,), generator=gen)
-            b = torch.randint(0, in_features - 1, (route_count,), generator=gen)
+            a = torch.randint(0, input_dim, (route_count,), generator=gen)
+            b = torch.randint(0, input_dim - 1, (route_count,), generator=gen)
             b = b + (b >= a).long()
     elif policy == "local":
-        a = flat.remainder(in_features)
-        b = (a + 1).remainder(in_features)
+        a = flat.remainder(input_dim)
+        b = (a + 1).remainder(input_dim)
     elif policy == "cyclic":
-        a = flat.remainder(in_features)
-        stride = ((flat // in_features) + (flat % comparisons) + 1).remainder(in_features - 1) + 1
-        b = (a + stride).remainder(in_features)
+        a = flat.remainder(input_dim)
+        stride = ((flat // input_dim) + (flat % comparisons) + 1).remainder(input_dim - 1) + 1
+        b = (a + stride).remainder(input_dim)
     elif policy == "block":
-        block = min(in_features, max(2, int(math.sqrt(in_features))))
-        block_count = (in_features + block - 1) // block
+        block = min(input_dim, max(2, int(math.sqrt(input_dim))))
+        block_count = (input_dim + block - 1) // block
         block_id = (flat // block).remainder(block_count)
         within = flat.remainder(block)
-        a = (block_id * block + within).remainder(in_features)
+        a = (block_id * block + within).remainder(input_dim)
         offset = ((flat // max(1, block_count)) % (block - 1)) + 1
-        b = (block_id * block + within + offset).remainder(in_features)
+        b = (block_id * block + within + offset).remainder(input_dim)
     elif policy == "expander":
-        a = (flat * 37 + 17).remainder(in_features)
-        stride = ((flat * 53 + 19) % (in_features - 1)) + 1
-        b = (a + stride).remainder(in_features)
+        a = (flat * 37 + 17).remainder(input_dim)
+        stride = ((flat * 53 + 19) % (input_dim - 1)) + 1
+        b = (a + stride).remainder(input_dim)
     elif policy == "permuted":
-        perm_a = torch.randperm(in_features, generator=gen)
-        perm_b = torch.randperm(in_features, generator=gen)
-        a = perm_a[flat.remainder(in_features)]
-        b = perm_b[(flat * 7 + flat // max(1, in_features)).remainder(in_features)]
-        b = torch.where(a == b, (b + 1).remainder(in_features), b)
+        perm_a = torch.randperm(input_dim, generator=gen)
+        perm_b = torch.randperm(input_dim, generator=gen)
+        a = perm_a[flat.remainder(input_dim)]
+        b = perm_b[(flat * 7 + flat // max(1, input_dim)).remainder(input_dim)]
+        b = torch.where(a == b, (b + 1).remainder(input_dim), b)
     else:
         raise AssertionError(f"unreachable anchor policy {policy!r}")
 
-    b = torch.where(a == b, (b + 1).remainder(in_features), b)
+    b = torch.where(a == b, (b + 1).remainder(input_dim), b)
     return torch.stack((a, b), dim=-1).view(tables, comparisons, 2)
 
 
-class PairwiseLinear(RoutedLinearBase):
-    """Compare -> lookup -> accumulate layer with no GEMM in the forward path.
+def _route_pairwise(x: Tensor, anchors: Tensor, thresholds: Tensor, powers: Tensor) -> PairwiseRoute:
+    batch, seq, _ = x.shape
+    tables, comparisons, _ = anchors.shape
+    a = anchors[:, :, 0].flatten()
+    b = anchors[:, :, 1].flatten()
+    left = x[..., a].view(batch, seq, tables, comparisons)
+    right = x[..., b].view(batch, seq, tables, comparisons)
+    margins = left - right - thresholds.to(dtype=x.dtype, device=x.device)
+    indices = ((margins > 0).to(torch.long) * powers.to(device=x.device).view(1, 1, 1, -1)).sum(dim=-1)
+    return PairwiseRoute(indices=indices, margins=margins)
 
-    Each table owns a small set of coordinate comparisons. The comparison bits
-    index one row in that table's payload LUT, and the selected rows are summed.
-    During training, finite-difference STE sends gradients through the nearest
-    comparator boundary while LUT rows receive ordinary selected-row gradients.
+
+def _lookup_lut_rows(indices: Tensor, lut: Tensor, *, table_size: int, output_dim: int, compute_dtype: torch.dtype) -> Tensor:
+    prefix_shape = indices.shape[:-1]
+    route_count = indices.shape[-1]
+    item_count = max(1, indices.numel() // route_count)
+    flat_indices = indices.reshape(item_count, route_count)
+    flat_lut = lut.reshape(route_count * table_size, output_dim)
+    output = torch.zeros(item_count, output_dim, device=indices.device, dtype=compute_dtype)
+    chunk = _route_chunk_size(item_count=item_count, payload_width=output_dim, compute_dtype=compute_dtype, route_count=route_count)
+
+    for route_start in range(0, route_count, chunk):
+        route_stop = min(route_start + chunk, route_count)
+        offsets = (torch.arange(route_start, route_stop, device=indices.device) * table_size).view(1, -1)
+        rows = (flat_indices[:, route_start:route_stop] + offsets).reshape(-1)
+        values = flat_lut.index_select(0, rows).view(item_count, route_stop - route_start, output_dim)
+        output = output + values.sum(dim=1)
+
+    return output.view(*prefix_shape, output_dim)
+
+
+def _min_margin_neighbors(route: PairwiseRoute, surrogate: str) -> tuple[Tensor, Tensor, Tensor]:
+    bit = route.margins.abs().argmin(dim=-1)
+    margin = route.margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
+    neighbor = route.indices ^ (2**bit).long()
+    ste = ste_heaviside(margin, surrogate) - (margin > 0).to(margin.dtype)
+    return neighbor, ste, margin
+
+
+def _ste_lut_delta(
+    *,
+    current_indices: Tensor,
+    neighbor_indices: Tensor,
+    ste_weight: Tensor,
+    lut: Tensor,
+    table_size: int,
+    output_dim: int,
+) -> Tensor:
+    prefix_shape = current_indices.shape[:-1]
+    route_count = current_indices.shape[-1]
+    item_count = max(1, current_indices.numel() // route_count)
+    current_flat = current_indices.reshape(item_count, route_count)
+    neighbor_flat = neighbor_indices.reshape(item_count, route_count)
+    weight_flat = ste_weight.reshape(item_count, route_count, 1).float()
+    flat_lut = lut.to(dtype=torch.float32, device=current_indices.device).reshape(route_count * table_size, output_dim)
+    output = torch.zeros(item_count, output_dim, device=current_indices.device, dtype=torch.float32)
+    chunk = _route_chunk_size(item_count=item_count, payload_width=output_dim, compute_dtype=torch.float32, route_count=route_count)
+
+    for route_start in range(0, route_count, chunk):
+        route_stop = min(route_start + chunk, route_count)
+        offsets = (torch.arange(route_start, route_stop, device=current_indices.device) * table_size).view(1, -1)
+        current_rows = (current_flat[:, route_start:route_stop] + offsets).reshape(-1)
+        neighbor_rows = (neighbor_flat[:, route_start:route_stop] + offsets).reshape(-1)
+        current = flat_lut.index_select(0, current_rows).view(item_count, route_stop - route_start, output_dim)
+        neighbor = flat_lut.index_select(0, neighbor_rows).view(item_count, route_stop - route_start, output_dim)
+        output = output + (weight_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=1)
+
+    return output.view(*prefix_shape, output_dim)
+
+
+def _full_ste_lut_delta(route: PairwiseRoute, powers: Tensor, lut: Tensor, *, table_size: int, output_dim: int, surrogate: str) -> Tensor:
+    prefix_shape = route.indices.shape[:-1]
+    route_count = route.indices.shape[-1]
+    comparisons = route.margins.shape[-1]
+    item_count = max(1, route.indices.numel() // route_count)
+    current_flat = route.indices.reshape(item_count, route_count)
+    neighbor_flat = current_flat.unsqueeze(-1) ^ powers.to(device=route.indices.device).view(1, 1, -1)
+    ste = ste_heaviside(route.margins, surrogate) - (route.margins > 0).to(route.margins.dtype)
+    ste_flat = ste.reshape(item_count, route_count, comparisons, 1).float()
+    flat_lut = lut.to(dtype=torch.float32, device=route.indices.device).reshape(route_count * table_size, output_dim)
+    output = torch.zeros(item_count, output_dim, device=route.indices.device, dtype=torch.float32)
+    chunk = _route_chunk_size(
+        item_count=item_count,
+        payload_width=output_dim * (comparisons + 1),
+        compute_dtype=torch.float32,
+        route_count=route_count,
+        target_bytes=8 * 1024 * 1024,
+    )
+
+    for route_start in range(0, route_count, chunk):
+        route_stop = min(route_start + chunk, route_count)
+        offsets = (torch.arange(route_start, route_stop, device=route.indices.device) * table_size).view(1, -1)
+        current_rows = (current_flat[:, route_start:route_stop] + offsets).reshape(-1)
+        current = flat_lut.index_select(0, current_rows).view(item_count, route_stop - route_start, 1, output_dim)
+        neighbor_rows = (neighbor_flat[:, route_start:route_stop] + offsets.unsqueeze(-1)).reshape(-1)
+        neighbor = flat_lut.index_select(0, neighbor_rows).view(item_count, route_stop - route_start, comparisons, output_dim)
+        output = output + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=(1, 2))
+
+    return output.view(*prefix_shape, output_dim)
+
+
+class PairwiseLUT(LUTModuleBase):
+    """Pairwise comparison lookup table.
+
+    The computation is deliberately small enough to read as the algorithm:
+    route comparisons, obtain a payload table, gather selected rows, then add a
+    finite-difference STE correction during training.
     """
 
     def __init__(
         self,
-        in_features: int,
-        out_features: int,
+        input_dim: int,
+        output_dim: int,
         *,
         tables: int = 16,
         comparisons: int = 4,
@@ -116,24 +230,20 @@ class PairwiseLinear(RoutedLinearBase):
         anchor_policy: str = "random",
         anchor_seed: int | None = None,
     ) -> None:
-        if tables < 1:
-            raise ValueError(f"tables must be >= 1, got {tables}")
-        if comparisons < 1:
-            raise ValueError(f"comparisons must be >= 1, got {comparisons}")
+        if tables < 1 or comparisons < 1:
+            raise ValueError("tables and comparisons must be positive")
         if backend not in {"torch", "tilelang", "zig"}:
-            raise ValueError(f"PairwiseLinear supports backend='torch', 'tilelang', or 'zig', got {backend!r}")
+            raise ValueError(f"unsupported backend {backend!r}")
         if cpu_lut_dtype not in {"f32", "f16"}:
-            raise ValueError(f"cpu_lut_dtype must be 'f32' or 'f16', got {cpu_lut_dtype!r}")
+            raise ValueError("cpu_lut_dtype must be 'f32' or 'f16'")
         surrogate_gradient(torch.zeros((), dtype=torch.float32), surrogate)
 
         output_scale = 1.0 / math.sqrt(tables) if use_output_scaling else 1.0
-        super().__init__(in_features, out_features, backend=backend, output_scale=output_scale)
-
+        super().__init__(input_dim, output_dim, backend=backend, output_scale=output_scale)
         self.tables = int(tables)
         self.comparisons = int(comparisons)
-        self.table_size = 1 << int(comparisons)
+        self.table_size = 1 << self.comparisons
         self.use_min_margin_ste = bool(use_min_margin_ste)
-        self.fixed_zero_threshold = bool(fixed_zero_threshold)
         self.surrogate = surrogate
         self.cpu_lut_dtype = cpu_lut_dtype
         self.anchor_policy = anchor_policy
@@ -141,38 +251,49 @@ class PairwiseLinear(RoutedLinearBase):
         self._zig_lut_f16_cache: Tensor | None = None
         self._zig_lut_f16_cache_version = -1
 
-        anchors = _make_pairwise_anchors(
-            in_features,
-            tables,
-            comparisons,
-            policy=anchor_policy,
-            seed=self.anchor_seed,
+        self.register_buffer(
+            "anchors",
+            _make_pairwise_anchors(input_dim, tables, comparisons, policy=anchor_policy, seed=self.anchor_seed),
         )
-        self.register_buffer("anchors", anchors)
         thresholds = torch.zeros(tables, comparisons)
         if fixed_zero_threshold:
             self.register_buffer("thresholds", thresholds)
         else:
             self.thresholds = nn.Parameter(thresholds)
         if lut_init_std == 0.0:
-            self.lut = nn.Parameter(torch.zeros(tables, self.table_size, out_features))
+            self.lut = nn.Parameter(torch.zeros(tables, self.table_size, output_dim))
         else:
             gen = torch.Generator(device="cpu").manual_seed(seed)
-            self.lut = nn.Parameter(torch.randn(tables, self.table_size, out_features, generator=gen) * lut_init_std)
+            self.lut = nn.Parameter(torch.randn(tables, self.table_size, output_dim, generator=gen) * lut_init_std)
         self.register_buffer("powers", 2 ** torch.arange(comparisons, dtype=torch.long))
 
     def extra_repr(self) -> str:
         return (
-            f"in_features={self.in_features}, out_features={self.out_features}, tables={self.tables}, "
-            f"comparisons={self.comparisons}, backend={self.backend!r}, use_min_margin_ste={self.use_min_margin_ste}, "
-            f"fixed_zero_threshold={self.fixed_zero_threshold}, surrogate={self.surrogate!r}, "
-            f"cpu_lut_dtype={self.cpu_lut_dtype!r}, anchor_policy={self.anchor_policy!r}, anchor_seed={self.anchor_seed}"
+            f"input_dim={self.input_dim}, output_dim={self.output_dim}, tables={self.tables}, "
+            f"comparisons={self.comparisons}, backend={self.backend!r}, anchor_policy={self.anchor_policy!r}"
         )
 
-    def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
-        if self.backend in {"tilelang", "zig"}:
-            return x.to(torch.float32)
-        return x.to(compute_dtype)
+    def payload_table(self, *, dtype: torch.dtype, device: torch.device) -> Tensor:
+        return self.lut.to(dtype=dtype, device=device)
+
+    def route(self, x: Tensor) -> PairwiseRoute:
+        return _route_pairwise(x, self.anchors, self.thresholds, self.powers)
+
+    def lookup(self, route: PairwiseRoute, lut: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
+        return _lookup_lut_rows(route.indices, lut, table_size=self.table_size, output_dim=self.output_dim, compute_dtype=compute_dtype)
+
+    def ste_correction(self, route: PairwiseRoute, lut: Tensor) -> Tensor:
+        if self.use_min_margin_ste:
+            neighbor, ste, _ = _min_margin_neighbors(route, self.surrogate)
+            return _ste_lut_delta(
+                current_indices=route.indices,
+                neighbor_indices=neighbor,
+                ste_weight=ste,
+                lut=lut,
+                table_size=self.table_size,
+                output_dim=self.output_dim,
+            )
+        return _full_ste_lut_delta(route, self.powers, lut, table_size=self.table_size, output_dim=self.output_dim, surrogate=self.surrogate)
 
     def _zig_lut_for_inference(self) -> Tensor:
         if self.cpu_lut_dtype == "f32":
@@ -185,372 +306,56 @@ class PairwiseLinear(RoutedLinearBase):
             self._zig_lut_f16_cache_version = version
         return cache
 
-    def _lookup_chunked(self, indices: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
-        batch, seq, route_count = indices.shape
-        item_count = batch * seq
-        indices_flat = indices.reshape(item_count, route_count)
-        lut_table = self.lut.to(dtype=compute_dtype, device=indices.device).reshape(
-            route_count * self.table_size,
-            self.out_features,
+    def _tilelang_compute(self, x: Tensor, *, compute_dtype: torch.dtype) -> tuple[Tensor, Tensor, Tensor]:
+        from ..backends import pairwise_tilelang
+
+        output, indices, margins = pairwise_tilelang(
+            x.to(torch.float32),
+            self.anchors.to(device=x.device),
+            self.thresholds.to(dtype=torch.float32, device=x.device),
+            self.lut.to(dtype=torch.float32, device=x.device),
+            use_min_margin_ste=self.use_min_margin_ste,
+            surrogate=self.surrogate,
         )
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features,
-            compute_dtype=compute_dtype,
-            route_count=route_count,
+        return output.to(compute_dtype), indices, margins
+
+    def _zig_compute(self, x: Tensor, route: PairwiseRoute, *, compute_dtype: torch.dtype, training: bool) -> tuple[Tensor, Tensor, Tensor]:
+        if training:
+            raise RuntimeError("PairwiseLUT backend='zig' is inference-only; call .eval() or use backend='torch' for training")
+        from ..backends import pairwise_zig_forward
+
+        output = pairwise_zig_forward(
+            x,
+            self.anchors,
+            self.thresholds.detach().to(dtype=torch.float32, device="cpu"),
+            self._zig_lut_for_inference(),
+            lut_dtype=self.cpu_lut_dtype,
         )
-        output = torch.zeros(item_count, self.out_features, device=indices.device, dtype=compute_dtype)
+        return output.to(device=x.device, dtype=compute_dtype), route.indices, route.margins
 
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            linear_idx = (indices_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            selected = lut_table.index_select(0, linear_idx).view(item_count, route_stop - route_start, self.out_features)
-            output = output + selected.sum(dim=1)
-
-        return output.view(batch, seq, self.out_features)
-
-    def _compute_indices(self, latent: Tensor) -> tuple[Tensor, Tensor]:
-        batch, seq, _ = latent.shape
-        anchor_a = self.anchors[:, :, 0].flatten()
-        anchor_b = self.anchors[:, :, 1].flatten()
-        x_a = latent[..., anchor_a].view(batch, seq, self.tables, self.comparisons)
-        x_b = latent[..., anchor_b].view(batch, seq, self.tables, self.comparisons)
-        thresholds = self.thresholds.to(dtype=latent.dtype, device=latent.device)
-        margins = x_a - x_b - thresholds
-        indices = ((margins > 0).to(torch.long) * self.powers.to(device=latent.device).view(1, 1, 1, -1)).sum(dim=-1)
-        return indices, margins
-
-    def _min_margin_ste(self, indices: Tensor, margins: Tensor) -> Tensor:
-        r_mins = margins.abs().argmin(dim=-1)
-        u_mins = margins.gather(dim=-1, index=r_mins.unsqueeze(-1)).squeeze(-1)
-        neighbor_indices = indices ^ (2**r_mins).long()
-        ste_delta = ste_heaviside(u_mins, self.surrogate) - (u_mins > 0).to(u_mins.dtype)
-
-        batch, seq, route_count = indices.shape
-        item_count = batch * seq
-        current_flat = indices.reshape(item_count, route_count)
-        neighbor_flat = neighbor_indices.reshape(item_count, route_count)
-        ste_flat = ste_delta.reshape(item_count, route_count, 1).float()
-        lut_table = self.lut.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features,
-            compute_dtype=torch.float32,
-            route_count=route_count,
-        )
-        corr = torch.zeros(item_count, self.out_features, device=indices.device, dtype=torch.float32)
-
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            current = lut_table.index_select(0, current_idx).view(item_count, route_stop - route_start, self.out_features)
-            neighbor = lut_table.index_select(0, neighbor_idx).view(item_count, route_stop - route_start, self.out_features)
-            corr = corr + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=1)
-
-        return corr.view(batch, seq, self.out_features)
-
-    def _full_ste(self, indices: Tensor, margins: Tensor) -> Tensor:
-        batch, seq, route_count = indices.shape
-        item_count = batch * seq
-        current_flat = indices.reshape(item_count, route_count)
-        powers = self.powers.to(device=indices.device)
-        neighbor_flat = current_flat.unsqueeze(-1) ^ powers.view(1, 1, -1)
-        ste_delta = ste_heaviside(margins, self.surrogate) - (margins > 0).to(margins.dtype)
-        ste_flat = ste_delta.reshape(item_count, route_count, self.comparisons, 1).float()
-        lut_table = self.lut.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features * (self.comparisons + 1),
-            compute_dtype=torch.float32,
-            route_count=route_count,
-            target_bytes=8 * 1024 * 1024,
-        )
-        corr = torch.zeros(item_count, self.out_features, device=indices.device, dtype=torch.float32)
-
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            current = lut_table.index_select(0, current_idx).view(item_count, route_stop - route_start, 1, self.out_features)
-            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + route_offsets.unsqueeze(-1)).reshape(-1)
-            neighbor = lut_table.index_select(0, neighbor_idx).view(
-                item_count,
-                route_stop - route_start,
-                self.comparisons,
-                self.out_features,
-            )
-            corr = corr + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=(1, 2))
-
-        return corr.view(batch, seq, self.out_features)
-
-    def _route_output(
-        self,
-        latent: Tensor,
-        *,
-        input_device: torch.device,
-        compute_dtype: torch.dtype,
-        training: bool,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        del input_device
+    def compute(self, x: Tensor, *, compute_dtype: torch.dtype, training: bool) -> tuple[Tensor, Tensor, Tensor]:
+        x = x.to(torch.float32 if self.backend in {"tilelang", "zig"} else compute_dtype)
         if self.backend == "tilelang":
-            from ..backends import pairwise_tilelang
+            return self._tilelang_compute(x, compute_dtype=compute_dtype)
 
-            thresholds = self.thresholds.to(dtype=torch.float32, device=latent.device)
-            output, indices, margins = pairwise_tilelang(
-                latent.to(torch.float32),
-                self.anchors.to(device=latent.device),
-                thresholds,
-                self.lut.to(dtype=torch.float32, device=latent.device),
-                use_min_margin_ste=self.use_min_margin_ste,
-                surrogate=self.surrogate,
-            )
-            return output.to(compute_dtype), indices, margins
-
-        indices, margins = self._compute_indices(latent)
+        route = self.route(x)
         if self.backend == "zig":
-            if training:
-                raise RuntimeError("PairwiseLinear backend='zig' is inference-only; call .eval() or use backend='torch' for training")
-            from ..backends import pairwise_zig_forward
+            return self._zig_compute(x, route, compute_dtype=compute_dtype, training=training)
 
-            output = pairwise_zig_forward(
-                latent,
-                self.anchors,
-                self.thresholds.detach().to(dtype=torch.float32, device="cpu"),
-                self._zig_lut_for_inference(),
-                lut_dtype=self.cpu_lut_dtype,
-            )
-            return output.to(device=latent.device, dtype=compute_dtype), indices, margins
-
-        output = self._lookup_chunked(indices, compute_dtype=compute_dtype)
-        threshold_has_grad = bool(getattr(self.thresholds, "requires_grad", False))
-        if training and (latent.requires_grad or threshold_has_grad):
-            ste_corr = self._min_margin_ste(indices, margins) if self.use_min_margin_ste else self._full_ste(indices, margins)
-            output = output + ste_corr.to(output.dtype)
-        return output, indices, margins
+        lut = self.payload_table(dtype=compute_dtype, device=route.indices.device)
+        output = self.lookup(route, lut, compute_dtype=compute_dtype)
+        if training and (x.requires_grad or bool(getattr(self.thresholds, "requires_grad", False))):
+            output = output + self.ste_correction(route, lut).to(output.dtype)
+        return output, route.indices, route.margins
 
 
-class AbsDiffLUT(nn.Module):
-    """Two-input compare/LUT relation layer for query-key coordinate agreement."""
+class PairwiseWalshLUT(PairwiseLUT):
+    """PairwiseLUT with a structured Walsh payload table."""
 
     def __init__(
         self,
-        features: int,
-        out_features: int,
-        *,
-        tables: int = 16,
-        comparisons: int = 4,
-        seed: int = 0,
-        lut_init_std: float = 0.02,
-        width_init: float = 0.2,
-        use_min_margin_ste: bool = True,
-        use_output_scaling: bool = True,
-        surrogate: str = "fast_sigmoid_odd",
-    ) -> None:
-        super().__init__()
-        if features < 1:
-            raise ValueError(f"features must be >= 1, got {features}")
-        if out_features < 1:
-            raise ValueError(f"out_features must be >= 1, got {out_features}")
-        if tables < 1:
-            raise ValueError(f"tables must be >= 1, got {tables}")
-        if comparisons < 1:
-            raise ValueError(f"comparisons must be >= 1, got {comparisons}")
-        if width_init <= 0:
-            raise ValueError(f"width_init must be > 0, got {width_init}")
-        surrogate_gradient(torch.zeros((), dtype=torch.float32), surrogate)
-
-        self.features = int(features)
-        self.out_features = int(out_features)
-        self.tables = int(tables)
-        self.comparisons = int(comparisons)
-        self.table_size = 1 << int(comparisons)
-        self.use_min_margin_ste = bool(use_min_margin_ste)
-        self.surrogate = surrogate
-        self.output_scale = 1.0 / math.sqrt(tables) if use_output_scaling else 1.0
-        self.cache_route_debug = True
-        self._last_indices: Tensor | None = None
-        self._last_margins: Tensor | None = None
-
-        gen = torch.Generator(device="cpu").manual_seed(seed)
-        coords = torch.randint(0, features, (tables, comparisons), generator=gen, dtype=torch.long)
-        self.register_buffer("coords", coords)
-        self.log_widths = nn.Parameter(torch.full((tables, comparisons), self._inverse_softplus(width_init)))
-        self.lut = nn.Parameter(torch.randn(tables, self.table_size, out_features, generator=gen) * lut_init_std)
-        self.register_buffer("powers", 2 ** torch.arange(comparisons, dtype=torch.long))
-
-    @staticmethod
-    def _inverse_softplus(value: float) -> float:
-        return math.log(math.expm1(value))
-
-    def extra_repr(self) -> str:
-        widths = F.softplus(self.log_widths.detach())
-        return (
-            f"features={self.features}, out_features={self.out_features}, tables={self.tables}, "
-            f"comparisons={self.comparisons}, width_mean={float(widths.mean()):.4f}, "
-            f"use_min_margin_ste={self.use_min_margin_ste}, surrogate={self.surrogate!r}"
-        )
-
-    def _compute_dtype(self, query: Tensor, key: Tensor) -> torch.dtype:
-        dtype = torch.promote_types(query.dtype, key.dtype)
-        return torch.float32 if dtype in {torch.float16, torch.bfloat16} else dtype
-
-    def _route_chunk_size(
-        self,
-        *,
-        item_count: int,
-        payload_width: int,
-        compute_dtype: torch.dtype,
-        route_count: int,
-        target_bytes: int = 16 * 1024 * 1024,
-    ) -> int:
-        bytes_per_route = item_count * payload_width * torch.finfo(compute_dtype).bits // 8
-        return max(1, min(route_count, target_bytes // max(1, bytes_per_route)))
-
-    def _lookup_chunked(self, indices: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
-        prefix_shape = indices.shape[:-1]
-        route_count = indices.shape[-1]
-        item_count = max(1, indices.numel() // route_count)
-        indices_flat = indices.reshape(item_count, route_count)
-        lut_table = self.lut.to(dtype=compute_dtype, device=indices.device).reshape(
-            route_count * self.table_size,
-            self.out_features,
-        )
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features,
-            compute_dtype=compute_dtype,
-            route_count=route_count,
-        )
-        output = torch.zeros(item_count, self.out_features, device=indices.device, dtype=compute_dtype)
-
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            linear_idx = (indices_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            selected = lut_table.index_select(0, linear_idx).view(item_count, route_stop - route_start, self.out_features)
-            output = output + selected.sum(dim=1)
-
-        return output.view(*prefix_shape, self.out_features)
-
-    def _compute_indices(self, query: Tensor, key: Tensor) -> tuple[Tensor, Tensor]:
-        coord_flat = self.coords.reshape(-1)
-        q = query[..., coord_flat].view(*query.shape[:-1], self.tables, self.comparisons)
-        k = key[..., coord_flat].view(*key.shape[:-1], self.tables, self.comparisons)
-        widths = F.softplus(self.log_widths).to(dtype=query.dtype, device=query.device)
-        margins = widths - (q - k).abs()
-        indices = ((margins > 0).to(torch.long) * self.powers.to(device=query.device).view(1, 1, -1)).sum(dim=-1)
-        return indices, margins
-
-    def _min_margin_ste(self, indices: Tensor, margins: Tensor) -> Tensor:
-        r_mins = margins.abs().argmin(dim=-1)
-        u_mins = margins.gather(dim=-1, index=r_mins.unsqueeze(-1)).squeeze(-1)
-        neighbor_indices = indices ^ (2**r_mins).long()
-        ste_delta = ste_heaviside(u_mins, self.surrogate) - (u_mins > 0).to(u_mins.dtype)
-
-        prefix_shape = indices.shape[:-1]
-        route_count = indices.shape[-1]
-        item_count = max(1, indices.numel() // route_count)
-        current_flat = indices.reshape(item_count, route_count)
-        neighbor_flat = neighbor_indices.reshape(item_count, route_count)
-        ste_flat = ste_delta.reshape(item_count, route_count, 1).float()
-        lut_table = self.lut.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features,
-            compute_dtype=torch.float32,
-            route_count=route_count,
-        )
-        corr = torch.zeros(item_count, self.out_features, device=indices.device, dtype=torch.float32)
-
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            current = lut_table.index_select(0, current_idx).view(item_count, route_stop - route_start, self.out_features)
-            neighbor = lut_table.index_select(0, neighbor_idx).view(item_count, route_stop - route_start, self.out_features)
-            corr = corr + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=1)
-
-        return corr.view(*prefix_shape, self.out_features)
-
-    def _full_ste(self, indices: Tensor, margins: Tensor) -> Tensor:
-        prefix_shape = indices.shape[:-1]
-        route_count = indices.shape[-1]
-        item_count = max(1, indices.numel() // route_count)
-        current_flat = indices.reshape(item_count, route_count)
-        neighbor_flat = current_flat.unsqueeze(-1) ^ self.powers.to(device=indices.device).view(1, 1, -1)
-        ste_delta = ste_heaviside(margins, self.surrogate) - (margins > 0).to(margins.dtype)
-        ste_flat = ste_delta.reshape(item_count, route_count, self.comparisons, 1).float()
-        lut_table = self.lut.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features * (self.comparisons + 1),
-            compute_dtype=torch.float32,
-            route_count=route_count,
-            target_bytes=8 * 1024 * 1024,
-        )
-        corr = torch.zeros(item_count, self.out_features, device=indices.device, dtype=torch.float32)
-
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            current = lut_table.index_select(0, current_idx).view(item_count, route_stop - route_start, 1, self.out_features)
-            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + route_offsets.unsqueeze(-1)).reshape(-1)
-            neighbor = lut_table.index_select(0, neighbor_idx).view(
-                item_count,
-                route_stop - route_start,
-                self.comparisons,
-                self.out_features,
-            )
-            corr = corr + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=(1, 2))
-
-        return corr.view(*prefix_shape, self.out_features)
-
-    def forward(self, query: Tensor, key: Tensor) -> Tensor:
-        if query.shape != key.shape:
-            raise ValueError(f"query and key must have the same shape, got {tuple(query.shape)} and {tuple(key.shape)}")
-        if query.ndim < 2:
-            raise ValueError(f"query/key must have at least 2 dims [..., features], got {tuple(query.shape)}")
-        if query.shape[-1] != self.features:
-            raise ValueError(f"expected last dimension {self.features}, got {query.shape[-1]}")
-
-        output_dtype = query.dtype
-        compute_dtype = self._compute_dtype(query, key)
-        q = query.to(compute_dtype)
-        k = key.to(compute_dtype)
-        indices, margins = self._compute_indices(q, k)
-        output = self._lookup_chunked(indices, compute_dtype=compute_dtype)
-        if self.training and (query.requires_grad or key.requires_grad or self.log_widths.requires_grad):
-            ste_corr = self._min_margin_ste(indices, margins) if self.use_min_margin_ste else self._full_ste(indices, margins)
-            output = output + ste_corr.to(output.dtype)
-        if self.output_scale != 1.0:
-            output = output * self.output_scale
-        if self.cache_route_debug:
-            self._last_indices = indices.detach()
-            self._last_margins = margins.detach()
-        else:
-            self._last_indices = None
-            self._last_margins = None
-        return output.to(dtype=output_dtype)
-
-
-class PairwiseWalshLinear(PairwiseLinear):
-    """Pairwise LUT whose payload rows are generated from low-order Walsh terms.
-
-    This is still a compare -> lookup -> accumulate operator at inference time:
-    the generated table is materialized from trainable coefficients, then the
-    normal PairwiseLinear row-selection path is used. Materialization uses only
-    broadcasted elementwise products and reductions, not GEMM.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
+        input_dim: int,
+        output_dim: int,
         *,
         tables: int = 16,
         comparisons: int = 4,
@@ -566,12 +371,12 @@ class PairwiseWalshLinear(PairwiseLinear):
         anchor_seed: int | None = None,
     ) -> None:
         if walsh_order not in {1, 2}:
-            raise ValueError(f"walsh_order must be 1 or 2, got {walsh_order}")
+            raise ValueError("walsh_order must be 1 or 2")
         if backend != "torch":
-            raise ValueError("PairwiseWalshLinear only supports backend='torch'")
+            raise ValueError("PairwiseWalshLUT only supports backend='torch'")
         super().__init__(
-            in_features,
-            out_features,
+            input_dim,
+            output_dim,
             tables=tables,
             comparisons=comparisons,
             backend=backend,
@@ -585,7 +390,6 @@ class PairwiseWalshLinear(PairwiseLinear):
             anchor_seed=anchor_seed,
         )
         del self.lut
-
         self.walsh_order = int(walsh_order)
         pair_indices = torch.combinations(torch.arange(comparisons, dtype=torch.long), r=2)
         if walsh_order == 1:
@@ -594,10 +398,10 @@ class PairwiseWalshLinear(PairwiseLinear):
 
         term_count = 1 + comparisons + int(pair_indices.shape[0])
         init_std = coeff_init_std / math.sqrt(term_count)
-        generator = torch.Generator(device="cpu").manual_seed(seed + 1)
-        self.constant = nn.Parameter(torch.randn(tables, out_features, generator=generator) * init_std)
-        self.linear_coeff = nn.Parameter(torch.randn(tables, comparisons, out_features, generator=generator) * init_std)
-        self.pair_coeff = nn.Parameter(torch.randn(tables, pair_indices.shape[0], out_features, generator=generator) * init_std)
+        gen = torch.Generator(device="cpu").manual_seed(seed + 1)
+        self.constant = nn.Parameter(torch.randn(tables, output_dim, generator=gen) * init_std)
+        self.linear_coeff = nn.Parameter(torch.randn(tables, comparisons, output_dim, generator=gen) * init_std)
+        self.pair_coeff = nn.Parameter(torch.randn(tables, pair_indices.shape[0], output_dim, generator=gen) * init_std)
 
         bit_values = torch.arange(self.table_size, dtype=torch.long).unsqueeze(-1).bitwise_and(self.powers.view(1, -1))
         self.register_buffer("walsh_bits", torch.where(bit_values > 0, torch.ones_like(bit_values), -torch.ones_like(bit_values)).float())
@@ -607,137 +411,138 @@ class PairwiseWalshLinear(PairwiseLinear):
         return 1 + self.comparisons + int(self.pair_indices.shape[0])
 
     def extra_repr(self) -> str:
-        return (
-            f"in_features={self.in_features}, out_features={self.out_features}, tables={self.tables}, "
-            f"comparisons={self.comparisons}, walsh_order={self.walsh_order}, backend={self.backend!r}, "
-            f"use_min_margin_ste={self.use_min_margin_ste}, surrogate={self.surrogate!r}, "
-            f"anchor_policy={self.anchor_policy!r}, anchor_seed={self.anchor_seed}"
-        )
+        return f"{super().extra_repr()}, walsh_order={self.walsh_order}"
 
     def materialize_lut(self, *, dtype: torch.dtype | None = None, device: torch.device | None = None) -> Tensor:
         compute_dtype = dtype if dtype is not None else self.constant.dtype
         compute_device = device if device is not None else self.constant.device
         bits = self.walsh_bits.to(dtype=compute_dtype, device=compute_device)
         output = self.constant.to(dtype=compute_dtype, device=compute_device).unsqueeze(1)
-        linear = bits.view(1, self.table_size, self.comparisons, 1) * self.linear_coeff.to(
+        linear_terms = bits.view(1, self.table_size, self.comparisons, 1) * self.linear_coeff.to(
             dtype=compute_dtype,
             device=compute_device,
-        ).view(self.tables, 1, self.comparisons, self.out_features)
-        output = output + linear.sum(dim=2)
+        ).view(self.tables, 1, self.comparisons, self.output_dim)
+        output = output + linear_terms.sum(dim=2)
         if self.pair_indices.numel() > 0:
             pairs = self.pair_indices.to(device=compute_device)
             pair_bits = bits[:, pairs[:, 0]] * bits[:, pairs[:, 1]]
-            pairwise = pair_bits.view(1, self.table_size, -1, 1) * self.pair_coeff.to(
+            pair_terms = pair_bits.view(1, self.table_size, -1, 1) * self.pair_coeff.to(
                 dtype=compute_dtype,
                 device=compute_device,
-            ).view(self.tables, 1, -1, self.out_features)
-            output = output + pairwise.sum(dim=2)
+            ).view(self.tables, 1, -1, self.output_dim)
+            output = output + pair_terms.sum(dim=2)
         return output
 
-    def _lookup_chunked_with_lut(self, indices: Tensor, lut: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
-        batch, seq, route_count = indices.shape
-        item_count = batch * seq
-        indices_flat = indices.reshape(item_count, route_count)
-        lut_table = lut.reshape(route_count * self.table_size, self.out_features)
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features,
-            compute_dtype=compute_dtype,
-            route_count=route_count,
-        )
-        output = torch.zeros(item_count, self.out_features, device=indices.device, dtype=compute_dtype)
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            linear_idx = (indices_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            selected = lut_table.index_select(0, linear_idx).view(item_count, route_stop - route_start, self.out_features)
-            output = output + selected.sum(dim=1)
-        return output.view(batch, seq, self.out_features)
+    def payload_table(self, *, dtype: torch.dtype, device: torch.device) -> Tensor:
+        return self.materialize_lut(dtype=dtype, device=device)
 
-    def _min_margin_ste_with_lut(self, indices: Tensor, margins: Tensor, lut: Tensor) -> Tensor:
-        r_mins = margins.abs().argmin(dim=-1)
-        u_mins = margins.gather(dim=-1, index=r_mins.unsqueeze(-1)).squeeze(-1)
-        neighbor_indices = indices ^ (2**r_mins).long()
-        ste_delta = ste_heaviside(u_mins, self.surrogate) - (u_mins > 0).to(u_mins.dtype)
 
-        batch, seq, route_count = indices.shape
-        item_count = batch * seq
-        current_flat = indices.reshape(item_count, route_count)
-        neighbor_flat = neighbor_indices.reshape(item_count, route_count)
-        ste_flat = ste_delta.reshape(item_count, route_count, 1).float()
-        lut_table = lut.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features,
-            compute_dtype=torch.float32,
-            route_count=route_count,
-        )
-        corr = torch.zeros(item_count, self.out_features, device=indices.device, dtype=torch.float32)
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            current = lut_table.index_select(0, current_idx).view(item_count, route_stop - route_start, self.out_features)
-            neighbor = lut_table.index_select(0, neighbor_idx).view(item_count, route_stop - route_start, self.out_features)
-            corr = corr + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=1)
-        return corr.view(batch, seq, self.out_features)
+class AbsDiffLUT(nn.Module):
+    """Two-input relation LUT based on coordinate closeness."""
 
-    def _full_ste_with_lut(self, indices: Tensor, margins: Tensor, lut: Tensor) -> Tensor:
-        batch, seq, route_count = indices.shape
-        item_count = batch * seq
-        current_flat = indices.reshape(item_count, route_count)
-        powers = self.powers.to(device=indices.device)
-        neighbor_flat = current_flat.unsqueeze(-1) ^ powers.view(1, 1, -1)
-        ste_delta = ste_heaviside(margins, self.surrogate) - (margins > 0).to(margins.dtype)
-        ste_flat = ste_delta.reshape(item_count, route_count, self.comparisons, 1).float()
-        lut_table = lut.to(dtype=torch.float32, device=indices.device).reshape(route_count * self.table_size, self.out_features)
-        route_chunk = self._route_chunk_size(
-            item_count=item_count,
-            payload_width=self.out_features * (self.comparisons + 1),
-            compute_dtype=torch.float32,
-            route_count=route_count,
-            target_bytes=8 * 1024 * 1024,
-        )
-        corr = torch.zeros(item_count, self.out_features, device=indices.device, dtype=torch.float32)
-        for route_start in range(0, route_count, route_chunk):
-            route_stop = min(route_start + route_chunk, route_count)
-            route_offsets = (torch.arange(route_start, route_stop, device=indices.device) * self.table_size).view(1, -1)
-            current_idx = (current_flat[:, route_start:route_stop] + route_offsets).reshape(-1)
-            current = lut_table.index_select(0, current_idx).view(item_count, route_stop - route_start, 1, self.out_features)
-            neighbor_idx = (neighbor_flat[:, route_start:route_stop] + route_offsets.unsqueeze(-1)).reshape(-1)
-            neighbor = lut_table.index_select(0, neighbor_idx).view(
-                item_count,
-                route_stop - route_start,
-                self.comparisons,
-                self.out_features,
-            )
-            corr = corr + (ste_flat[:, route_start:route_stop] * (neighbor - current)).sum(dim=(1, 2))
-        return corr.view(batch, seq, self.out_features)
-
-    def _route_output(
+    def __init__(
         self,
-        latent: Tensor,
+        features: int,
+        output_dim: int,
         *,
-        input_device: torch.device,
-        compute_dtype: torch.dtype,
-        training: bool,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        del input_device
-        indices, margins = self._compute_indices(latent)
-        lut = self.materialize_lut(dtype=compute_dtype, device=indices.device)
-        output = self._lookup_chunked_with_lut(indices, lut, compute_dtype=compute_dtype)
-        threshold_has_grad = bool(getattr(self.thresholds, "requires_grad", False))
-        if training and (latent.requires_grad or threshold_has_grad):
-            ste_corr = self._min_margin_ste_with_lut(indices, margins, lut) if self.use_min_margin_ste else self._full_ste_with_lut(indices, margins, lut)
-            output = output + ste_corr.to(output.dtype)
-        return output, indices, margins
+        tables: int = 16,
+        comparisons: int = 4,
+        seed: int = 0,
+        lut_init_std: float = 0.02,
+        width_init: float = 0.2,
+        use_min_margin_ste: bool = True,
+        use_output_scaling: bool = True,
+        surrogate: str = "fast_sigmoid_odd",
+    ) -> None:
+        super().__init__()
+        if features < 1 or output_dim < 1 or tables < 1 or comparisons < 1:
+            raise ValueError("features, output_dim, tables, and comparisons must be positive")
+        if width_init <= 0:
+            raise ValueError("width_init must be positive")
+        surrogate_gradient(torch.zeros((), dtype=torch.float32), surrogate)
+
+        self.features = int(features)
+        self.output_dim = int(output_dim)
+        self.tables = int(tables)
+        self.comparisons = int(comparisons)
+        self.table_size = 1 << int(comparisons)
+        self.use_min_margin_ste = bool(use_min_margin_ste)
+        self.surrogate = surrogate
+        self.output_scale = 1.0 / math.sqrt(tables) if use_output_scaling else 1.0
+        self.cache_route_debug = True
+        self._last_indices: Tensor | None = None
+        self._last_margins: Tensor | None = None
+
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        self.register_buffer("coords", torch.randint(0, features, (tables, comparisons), generator=gen, dtype=torch.long))
+        self.log_widths = nn.Parameter(torch.full((tables, comparisons), self._inverse_softplus(width_init)))
+        self.lut = nn.Parameter(torch.randn(tables, self.table_size, output_dim, generator=gen) * lut_init_std)
+        self.register_buffer("powers", 2 ** torch.arange(comparisons, dtype=torch.long))
+
+    @staticmethod
+    def _inverse_softplus(value: float) -> float:
+        return math.log(math.expm1(value))
+
+    @staticmethod
+    def _compute_dtype(query: Tensor, key: Tensor) -> torch.dtype:
+        dtype = torch.promote_types(query.dtype, key.dtype)
+        return torch.float32 if dtype in {torch.float16, torch.bfloat16} else dtype
+
+    def route(self, query: Tensor, key: Tensor) -> PairwiseRoute:
+        coord_flat = self.coords.reshape(-1)
+        q = query[..., coord_flat].view(*query.shape[:-1], self.tables, self.comparisons)
+        k = key[..., coord_flat].view(*key.shape[:-1], self.tables, self.comparisons)
+        widths = F.softplus(self.log_widths).to(dtype=query.dtype, device=query.device)
+        margins = widths - (q - k).abs()
+        indices = ((margins > 0).to(torch.long) * self.powers.to(device=query.device).view(1, 1, -1)).sum(dim=-1)
+        return PairwiseRoute(indices=indices, margins=margins)
+
+    def lookup(self, route: PairwiseRoute, *, compute_dtype: torch.dtype) -> Tensor:
+        return _lookup_lut_rows(
+            route.indices,
+            self.lut.to(dtype=compute_dtype, device=route.indices.device),
+            table_size=self.table_size,
+            output_dim=self.output_dim,
+            compute_dtype=compute_dtype,
+        )
+
+    def ste_correction(self, route: PairwiseRoute) -> Tensor:
+        lut = self.lut.to(dtype=torch.float32, device=route.indices.device)
+        if self.use_min_margin_ste:
+            neighbor, ste, _ = _min_margin_neighbors(route, self.surrogate)
+            return _ste_lut_delta(
+                current_indices=route.indices,
+                neighbor_indices=neighbor,
+                ste_weight=ste,
+                lut=lut,
+                table_size=self.table_size,
+                output_dim=self.output_dim,
+            )
+        return _full_ste_lut_delta(route, self.powers, lut, table_size=self.table_size, output_dim=self.output_dim, surrogate=self.surrogate)
+
+    def forward(self, query: Tensor, key: Tensor) -> Tensor:
+        output_dtype = query.dtype
+        compute_dtype = self._compute_dtype(query, key)
+        route = self.route(query.to(compute_dtype), key.to(compute_dtype))
+        output = self.lookup(route, compute_dtype=compute_dtype)
+        if self.training and (query.requires_grad or key.requires_grad or self.log_widths.requires_grad):
+            output = output + self.ste_correction(route).to(output.dtype)
+        if self.output_scale != 1.0:
+            output = output * self.output_scale
+        if self.cache_route_debug:
+            self._last_indices = route.indices.detach()
+            self._last_margins = route.margins.detach()
+        else:
+            self._last_indices = None
+            self._last_margins = None
+        return output.to(dtype=output_dtype)
 
 
 __all__ = [
     "AbsDiffLUT",
     "PAIRWISE_ANCHOR_POLICIES",
-    "PairwiseLinear",
-    "PairwiseWalshLinear",
+    "PairwiseLUT",
+    "PairwiseRoute",
+    "PairwiseWalshLUT",
     "_make_pairwise_anchors",
 ]

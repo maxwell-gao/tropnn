@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..layers import PairwiseLinear
+from ..layers import PairwiseLUT
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,7 @@ def _build_student(variant: str, dim: int, tables: int, comparisons: int, seed: 
     if variant == "linear":
         return LinearStudent(dim)
     if variant == "pairwise":
-        return PairwiseLinear(dim, dim, tables=tables, comparisons=comparisons, seed=seed, use_output_scaling=True)
+        return PairwiseLUT(dim, dim, tables=tables, comparisons=comparisons, seed=seed, use_output_scaling=True)
     raise ValueError(f"unknown variant {variant!r}")
 
 

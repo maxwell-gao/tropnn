@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from tropnn import AbsDiffLUT, PairwiseLinear
+from tropnn import AbsDiffLUT, PairwiseLUT
 
 
-def test_pairwise_linear_shape() -> None:
-    layer = PairwiseLinear(8, 3, tables=4, comparisons=3, seed=0)
+def test_pairwise_lut_shape() -> None:
+    layer = PairwiseLUT(8, 3, tables=4, comparisons=3, seed=0)
     y = layer(torch.randn(5, 8))
     assert y.shape == (5, 1, 3)
 

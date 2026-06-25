@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tropnn import AbsDiffLUT, PairwiseLinear, PairwiseWalshLinear
+from tropnn import AbsDiffLUT, PairwiseLUT, PairwiseWalshLUT
 from tropnn.examples.emnist import EmnistPairwiseWalshClassifier
 from tropnn.layers.surrogate import surrogate_gradient
 
@@ -17,7 +17,7 @@ def test_fast_sigmoid_odd_surrogate_has_lut_direction() -> None:
 
 
 def test_pairwise_zig_backend_is_inference_only() -> None:
-    layer = PairwiseLinear(8, 5, tables=3, comparisons=3, backend="zig", seed=1)
+    layer = PairwiseLUT(8, 5, tables=3, comparisons=3, backend="zig", seed=1)
 
     with pytest.raises(RuntimeError, match="inference-only"):
         layer(torch.randn(4, 8))
@@ -76,7 +76,7 @@ def test_absdiff_lut_min_margin_ste_routes_credit_to_query_key_and_width() -> No
 
 
 def test_pairwise_walsh_materializes_order2_rows() -> None:
-    layer = PairwiseWalshLinear(4, 2, tables=1, comparisons=3, walsh_order=2, seed=1)
+    layer = PairwiseWalshLUT(4, 2, tables=1, comparisons=3, walsh_order=2, seed=1)
     assert layer.walsh_term_count == 7
 
     with torch.no_grad():
@@ -113,8 +113,8 @@ def test_pairwise_walsh_materializes_order2_rows() -> None:
 
 def test_pairwise_walsh_forward_matches_flat_lut_rows() -> None:
     torch.manual_seed(0)
-    structured = PairwiseWalshLinear(5, 3, tables=4, comparisons=3, walsh_order=2, seed=3)
-    flat = PairwiseLinear(5, 3, tables=4, comparisons=3, seed=3)
+    structured = PairwiseWalshLUT(5, 3, tables=4, comparisons=3, walsh_order=2, seed=3)
+    flat = PairwiseLUT(5, 3, tables=4, comparisons=3, seed=3)
     with torch.no_grad():
         flat.anchors.copy_(structured.anchors)
         flat.thresholds.copy_(structured.thresholds)
@@ -127,7 +127,7 @@ def test_pairwise_walsh_forward_matches_flat_lut_rows() -> None:
 
 
 def test_pairwise_walsh_gradient_uses_selected_row_and_neighbor_delta() -> None:
-    layer = PairwiseWalshLinear(4, 1, tables=1, comparisons=2, walsh_order=2, use_output_scaling=False, seed=1)
+    layer = PairwiseWalshLUT(4, 1, tables=1, comparisons=2, walsh_order=2, use_output_scaling=False, seed=1)
     with torch.no_grad():
         layer.anchors[0, :, 0] = torch.tensor([0, 2])
         layer.anchors[0, :, 1] = torch.tensor([1, 3])

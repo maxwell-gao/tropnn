@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -10,73 +9,41 @@ from torch import Tensor
 from ..backend import Backend
 
 
-class RoutedLinearBase(nn.Module, ABC):
-    """Shared shell for discrete-routing linear layers.
+class LUTModuleBase(nn.Module, ABC):
+    """Shared shell for lookup-table modules.
 
-    Subclasses own the family-specific routing and payload math. The base class
-    only standardizes input shaping, compute dtype selection, output scaling,
-    and debug-state caching.
+    The base class only handles boring module mechanics: optional single-token
+    sequence wrapping, compute dtype selection, output scaling, and debug route
+    caching. Subclasses own the actual algorithm.
     """
 
-    def __init__(self, in_features: int, out_features: int, *, backend: Backend = "torch", output_scale: float = 1.0) -> None:
+    def __init__(self, input_dim: int, output_dim: int, *, backend: Backend = "torch", output_scale: float = 1.0) -> None:
         super().__init__()
-        if in_features < 1:
-            raise ValueError(f"in_features must be >= 1, got {in_features}")
-        if out_features < 1:
-            raise ValueError(f"out_features must be >= 1, got {out_features}")
-        self.in_features = in_features
-        self.out_features = out_features
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
         self.backend = backend
-        self.output_scale = output_scale
-        self._last_indices: Optional[Tensor] = None
-        self._last_margins: Optional[Tensor] = None
+        self.output_scale = float(output_scale)
+        self.cache_route_debug = True
+        self._last_indices: Tensor | None = None
+        self._last_margins: Tensor | None = None
 
-    def _compute_dtype(self, x: Tensor) -> torch.dtype:
+    @staticmethod
+    def compute_dtype(x: Tensor) -> torch.dtype:
         return torch.float32 if x.dtype in {torch.float16, torch.bfloat16} else x.dtype
 
-    def _route_chunk_size(
-        self,
-        *,
-        item_count: int,
-        payload_width: int,
-        compute_dtype: torch.dtype,
-        route_count: int,
-        target_bytes: int = 16 * 1024 * 1024,
-    ) -> int:
-        bytes_per_route = item_count * payload_width * torch.finfo(compute_dtype).bits // 8
-        return max(1, min(route_count, target_bytes // max(1, bytes_per_route)))
-
     @abstractmethod
-    def _project_input(self, x: Tensor, compute_dtype: torch.dtype) -> Tensor:
-        """Map input to the latent representation used by the routing family."""
-
-    @abstractmethod
-    def _route_output(
-        self,
-        latent: Tensor,
-        *,
-        input_device: torch.device,
-        compute_dtype: torch.dtype,
-        training: bool,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Return output, discrete route indices, and route margins."""
+    def compute(self, x: Tensor, *, compute_dtype: torch.dtype, training: bool) -> tuple[Tensor, Tensor, Tensor]:
+        """Return output, route indices, and route margins."""
 
     def forward(self, x: Tensor) -> Tensor:
         if x.ndim == 2:
             x = x.unsqueeze(1)
         input_dtype = x.dtype
-        compute_dtype = self._compute_dtype(x)
-        latent = self._project_input(x, compute_dtype)
-        output, route_indices, margins = self._route_output(
-            latent,
-            input_device=x.device,
-            compute_dtype=compute_dtype,
-            training=self.training,
-        )
+        output, indices, margins = self.compute(x, compute_dtype=self.compute_dtype(x), training=self.training)
         if self.output_scale != 1.0:
             output = output * self.output_scale
-        if getattr(self, "cache_route_debug", True):
-            self._last_indices = route_indices.detach()
+        if self.cache_route_debug:
+            self._last_indices = indices.detach()
             self._last_margins = margins.detach()
         else:
             self._last_indices = None
