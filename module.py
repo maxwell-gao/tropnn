@@ -1,3 +1,3 @@
-from .layers import TropLinear
+from .layers import PairwiseLinear
 
-__all__ = ["TropLinear"]
+__all__ = ["PairwiseLinear"]

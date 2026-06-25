@@ -5,7 +5,14 @@ import torch
 from torch import Tensor
 
 from ._utils import select_block_size as _select_block_size
-from .tilelang_route import has_tilelang
+
+
+def has_tilelang() -> bool:
+    try:
+        import tilelang  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _require_float32(*tensors: Tensor) -> None:

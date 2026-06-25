@@ -1,14 +1,14 @@
 [project]
 name = "tropnn"
 version = "0.1.0"
-description = "Minimal tropical neural layer library"
+description = "Minimal pairwise comparison lookup-table neural layer library"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "Senquan(Maxwell) Gao" }
 ]
-keywords = ["tropical", "neural-network", "torch", "triton", "teaching"]
+keywords = ["pairwise", "lookup-table", "neural-network", "torch", "teaching"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -29,9 +29,6 @@ dependencies = [
 cpu = [
     "ziglang==0.16.0",
 ]
-triton = [
-    "triton",
-]
 dev = [
     "pytest>=9.0.2",
     "ruff>=0.1.0",
@@ -39,10 +36,9 @@ dev = [
 
 [project.scripts]
 tropnn-emnist = "tropnn.examples.emnist:main"
-tropnn-cifar100 = "tropnn.examples.cifar100:main"
-tropnn-benchmark = "tropnn.tools.benchmark:main"
-tropnn-profile = "tropnn.tools.profile:main"
+tropnn-recovery-lut-structures = "tropnn.examples.recovery_lut_structures:main"
 tropnn-scaling-benchmark = "tropnn.tools.scaling_benchmark:main"
+tropnn-dense-projection-fit = "tropnn.tools.dense_projection_fit:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
