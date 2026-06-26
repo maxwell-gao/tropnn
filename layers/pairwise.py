@@ -154,6 +154,10 @@ class PairwiseLUT(LUTModuleBase):
         thresholds = torch.zeros(spec.tables, spec.comparisons)
         self.register_buffer("thresholds", thresholds) if fixed_zero_threshold else setattr(self, "thresholds", nn.Parameter(thresholds))
         self.lut = nn.Parameter(_init_lut(spec, seed=seed, init_std=lut_init_std))
+        self._packed_payload_train_key: tuple[object, ...] | None = None
+        self._packed_payload_train: object | None = None
+        self._packed_payload_eval_key: tuple[object, ...] | None = None
+        self._packed_payload_eval: object | None = None
 
     @property
     def tables(self) -> int: return self.spec.tables
@@ -226,6 +230,34 @@ class PairwiseLUT(LUTModuleBase):
     def lookup(self, route: PairwiseRoute, lut: Tensor, *, compute_dtype: torch.dtype) -> Tensor: return self.lut_forward(route, lut, compute_dtype=compute_dtype)
     def ste_correction(self, route: PairwiseRoute, lut: Tensor) -> Tensor: return self.lut_backward_surrogate(route, lut)
     def set_ste_mode(self, use_min_margin: bool) -> None: self._use_min_margin_ste = bool(use_min_margin)
+    def clear_packed_payload_cache(self) -> None:
+        self._packed_payload_train_key = None
+        self._packed_payload_train = None
+        self._packed_payload_eval_key = None
+        self._packed_payload_eval = None
+
+    def _packed_payload_key(self, device: torch.device) -> tuple[object, ...]:
+        return (
+            self.lut_dtype,
+            str(device),
+            str(self.lut.dtype),
+            tuple(int(v) for v in self.lut.shape),
+            int(self.lut._version),
+        )
+
+    def _packed_payload_for(self, device: torch.device) -> object:
+        from ..backends.pairwise_payload import _pack_lut_payload
+
+        key = self._packed_payload_key(device)
+        if self.training:
+            if self._packed_payload_train_key != key or self._packed_payload_train is None:
+                self._packed_payload_train = _pack_lut_payload(self.lut.to(device=device), self.lut_dtype)
+                self._packed_payload_train_key = key
+            return self._packed_payload_train
+        if self._packed_payload_eval_key != key or self._packed_payload_eval is None:
+            self._packed_payload_eval = _pack_lut_payload(self.lut.to(device=device), self.lut_dtype)
+            self._packed_payload_eval_key = key
+        return self._packed_payload_eval
 
     def _tilelang_compute(self, x: Tensor, *, compute_dtype: torch.dtype) -> tuple[Tensor, PairwiseRoute]:
         from ..backends import pairwise_tilelang
@@ -238,6 +270,7 @@ class PairwiseLUT(LUTModuleBase):
             use_min_margin_ste=self.use_min_margin_ste,
             surrogate=self.surrogate,
             lut_dtype=self.lut_dtype,
+            packed_payload=self._packed_payload_for(x.device),
         )
         return output.to(compute_dtype), PairwiseRoute(indices, margins)
 
@@ -252,6 +285,7 @@ class PairwiseLUT(LUTModuleBase):
             use_min_margin_ste=self.use_min_margin_ste,
             surrogate=self.surrogate,
             lut_dtype=self.lut_dtype,
+            packed_payload=self._packed_payload_for(x.device),
         )
         return output.to(compute_dtype), PairwiseRoute(indices, margins)
 

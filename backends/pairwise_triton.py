@@ -467,6 +467,7 @@ def _run_forward(
     lut: Tensor,
     *,
     lut_dtype: PackedLutDType,
+    packed_payload: Any | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Any]:
     if triton is None:
         raise RuntimeError("Triton is not installed; install triton or use backend='torch'")
@@ -479,7 +480,9 @@ def _run_forward(
     tables, comparisons, pair_width = anchors.shape
     if pair_width != 2:
         raise ValueError(f"anchors must have shape [tables, comparisons, 2], got {tuple(anchors.shape)}")
-    payload = _pack_lut_payload(lut, lut_dtype)
+    payload = packed_payload if packed_payload is not None else _pack_lut_payload(lut, lut_dtype)
+    if payload.mode != lut_dtype:
+        raise ValueError("packed_payload mode does not match lut_dtype")
     item_count = batch * steps
     out_features = payload.out_features
     block_d = _block_d(out_features)
@@ -536,8 +539,9 @@ class _PairwiseTritonFunction(torch.autograd.Function):
         use_min_margin_ste: bool,
         surrogate: str,
         lut_dtype: str,
+        packed_payload: Any | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        output, indices, margins, payload = _run_forward(latent, anchors, thresholds, lut, lut_dtype=lut_dtype)
+        output, indices, margins, payload = _run_forward(latent, anchors, thresholds, lut, lut_dtype=lut_dtype, packed_payload=packed_payload)
         ctx.save_for_backward(indices, margins, anchors.contiguous().reshape(-1).to(torch.int64), payload.data, payload.scales, payload.codebook)
         ctx.latent_shape = tuple(latent.shape)
         ctx.lut_shape = tuple(lut.shape)
@@ -645,7 +649,7 @@ class _PairwiseTritonFunction(torch.autograd.Function):
                 BLOCK_D=block_d,
                 USE_IZHIKEVICH=ctx.use_izhikevich_surrogate,
             )
-        return grad_x.view(batch, steps, in_features), None, grad_thresholds, grad_lut.to(dtype=ctx.lut_input_dtype), None, None, None
+        return grad_x.view(batch, steps, in_features), None, grad_thresholds, grad_lut.to(dtype=ctx.lut_input_dtype), None, None, None, None
 
 
 def pairwise_triton(
@@ -657,9 +661,10 @@ def pairwise_triton(
     use_min_margin_ste: bool,
     surrogate: str = "fast_sigmoid_odd",
     lut_dtype: PackedLutDType = "fp32",
+    packed_payload: Any | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     if surrogate not in {"fast_sigmoid_odd", "izhikevich"}:
         raise ValueError(f"Pairwise Triton backend does not support surrogate={surrogate!r}")
     if lut_dtype not in {"fp32", "bf16", "int8", "fp8", "fp4", "nf4"}:
         raise ValueError(f"Pairwise Triton backend does not support lut_dtype={lut_dtype!r}")
-    return _PairwiseTritonFunction.apply(latent, anchors, thresholds, lut, use_min_margin_ste, surrogate, lut_dtype)
+    return _PairwiseTritonFunction.apply(latent, anchors, thresholds, lut, use_min_margin_ste, surrogate, lut_dtype, packed_payload)

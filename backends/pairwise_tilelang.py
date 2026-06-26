@@ -1075,6 +1075,7 @@ def _run_forward(
     *,
     target: str,
     lut_dtype: PackedLutDType = "fp32",
+    packed_payload: _PackedPayload | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, _PackedPayload]:
     if not has_tilelang():
         raise RuntimeError("TileLang is not installed; install tilelang or use backend='torch'")
@@ -1099,7 +1100,9 @@ def _run_forward(
     latent_flat = latent.reshape(item_count, in_features).contiguous()
     anchors_contig = anchors.contiguous()
     thresholds_contig = thresholds.contiguous()
-    payload = _pack_lut_payload(lut, lut_dtype)
+    payload = packed_payload if packed_payload is not None else _pack_lut_payload(lut, lut_dtype)
+    if payload.mode != lut_dtype or payload.table_size != table_size or payload.out_features != out_features:
+        raise ValueError("packed_payload does not match the requested LUT payload layout")
     indices = torch.empty((item_count, tables), device=latent.device, dtype=torch.int64)
     margins = torch.empty((item_count, tables, comparisons), device=latent.device, dtype=torch.float32)
     output = torch.empty((item_count, out_features), device=latent.device, dtype=torch.float32)
@@ -1135,8 +1138,9 @@ class _PairwiseTileLangFunction(torch.autograd.Function):
         surrogate: str,
         target: str,
         lut_dtype: str,
+        packed_payload: _PackedPayload | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        output, indices, margins, payload = _run_forward(latent, anchors, thresholds, lut, target=target, lut_dtype=lut_dtype)
+        output, indices, margins, payload = _run_forward(latent, anchors, thresholds, lut, target=target, lut_dtype=lut_dtype, packed_payload=packed_payload)
         ctx.save_for_backward(indices, margins, anchors, payload.data, payload.scales, payload.codebook)
         ctx.latent_shape = tuple(latent.shape)
         ctx.lut_shape = tuple(lut.shape)
@@ -1268,7 +1272,7 @@ class _PairwiseTileLangFunction(torch.autograd.Function):
                 )
             ste_kernel(grad_flat, indices_flat, margins_flat, anchors_contig, payload_data, payload_scales, payload_codebook, grad_latent, grad_thresholds)
 
-        return grad_latent.view(batch, steps, in_features), None, grad_thresholds, grad_lut.to(dtype=ctx.lut_input_dtype), None, None, None, None
+        return grad_latent.view(batch, steps, in_features), None, grad_thresholds, grad_lut.to(dtype=ctx.lut_input_dtype), None, None, None, None, None
 
 
 def pairwise_tilelang(
@@ -1281,9 +1285,10 @@ def pairwise_tilelang(
     surrogate: str = "fast_sigmoid_odd",
     target: str = "cuda",
     lut_dtype: PackedLutDType = "fp32",
+    packed_payload: _PackedPayload | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     if surrogate not in {"fast_sigmoid_odd", "izhikevich"}:
         raise ValueError(f"Pairwise TileLang backend does not support surrogate={surrogate!r}")
     if lut_dtype not in {"fp32", "bf16", "int8", "fp8", "fp4", "nf4"}:
         raise ValueError(f"Pairwise TileLang backend does not support lut_dtype={lut_dtype!r}")
-    return _PairwiseTileLangFunction.apply(latent, anchors, thresholds, lut, use_min_margin_ste, surrogate, target, lut_dtype)
+    return _PairwiseTileLangFunction.apply(latent, anchors, thresholds, lut, use_min_margin_ste, surrogate, target, lut_dtype, packed_payload)
