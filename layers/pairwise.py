@@ -14,6 +14,7 @@ from .base import LUTLayerSpec, LUTModuleBase, finish_lut_output
 from .surrogate import ste_heaviside, surrogate_gradient
 
 PAIRWISE_ANCHOR_POLICIES = ("random", "random_no_replace", "local", "cyclic", "block", "expander", "permuted")
+LutDType = Literal["fp32", "bf16", "int8", "fp8", "fp4", "nf4"]
 
 __all__ = ["AbsDiffLUT", "AbsDiffSpec", "PAIRWISE_ANCHOR_POLICIES", "PairwiseLUT", "PairwiseRoute", "PairwiseSpec", "PairwiseWalshLUT"]
 
@@ -30,17 +31,20 @@ class PairwiseSpec:
     cpu_lut_dtype: Literal["f32", "f16"]
     anchor_policy: str
     anchor_seed: int
+    lut_dtype: LutDType
     use_output_scaling: bool
 
     def __post_init__(self) -> None:
         if self.tables < 1 or self.comparisons < 1:
             raise ValueError("tables and comparisons must be positive")
-        if self.backend not in {"torch", "tilelang", "zig"}:
+        if self.backend not in {"auto", "torch", "tilelang", "triton", "zig"}:
             raise ValueError(f"unsupported backend {self.backend!r}")
         if self.cpu_lut_dtype not in {"f32", "f16"}:
             raise ValueError("cpu_lut_dtype must be 'f32' or 'f16'")
         if self.anchor_policy not in PAIRWISE_ANCHOR_POLICIES:
             raise ValueError(f"unsupported anchor policy {self.anchor_policy!r}")
+        if self.lut_dtype not in {"fp32", "bf16", "int8", "fp8", "fp4", "nf4"}:
+            raise ValueError(f"unsupported lut_dtype {self.lut_dtype!r}")
 
     @property
     def table_size(self) -> int:
@@ -118,7 +122,14 @@ class PairwiseLUT(LUTModuleBase):
         cpu_lut_dtype: Literal["f32", "f16"] = "f32",
         anchor_policy: str = "random",
         anchor_seed: int | None = None,
+        lut_dtype: LutDType = "fp32",
+        slope_bank_rank: int = 0,
+        slope_bank_atom_init_std: float = 0.02,
+        slope_bank_coeff_init_std: float = 0.0,
     ) -> None:
+        del slope_bank_atom_init_std, slope_bank_coeff_init_std
+        if int(slope_bank_rank) != 0:
+            raise ValueError("PairwiseLUT no longer supports slope_bank_rank; use the plain payload LUT path")
         spec = PairwiseSpec(
             int(input_dim),
             int(output_dim),
@@ -130,11 +141,13 @@ class PairwiseLUT(LUTModuleBase):
             cpu_lut_dtype,
             anchor_policy,
             seed if anchor_seed is None else int(anchor_seed),
+            lut_dtype,
             bool(use_output_scaling),
         )
         surrogate_gradient(torch.zeros((), dtype=torch.float32), spec.surrogate)
         super().__init__(LUTLayerSpec.build(spec.input_dim, spec.output_dim, backend=spec.backend, output_scale=spec.output_scale))
         self.spec = spec
+        self._use_min_margin_ste = spec.use_min_margin_ste
         self._zig_cache = _ZigLutCache(spec.cpu_lut_dtype)
         self.register_buffer("anchors", _make_pairwise_anchors(spec.input_dim, spec.tables, spec.comparisons, policy=spec.anchor_policy, seed=spec.anchor_seed))
         self.register_buffer("powers", 2 ** torch.arange(spec.comparisons, dtype=torch.long))
@@ -149,9 +162,11 @@ class PairwiseLUT(LUTModuleBase):
     @property
     def table_size(self) -> int: return self.spec.table_size
     @property
-    def use_min_margin_ste(self) -> bool: return self.spec.use_min_margin_ste
+    def use_min_margin_ste(self) -> bool: return self._use_min_margin_ste
     @property
     def surrogate(self) -> str: return self.spec.surrogate
+    @property
+    def lut_dtype(self) -> LutDType: return self.spec.lut_dtype
     @property
     def cpu_lut_dtype(self) -> Literal["f32", "f16"]: return self.spec.cpu_lut_dtype
     @property
@@ -171,12 +186,15 @@ class PairwiseLUT(LUTModuleBase):
     def compute(self, x: Tensor, *, compute_dtype: torch.dtype, training: bool) -> tuple[Tensor, PairwiseRoute]:
         """Route rows, read LUT payloads, and attach the finite-difference STE path."""
 
-        x = x.to(torch.float32 if self.backend in {"tilelang", "zig"} else compute_dtype)
-        if self.backend == "tilelang":
+        backend = "tilelang" if self.backend == "auto" and x.is_cuda else ("torch" if self.backend == "auto" else self.backend)
+        x = x.to(torch.float32 if backend in {"tilelang", "triton", "zig"} else compute_dtype)
+        if backend == "tilelang":
             return self._tilelang_compute(x, compute_dtype=compute_dtype)
+        if backend == "triton":
+            return self._triton_compute(x, compute_dtype=compute_dtype)
 
         route = self.cache_index(x)
-        if self.backend == "zig":
+        if backend == "zig":
             return self._zig_compute(x, route, compute_dtype=compute_dtype, training=training)
 
         lut = self.lut_payload(dtype=compute_dtype, device=route.indices.device)
@@ -189,7 +207,7 @@ class PairwiseLUT(LUTModuleBase):
         return _cache_pairwise_index(x, self.anchors, self.thresholds, self.powers)
 
     def lut_payload(self, *, dtype: torch.dtype, device: torch.device) -> Tensor:
-        return self.lut.to(dtype=dtype, device=device)
+        return _materialize_lut_payload(self.lut, self.lut_dtype, dtype=dtype, device=device)
 
     def lut_forward(self, route: PairwiseRoute, lut: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
         return _sum_lut_rows(route.indices, lut, table_size=self.table_size, output_dim=self.output_dim, compute_dtype=compute_dtype)
@@ -207,6 +225,7 @@ class PairwiseLUT(LUTModuleBase):
     def payload_table(self, *, dtype: torch.dtype, device: torch.device) -> Tensor: return self.lut_payload(dtype=dtype, device=device)
     def lookup(self, route: PairwiseRoute, lut: Tensor, *, compute_dtype: torch.dtype) -> Tensor: return self.lut_forward(route, lut, compute_dtype=compute_dtype)
     def ste_correction(self, route: PairwiseRoute, lut: Tensor) -> Tensor: return self.lut_backward_surrogate(route, lut)
+    def set_ste_mode(self, use_min_margin: bool) -> None: self._use_min_margin_ste = bool(use_min_margin)
 
     def _tilelang_compute(self, x: Tensor, *, compute_dtype: torch.dtype) -> tuple[Tensor, PairwiseRoute]:
         from ..backends import pairwise_tilelang
@@ -215,9 +234,24 @@ class PairwiseLUT(LUTModuleBase):
             x.to(torch.float32),
             self.anchors.to(device=x.device),
             self.thresholds.to(dtype=torch.float32, device=x.device),
-            self.lut.to(dtype=torch.float32, device=x.device),
+            self.lut.to(device=x.device),
             use_min_margin_ste=self.use_min_margin_ste,
             surrogate=self.surrogate,
+            lut_dtype=self.lut_dtype,
+        )
+        return output.to(compute_dtype), PairwiseRoute(indices, margins)
+
+    def _triton_compute(self, x: Tensor, *, compute_dtype: torch.dtype) -> tuple[Tensor, PairwiseRoute]:
+        from ..backends.pairwise_triton import pairwise_triton
+
+        output, indices, margins = pairwise_triton(
+            x.to(torch.float32),
+            self.anchors.to(device=x.device),
+            self.thresholds.to(dtype=torch.float32, device=x.device),
+            self.lut.to(device=x.device),
+            use_min_margin_ste=self.use_min_margin_ste,
+            surrogate=self.surrogate,
+            lut_dtype=self.lut_dtype,
         )
         return output.to(compute_dtype), PairwiseRoute(indices, margins)
 
@@ -379,10 +413,75 @@ class AbsDiffLUT(nn.Module):
 
 
 def _init_lut(spec: PairwiseSpec, *, seed: int, init_std: float) -> Tensor:
+    storage_dtype = torch.bfloat16 if spec.lut_dtype == "bf16" else torch.float32
     if init_std == 0.0:
-        return torch.zeros(spec.tables, spec.table_size, spec.output_dim)
+        return torch.zeros(spec.tables, spec.table_size, spec.output_dim, dtype=storage_dtype)
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    return torch.randn(spec.tables, spec.table_size, spec.output_dim, generator=gen) * init_std
+    return (torch.randn(spec.tables, spec.table_size, spec.output_dim, generator=gen) * init_std).to(storage_dtype)
+
+
+def _materialize_lut_payload(lut: Tensor, mode: LutDType, *, dtype: torch.dtype, device: torch.device) -> Tensor:
+    payload = lut.to(device=device)
+    if mode in {"fp32", "bf16"}:
+        return payload.to(dtype=dtype)
+    quantized = _fake_quantize_lut(payload.float(), mode)
+    return quantized.to(dtype=dtype)
+
+
+def _fake_quantize_lut(x: Tensor, mode: LutDType) -> Tensor:
+    if mode == "int8":
+        return _ste_quantize_uniform(x, qmax=127.0)
+    if mode == "fp8":
+        return _ste_quantize_fp8(x)
+    if mode == "fp4":
+        return _ste_quantize_codebook(x, [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0])
+    if mode == "nf4":
+        return _ste_quantize_codebook(
+            x,
+            [
+                -1.0,
+                -0.6961928,
+                -0.5250731,
+                -0.3949175,
+                -0.2844414,
+                -0.1847734,
+                -0.0910500,
+                0.0,
+                0.0795803,
+                0.1609302,
+                0.2461123,
+                0.3379152,
+                0.4407098,
+                0.5626170,
+                0.7229568,
+                1.0,
+            ],
+        )
+    return x
+
+
+def _ste_quantize_uniform(x: Tensor, *, qmax: float) -> Tensor:
+    scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / qmax
+    dequant = torch.round(x / scale).clamp(min=-qmax, max=qmax) * scale
+    return x + (dequant - x).detach()
+
+
+def _ste_quantize_fp8(x: Tensor) -> Tensor:
+    return _ste_quantize_uniform(x, qmax=127.0)
+
+
+def _ste_quantize_codebook(x: Tensor, values: list[float]) -> Tensor:
+    codebook = torch.tensor(values, dtype=x.dtype, device=x.device)
+    scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / codebook.abs().amax().clamp_min(1e-8)
+    normalized = x / scale
+    best = torch.full_like(normalized, codebook[0])
+    best_dist = (normalized - codebook[0]).abs()
+    for value in codebook[1:]:
+        dist = (normalized - value).abs()
+        best = torch.where(dist < best_dist, value, best)
+        best_dist = torch.minimum(best_dist, dist)
+    dequant = best * scale
+    return x + (dequant - x).detach()
 
 
 def _compute_dtype_for_lut(x: Tensor) -> torch.dtype:

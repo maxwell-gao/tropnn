@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-Backend = Literal["torch", "tilelang", "zig"]
+Backend = Literal["auto", "torch", "tilelang", "triton", "zig"]
 
 
 def has_tilelang() -> bool:
@@ -19,4 +19,12 @@ def has_pairwise_zig() -> bool:
     return _has_pairwise_zig()
 
 
-__all__ = ["Backend", "has_pairwise_zig", "has_tilelang"]
+def has_triton() -> bool:
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+__all__ = ["Backend", "has_pairwise_zig", "has_tilelang", "has_triton"]

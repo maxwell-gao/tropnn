@@ -39,6 +39,7 @@ tropnn-emnist = "tropnn.examples.emnist:main"
 tropnn-recovery-lut-structures = "tropnn.examples.recovery_lut_structures:main"
 tropnn-scaling-benchmark = "tropnn.tools.scaling_benchmark:main"
 tropnn-dense-projection-fit = "tropnn.tools.dense_projection_fit:main"
+tropnn-anchor-policy-benchmark = "tropnn.tools.anchor_policy_benchmark:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

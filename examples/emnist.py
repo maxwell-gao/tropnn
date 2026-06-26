@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 
 from tropnn import PairwiseLUT, PairwiseWalshLUT
 
@@ -24,6 +24,65 @@ class LinearImageClassifier(nn.Module):
         return self.linear(x.flatten(1))
 
 
+class EmnistLinearClassifier(nn.Module):
+    def __init__(self, *, input_dim: int, hidden_dim: int, num_classes: int, depth: int = 2, seed: int = 0, **_: object) -> None:
+        super().__init__()
+        torch.manual_seed(seed)
+        layers: list[nn.Module] = []
+        dim = input_dim
+        for _layer in range(max(0, depth - 1)):
+            layers.extend([nn.Linear(dim, hidden_dim), nn.GELU()])
+            dim = hidden_dim
+        layers.append(nn.Linear(dim, num_classes))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x.flatten(1))
+
+
+class EmnistPairwiseClassifier(nn.Module):
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        depth: int = 2,
+        tables: int = 64,
+        comparisons: int = 6,
+        seed: int = 0,
+        backend: str = "auto",
+        anchor_policy: str = "random",
+        lut_dtype: str = "fp32",
+        **_: object,
+    ) -> None:
+        super().__init__()
+        dims = [input_dim] + [hidden_dim] * max(0, depth - 1) + [num_classes]
+        self.layers = nn.ModuleList(
+            [
+                PairwiseLUT(
+                    dims[i],
+                    dims[i + 1],
+                    tables=tables,
+                    comparisons=comparisons,
+                    seed=seed + i,
+                    backend=backend,  # type: ignore[arg-type]
+                    anchor_policy=anchor_policy,
+                    lut_dtype=lut_dtype,  # type: ignore[arg-type]
+                )
+                for i in range(len(dims) - 1)
+            ]
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = x.flatten(1)
+        for idx, layer in enumerate(self.layers):
+            y = layer(y).squeeze(1)
+            if idx + 1 < len(self.layers):
+                y = torch.tanh(y)
+        return y
+
+
 class PairwiseImageClassifier(nn.Module):
     def __init__(
         self,
@@ -36,6 +95,7 @@ class PairwiseImageClassifier(nn.Module):
         lut_init_std: float,
         anchor_policy: str,
         backend: str,
+        lut_dtype: str,
     ) -> None:
         super().__init__()
         self.layer = PairwiseLUT(
@@ -47,6 +107,7 @@ class PairwiseImageClassifier(nn.Module):
             lut_init_std=lut_init_std,
             anchor_policy=anchor_policy,
             backend=backend,  # type: ignore[arg-type]
+            lut_dtype=lut_dtype,  # type: ignore[arg-type]
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -127,7 +188,20 @@ def _build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, in
         from torchvision.datasets import EMNIST
         from torchvision.transforms import Compose, Lambda, ToTensor
     except ImportError as exc:
-        raise RuntimeError("The EMNIST demo requires torchvision. Install it separately for this example.") from exc
+        try:
+            from lutflow.experiments.emnist_fit import _load_emnist_split
+        except ImportError:
+            raise RuntimeError("The EMNIST demo requires torchvision or lutflow's local IDX EMNIST loader.") from exc
+
+        root = Path(args.root).expanduser()
+        x_train, y_train = _load_emnist_split(root, args.split, train=True, limit=args.max_train, fix_orientation=True, permute=False, permute_seed=args.seed)
+        x_test, y_test = _load_emnist_split(root, args.split, train=False, limit=args.max_test, fix_orientation=True, permute=False, permute_seed=args.seed)
+        train_set = TensorDataset(x_train.float(), y_train.long())
+        test_set = TensorDataset(x_test.float(), y_test.long())
+        classes = int(max(int(y_train.max().item()), int(y_test.max().item())) + 1)
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=args.device == "cuda")
+        test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=args.device == "cuda")
+        return train_loader, test_loader, classes
 
     transform = Compose([ToTensor(), Lambda(lambda x: x.flatten())])
     root = Path(args.root).expanduser()
@@ -154,6 +228,7 @@ def _build_model(args: argparse.Namespace, classes: int) -> nn.Module:
             lut_init_std=args.lut_init_std,
             anchor_policy=args.anchor_policy,
             backend=args.backend,
+            lut_dtype=args.lut_dtype,
         )
     if args.family == "pairwise_walsh":
         return PairwiseWalshImageClassifier(
@@ -209,7 +284,8 @@ def main() -> None:
     parser.add_argument("--walsh-order", type=int, choices=(1, 2), default=2)
     parser.add_argument("--lut-init-std", type=float, default=0.02)
     parser.add_argument("--anchor-policy", default="random")
-    parser.add_argument("--backend", choices=("torch", "tilelang"), default="torch")
+    parser.add_argument("--backend", choices=("auto", "torch", "tilelang", "triton"), default="auto")
+    parser.add_argument("--lut-dtype", choices=("fp32", "bf16", "int8", "fp8", "fp4", "nf4"), default="fp32")
     parser.add_argument("--max-train", type=int, default=0)
     parser.add_argument("--max-test", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
