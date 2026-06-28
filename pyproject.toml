@@ -40,6 +40,13 @@ tropnn-recovery-lut-structures = "tropnn.examples.recovery_lut_structures:main"
 tropnn-scaling-benchmark = "tropnn.tools.scaling_benchmark:main"
 tropnn-dense-projection-fit = "tropnn.tools.dense_projection_fit:main"
 tropnn-anchor-policy-benchmark = "tropnn.tools.anchor_policy_benchmark:main"
+tropnn-paged-anchor-benchmark = "tropnn.tools.paged_anchor_benchmark:main"
+tropnn-soa-anchor-benchmark = "tropnn.tools.soa_anchor_benchmark:main"
+tropnn-tree-kernel-benchmark = "tropnn.tools.tree_kernel_benchmark:main"
+tropnn-emnist-payload-dtype-sweep = "tropnn.tools.emnist_payload_dtype_sweep:main"
+tropnn-emnist-discrete-payload = "tropnn.tools.emnist_discrete_payload:main"
+tropnn-emnist-route-conditioned = "tropnn.tools.emnist_route_conditioned:main"
+tropnn-partition-geometry-probe = "tropnn.tools.partition_geometry_probe:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

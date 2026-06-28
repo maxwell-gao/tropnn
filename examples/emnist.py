@@ -54,6 +54,7 @@ class EmnistPairwiseClassifier(nn.Module):
         backend: str = "auto",
         anchor_policy: str = "random",
         lut_dtype: str = "fp32",
+        lut_init_std: float = 0.0,
         **_: object,
     ) -> None:
         super().__init__()
@@ -66,6 +67,7 @@ class EmnistPairwiseClassifier(nn.Module):
                     tables=tables,
                     comparisons=comparisons,
                     seed=seed + i,
+                    lut_init_std=lut_init_std,
                     backend=backend,  # type: ignore[arg-type]
                     anchor_policy=anchor_policy,
                     lut_dtype=lut_dtype,  # type: ignore[arg-type]
@@ -285,7 +287,7 @@ def main() -> None:
     parser.add_argument("--lut-init-std", type=float, default=0.02)
     parser.add_argument("--anchor-policy", default="random")
     parser.add_argument("--backend", choices=("auto", "torch", "tilelang", "triton"), default="auto")
-    parser.add_argument("--lut-dtype", choices=("fp32", "bf16", "int8", "fp8", "fp4", "nf4"), default="fp32")
+    parser.add_argument("--lut-dtype", choices=("fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"), default="fp32")
     parser.add_argument("--max-train", type=int, default=0)
     parser.add_argument("--max-test", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)

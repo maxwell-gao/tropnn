@@ -585,7 +585,7 @@ class _PairwiseTritonFunction(torch.autograd.Function):
             table_size,
             BLOCK_D=block_d,
         )
-        if ctx.lut_dtype in {"fp32", "bf16"}:
+        if ctx.lut_dtype in {"fp32", "bf16", "fp16"}:
             kernel = _ste_min_float_kernel if ctx.use_min_margin_ste else _ste_full_float_kernel
             grid = (item_count, tables) if ctx.use_min_margin_ste else (item_count, tables, comparisons)
             kernel[grid](
@@ -665,6 +665,6 @@ def pairwise_triton(
 ) -> tuple[Tensor, Tensor, Tensor]:
     if surrogate not in {"fast_sigmoid_odd", "izhikevich"}:
         raise ValueError(f"Pairwise Triton backend does not support surrogate={surrogate!r}")
-    if lut_dtype not in {"fp32", "bf16", "int8", "fp8", "fp4", "nf4"}:
+    if lut_dtype not in {"fp32", "bf16", "fp16", "int8", "fp8", "fp4", "nf4"}:
         raise ValueError(f"Pairwise Triton backend does not support lut_dtype={lut_dtype!r}")
     return _PairwiseTritonFunction.apply(latent, anchors, thresholds, lut, use_min_margin_ste, surrogate, lut_dtype, packed_payload)

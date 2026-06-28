@@ -14,7 +14,7 @@ from .base import LUTLayerSpec, LUTModuleBase, finish_lut_output
 from .surrogate import ste_heaviside, surrogate_gradient
 
 PAIRWISE_ANCHOR_POLICIES = ("random", "random_no_replace", "local", "cyclic", "block", "expander", "permuted")
-LutDType = Literal["fp32", "bf16", "int8", "fp8", "fp4", "nf4"]
+LutDType = Literal["fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"]
 
 __all__ = ["AbsDiffLUT", "AbsDiffSpec", "PAIRWISE_ANCHOR_POLICIES", "PairwiseLUT", "PairwiseRoute", "PairwiseSpec", "PairwiseWalshLUT"]
 
@@ -43,7 +43,7 @@ class PairwiseSpec:
             raise ValueError("cpu_lut_dtype must be 'f32' or 'f16'")
         if self.anchor_policy not in PAIRWISE_ANCHOR_POLICIES:
             raise ValueError(f"unsupported anchor policy {self.anchor_policy!r}")
-        if self.lut_dtype not in {"fp32", "bf16", "int8", "fp8", "fp4", "nf4"}:
+        if self.lut_dtype not in {"fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"}:
             raise ValueError(f"unsupported lut_dtype {self.lut_dtype!r}")
 
     @property
@@ -447,7 +447,7 @@ class AbsDiffLUT(nn.Module):
 
 
 def _init_lut(spec: PairwiseSpec, *, seed: int, init_std: float) -> Tensor:
-    storage_dtype = torch.bfloat16 if spec.lut_dtype == "bf16" else torch.float32
+    storage_dtype = torch.bfloat16 if spec.lut_dtype == "bf16" else torch.float16 if spec.lut_dtype == "fp16" else torch.float32
     if init_std == 0.0:
         return torch.zeros(spec.tables, spec.table_size, spec.output_dim, dtype=storage_dtype)
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -456,7 +456,7 @@ def _init_lut(spec: PairwiseSpec, *, seed: int, init_std: float) -> Tensor:
 
 def _materialize_lut_payload(lut: Tensor, mode: LutDType, *, dtype: torch.dtype, device: torch.device) -> Tensor:
     payload = lut.to(device=device)
-    if mode in {"fp32", "bf16"}:
+    if mode in {"fp32", "bf16", "fp16"}:
         return payload.to(dtype=dtype)
     quantized = _fake_quantize_lut(payload.float(), mode)
     return quantized.to(dtype=dtype)
@@ -467,6 +467,10 @@ def _fake_quantize_lut(x: Tensor, mode: LutDType) -> Tensor:
         return _ste_quantize_uniform(x, qmax=127.0)
     if mode == "fp8":
         return _ste_quantize_fp8(x)
+    if mode == "int4":
+        return _ste_quantize_signed_integer(x, qmin=-8.0, qmax=7.0)
+    if mode == "int2":
+        return _ste_quantize_signed_integer(x, qmin=-2.0, qmax=1.0)
     if mode == "fp4":
         return _ste_quantize_codebook(x, [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0])
     if mode == "nf4":
@@ -502,6 +506,12 @@ def _ste_quantize_uniform(x: Tensor, *, qmax: float) -> Tensor:
 
 def _ste_quantize_fp8(x: Tensor) -> Tensor:
     return _ste_quantize_uniform(x, qmax=127.0)
+
+
+def _ste_quantize_signed_integer(x: Tensor, *, qmin: float, qmax: float) -> Tensor:
+    scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / max(1.0, qmax)
+    dequant = torch.round(x / scale).clamp(min=qmin, max=qmax) * scale
+    return x + (dequant - x).detach()
 
 
 def _ste_quantize_codebook(x: Tensor, values: list[float]) -> Tensor:

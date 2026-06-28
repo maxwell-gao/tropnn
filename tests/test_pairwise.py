@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tropnn.backends.pairwise_zig import has_pairwise_zig, pairwise_zig_forward, pairwise_zig_paged_forward, pairwise_zig_soa_forward, pairwise_zig_tree_tiled_forward
 from tropnn import AbsDiffLUT, PairwiseLUT, PairwiseWalshLUT
 from tropnn.examples.emnist import EmnistPairwiseWalshClassifier
 from tropnn.layers.surrogate import surrogate_gradient
@@ -21,6 +22,36 @@ def test_pairwise_zig_backend_is_inference_only() -> None:
 
     with pytest.raises(RuntimeError, match="inference-only"):
         layer(torch.randn(4, 8))
+
+
+@pytest.mark.skipif(not has_pairwise_zig(), reason="Zig backend is not available")
+def test_pairwise_zig_paged_forward_matches_standard_zig_forward() -> None:
+    torch.manual_seed(0)
+    layer = PairwiseLUT(16, 9, tables=5, comparisons=3, backend="torch", seed=2, lut_init_std=0.02, use_output_scaling=False)
+    x = torch.randn(4, 3, 16)
+    standard = pairwise_zig_forward(x.float(), layer.anchors, layer.thresholds.detach().float(), layer.lut.detach().float(), lut_dtype="f32")
+    paged = pairwise_zig_paged_forward(x.float(), layer.anchors, layer.thresholds.detach().float(), layer.lut.detach().float(), lut_dtype="f32", page_size=4)
+    assert torch.allclose(paged, standard, atol=1e-6)
+
+
+@pytest.mark.skipif(not has_pairwise_zig(), reason="Zig backend is not available")
+def test_pairwise_zig_soa_forward_matches_standard_zig_forward() -> None:
+    torch.manual_seed(0)
+    layer = PairwiseLUT(16, 9, tables=5, comparisons=3, backend="torch", seed=2, lut_init_std=0.02, use_output_scaling=False)
+    x = torch.randn(4, 3, 16)
+    standard = pairwise_zig_forward(x.float(), layer.anchors, layer.thresholds.detach().float(), layer.lut.detach().float(), lut_dtype="f32")
+    soa = pairwise_zig_soa_forward(x.float(), layer.anchors, layer.thresholds.detach().float(), layer.lut.detach().float(), lut_dtype="f32")
+    assert torch.allclose(soa, standard, atol=1e-6)
+
+
+@pytest.mark.skipif(not has_pairwise_zig(), reason="Zig backend is not available")
+def test_pairwise_zig_tree_tiled_forward_matches_standard_zig_forward() -> None:
+    torch.manual_seed(0)
+    layer = PairwiseLUT(16, 9, tables=5, comparisons=3, backend="torch", seed=2, lut_init_std=0.02, use_output_scaling=False)
+    x = torch.randn(4, 3, 16)
+    standard = pairwise_zig_forward(x.float(), layer.anchors, layer.thresholds.detach().float(), layer.lut.detach().float(), lut_dtype="f32")
+    tree = pairwise_zig_tree_tiled_forward(x.float(), layer.anchors, layer.thresholds.detach().float(), layer.lut.detach().float())
+    assert torch.allclose(tree, standard, atol=1e-6)
 
 
 def test_absdiff_lut_selects_rows_from_coordinate_closeness() -> None:
