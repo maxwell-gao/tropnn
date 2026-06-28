@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .emnist_payload_dtype_sweep import _build_local_loaders, _eval_model
-from .emnist_route_conditioned import RouteConditionedEmnistClassifier
+from .emnist_route_conditioned import RouteConditionedEmnistClassifier, _train as _train_pairwise
 
 ModelKind = Literal["mlp", "pairwise_plain", "pairwise_sparse_mixing", "pairwise_anchor_transform"]
 
@@ -22,10 +22,13 @@ ModelKind = Literal["mlp", "pairwise_plain", "pairwise_sparse_mixing", "pairwise
 @dataclass(frozen=True)
 class ProbeRow:
     model: str
+    optimizer: str
+    discrete_method: str
     depth: int
     hidden_dim: int
     tables: int
     comparisons: int
+    table_dropout: float
     grid_size: int
     epochs: int
     params: int
@@ -41,6 +44,13 @@ class ProbeRow:
     refinement_max: int
     interpolation_flips_mean: float
     normal_effective_rank: float
+    route_entropy: float
+    route_transition: float
+    route_unique_fraction: float
+    payload_commit_fraction: float
+    payload_saturation_fraction: float
+    changed_codes: int
+    total_codes: int
     figure_path: str
 
 
@@ -92,6 +102,7 @@ def _build_probe_model(args: argparse.Namespace, classes: int) -> nn.Module:
         backend=args.backend,
         anchor_policy=args.anchor_policy,
         lut_init_std=args.lut_init_std,
+        table_dropout=args.table_dropout,
         variant=variant,  # type: ignore[arg-type]
         mix_strength=args.mix_strength,
     )
@@ -321,7 +332,19 @@ def run(args: argparse.Namespace) -> ProbeRow:
     device = torch.device(args.device)
     train_loader, valid_loader, classes = _build_local_loaders(args)
     model = _build_probe_model(args, classes).to(device)
-    train_loss, train_acc = _train(model, train_loader, args, device=device)
+    train_stats: dict[str, float | int] = {
+        "route_entropy": 0.0,
+        "route_transition": 0.0,
+        "route_unique_fraction": 0.0,
+        "payload_commit_fraction": 0.0,
+        "payload_saturation_fraction": 0.0,
+        "changed_codes": 0,
+        "total_codes": 0,
+    }
+    if isinstance(model, RouteConditionedEmnistClassifier):
+        train_loss, train_acc, train_stats = _train_pairwise(model, train_loader, args, device=device)
+    else:
+        train_loss, train_acc = _train(model, train_loader, args, device=device)
     valid_loss, valid_acc = _eval_model(model, valid_loader, device=device)
     x_train, y_train = _collect_dataset_tensor(train_loader)
     center, u, v = _pca_plane(x_train, limit=args.pca_samples)
@@ -338,14 +361,19 @@ def run(args: argparse.Namespace) -> ProbeRow:
             preds.append(logits.argmax(dim=-1).cpu())
     pred = torch.cat(preds, dim=0)
     refinement_mean, refinement_max = _refinement(signatures)
-    fig_path = Path(args.figure_dir) / f"{args.model}_L{args.depth}_s{args.seed}.png"
+    opt_name = args.optimizer if args.optimizer == "adamw" else args.discrete_method
+    dropout_name = f"{args.table_dropout:.3f}".replace(".", "p")
+    fig_path = Path(args.figure_dir) / f"{args.model}_L{args.depth}_td{dropout_name}_{opt_name}_s{args.seed}.png"
     written_fig = _save_figure(full_ids, pred, args.grid_size, fig_path)
     return ProbeRow(
         model=args.model,
+        optimizer=args.optimizer,
+        discrete_method=args.discrete_method if args.optimizer == "discrete" else "none",
         depth=args.depth,
         hidden_dim=args.hidden_dim,
         tables=args.tables,
         comparisons=args.comparisons,
+        table_dropout=args.table_dropout,
         grid_size=args.grid_size,
         epochs=args.epochs,
         params=sum(p.numel() for p in model.parameters()),
@@ -361,6 +389,13 @@ def run(args: argparse.Namespace) -> ProbeRow:
         refinement_max=refinement_max,
         interpolation_flips_mean=_interpolation_flips(model, x_train.reshape(x_train.shape[0], -1), y_train, device=device, samples=args.interp_samples, pairs=args.interp_pairs, batch_size=args.probe_batch_size),
         normal_effective_rank=_normal_effective_rank(model),
+        route_entropy=float(train_stats["route_entropy"]),
+        route_transition=float(train_stats["route_transition"]),
+        route_unique_fraction=float(train_stats["route_unique_fraction"]),
+        payload_commit_fraction=float(train_stats["payload_commit_fraction"]),
+        payload_saturation_fraction=float(train_stats["payload_saturation_fraction"]),
+        changed_codes=int(train_stats["changed_codes"]),
+        total_codes=int(train_stats["total_codes"]),
         figure_path=str(written_fig),
     )
 
@@ -372,11 +407,22 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--model", choices=("mlp", "pairwise_plain", "pairwise_sparse_mixing", "pairwise_anchor_transform"), default="mlp")
     parser.add_argument("--backend", choices=("auto", "torch", "tilelang", "triton"), default="tilelang")
+    parser.add_argument("--optimizer", choices=("adamw", "discrete"), default="adamw")
+    parser.add_argument("--discrete-method", choices=("ef_sgd", "adam_ef", "factored_adam_ef", "integer_adam_ef", "scaled_integer_adam_ef", "bop2_ternary"), default="adam_ef")
+    parser.add_argument("--payload-bitwidth", type=int, choices=(2, 3, 4, 8), default=4)
+    parser.add_argument("--payload-lr", type=float, default=0.005)
+    parser.add_argument("--payload-step-size", type=float, default=0.05)
+    parser.add_argument("--accumulator-unit", type=float, default=0.0002)
+    parser.add_argument("--bop-threshold", type=float, default=0.1)
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.999)
+    parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--tables", type=int, default=64)
     parser.add_argument("--comparisons", type=int, default=6)
     parser.add_argument("--lut-init-std", type=float, default=0.0)
+    parser.add_argument("--table-dropout", type=float, default=0.0)
     parser.add_argument("--anchor-policy", default="permuted")
     parser.add_argument("--mix-strength", type=float, default=0.125)
     parser.add_argument("--epochs", type=int, default=2)
@@ -405,7 +451,8 @@ def main() -> None:
         writer.writeheader()
         writer.writerow(asdict(row))
     print(
-        f"model={row.model} L{row.depth} valid_loss={row.valid_loss:.4f} valid_acc={row.valid_acc:.4f} "
+        f"model={row.model} L{row.depth} optimizer={row.optimizer}:{row.discrete_method} "
+        f"table_dropout={row.table_dropout:.3f} valid_loss={row.valid_loss:.4f} valid_acc={row.valid_acc:.4f} "
         f"unique={row.unique_signatures} components={row.connected_components} boundary={row.boundary_density:.4f} "
         f"refine={row.refinement_mean:.3f} flips={row.interpolation_flips_mean:.2f} fig={row.figure_path}",
         flush=True,

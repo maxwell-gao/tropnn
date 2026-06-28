@@ -30,6 +30,7 @@ class RouteConditionedRow:
     comparisons: int
     anchor_policy: str
     mix_strength: float
+    table_dropout: float
     lut_init_std: float
     backend: str
     device: str
@@ -141,6 +142,7 @@ class RouteConditionedBlock(nn.Module):
         backend: str,
         anchor_policy: str,
         lut_init_std: float,
+        table_dropout: float,
         variant: RouteVariant,
         mix_strength: float,
     ) -> None:
@@ -155,6 +157,7 @@ class RouteConditionedBlock(nn.Module):
             backend=backend,  # type: ignore[arg-type]
             anchor_policy=anchor_policy,
             lut_init_std=lut_init_std,
+            table_dropout=table_dropout,
         )
         self.mixer = RouteConditionedMixer(dim, tables, variant, seed=seed + 1009, mix_strength=mix_strength)
 
@@ -215,6 +218,7 @@ class RouteConditionedEmnistClassifier(nn.Module):
         backend: str,
         anchor_policy: str,
         lut_init_std: float,
+        table_dropout: float,
         variant: RouteVariant,
         mix_strength: float,
     ) -> None:
@@ -230,6 +234,7 @@ class RouteConditionedEmnistClassifier(nn.Module):
                     backend=backend,
                     anchor_policy=anchor_policy,
                     lut_init_std=lut_init_std,
+                    table_dropout=table_dropout,
                     variant=variant,
                     mix_strength=mix_strength,
                 )
@@ -245,6 +250,7 @@ class RouteConditionedEmnistClassifier(nn.Module):
             backend=backend,  # type: ignore[arg-type]
             anchor_policy=anchor_policy,
             lut_init_std=lut_init_std,
+            table_dropout=table_dropout,
         )
         self.last_routes: list[Tensor] = []
 
@@ -300,10 +306,11 @@ def _train(model: RouteConditionedEmnistClassifier, train_loader, args: argparse
         payload_opt = None
         other_opt = None
     else:
+        payload_bitwidth = 2 if args.discrete_method == "bop2_ternary" else int(args.payload_bitwidth)
         payload_opt = RowLocalDiscretePayloadOptimizer(
             _pairwise_layers(model),
             method=args.discrete_method,
-            bitwidth=4,
+            bitwidth=payload_bitwidth,
             lr=args.payload_lr,
             step_size=args.payload_step_size,
             accumulator="float_ef",
@@ -311,7 +318,7 @@ def _train(model: RouteConditionedEmnistClassifier, train_loader, args: argparse
             beta1=args.beta1,
             beta2=args.beta2,
             eps=args.eps,
-            bop_threshold=1.0,
+            bop_threshold=args.bop_threshold,
             adam_m_unit=1e-5,
             adam_v_unit=1e-8,
             row_frequency_normalization=False,
@@ -404,6 +411,7 @@ def run(args: argparse.Namespace) -> RouteConditionedRow:
         backend=args.backend,
         anchor_policy=args.anchor_policy,
         lut_init_std=args.lut_init_std,
+        table_dropout=args.table_dropout,
         variant=args.variant,
         mix_strength=args.mix_strength,
     ).to(device)
@@ -418,6 +426,7 @@ def run(args: argparse.Namespace) -> RouteConditionedRow:
         comparisons=args.comparisons,
         anchor_policy=args.anchor_policy,
         mix_strength=args.mix_strength,
+        table_dropout=args.table_dropout,
         lut_init_std=args.lut_init_std,
         backend=args.backend,
         device=str(device),
@@ -451,12 +460,14 @@ def main() -> None:
     parser.add_argument("--backend", choices=("auto", "torch", "tilelang", "triton"), default="tilelang")
     parser.add_argument("--variant", choices=("plain", "sign_permutation", "sparse_mixing", "butterfly", "anchor_transform", "transformed_coordinates"), default="plain")
     parser.add_argument("--optimizer", choices=("adamw", "discrete"), default="adamw")
-    parser.add_argument("--discrete-method", choices=("ef_sgd", "adam_ef", "factored_adam_ef", "integer_adam_ef", "scaled_integer_adam_ef"), default="adam_ef")
+    parser.add_argument("--discrete-method", choices=("ef_sgd", "adam_ef", "factored_adam_ef", "integer_adam_ef", "scaled_integer_adam_ef", "bop2_ternary"), default="adam_ef")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--payload-bitwidth", type=int, choices=(2, 3, 4, 8), default=4)
     parser.add_argument("--payload-lr", type=float, default=0.005)
     parser.add_argument("--payload-step-size", type=float, default=0.05)
     parser.add_argument("--accumulator-unit", type=float, default=0.0002)
+    parser.add_argument("--bop-threshold", type=float, default=0.1)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--eps", type=float, default=1e-8)
@@ -468,6 +479,7 @@ def main() -> None:
     parser.add_argument("--comparisons", type=int, default=6)
     parser.add_argument("--lut-init-std", type=float, default=0.0)
     parser.add_argument("--mix-strength", type=float, default=0.125)
+    parser.add_argument("--table-dropout", type=float, default=0.0)
     parser.add_argument("--anchor-policy", default="permuted")
     parser.add_argument("--max-train", type=int, default=0)
     parser.add_argument("--max-test", type=int, default=0)
@@ -484,6 +496,7 @@ def main() -> None:
         writer.writerow(asdict(row))
     print(
         f"variant={row.variant} optimizer={row.optimizer}:{row.discrete_method} depth={row.depth} "
+        f"table_dropout={row.table_dropout:.3f} "
         f"train_loss={row.train_loss:.4f} train_acc={row.train_acc:.4f} "
         f"valid_loss={row.valid_loss:.4f} valid_acc={row.valid_acc:.4f} "
         f"route_entropy={row.route_entropy:.4f} route_transition={row.route_transition:.4f} "

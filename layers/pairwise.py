@@ -33,6 +33,7 @@ class PairwiseSpec:
     anchor_seed: int
     lut_dtype: LutDType
     use_output_scaling: bool
+    table_dropout: float
 
     def __post_init__(self) -> None:
         if self.tables < 1 or self.comparisons < 1:
@@ -45,6 +46,8 @@ class PairwiseSpec:
             raise ValueError(f"unsupported anchor policy {self.anchor_policy!r}")
         if self.lut_dtype not in {"fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"}:
             raise ValueError(f"unsupported lut_dtype {self.lut_dtype!r}")
+        if not 0.0 <= self.table_dropout < 1.0:
+            raise ValueError("table_dropout must be in [0, 1)")
 
     @property
     def table_size(self) -> int:
@@ -123,6 +126,7 @@ class PairwiseLUT(LUTModuleBase):
         anchor_policy: str = "random",
         anchor_seed: int | None = None,
         lut_dtype: LutDType = "fp32",
+        table_dropout: float = 0.0,
         slope_bank_rank: int = 0,
         slope_bank_atom_init_std: float = 0.02,
         slope_bank_coeff_init_std: float = 0.0,
@@ -143,6 +147,7 @@ class PairwiseLUT(LUTModuleBase):
             seed if anchor_seed is None else int(anchor_seed),
             lut_dtype,
             bool(use_output_scaling),
+            float(table_dropout),
         )
         surrogate_gradient(torch.zeros((), dtype=torch.float32), spec.surrogate)
         super().__init__(LUTLayerSpec.build(spec.input_dim, spec.output_dim, backend=spec.backend, output_scale=spec.output_scale))
@@ -175,9 +180,15 @@ class PairwiseLUT(LUTModuleBase):
     def cpu_lut_dtype(self) -> Literal["f32", "f16"]: return self.spec.cpu_lut_dtype
     @property
     def anchor_policy(self) -> str: return self.spec.anchor_policy
+    @property
+    def table_dropout(self) -> float: return self.spec.table_dropout
 
     def extra_repr(self) -> str:
-        return f"input_dim={self.input_dim}, output_dim={self.output_dim}, tables={self.tables}, comparisons={self.comparisons}, backend={self.backend!r}, anchor_policy={self.anchor_policy!r}"
+        return (
+            f"input_dim={self.input_dim}, output_dim={self.output_dim}, tables={self.tables}, "
+            f"comparisons={self.comparisons}, backend={self.backend!r}, anchor_policy={self.anchor_policy!r}, "
+            f"table_dropout={self.table_dropout}"
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         input_dtype = x.dtype
@@ -192,6 +203,9 @@ class PairwiseLUT(LUTModuleBase):
 
         backend = "tilelang" if self.backend == "auto" and x.is_cuda else ("torch" if self.backend == "auto" else self.backend)
         x = x.to(torch.float32 if backend in {"tilelang", "triton", "zig"} else compute_dtype)
+        use_table_dropout = training and self.table_dropout > 0.0
+        if use_table_dropout and backend in {"tilelang", "triton", "zig"}:
+            backend = "torch"
         if backend == "tilelang":
             return self._tilelang_compute(x, compute_dtype=compute_dtype)
         if backend == "triton":
@@ -202,6 +216,8 @@ class PairwiseLUT(LUTModuleBase):
             return self._zig_compute(x, route, compute_dtype=compute_dtype, training=training)
 
         lut = self.lut_payload(dtype=compute_dtype, device=route.indices.device)
+        if use_table_dropout:
+            lut = _apply_table_dropout(lut, self.table_dropout)
         output = self.lut_forward(route, lut, compute_dtype=compute_dtype)
         if training and (x.requires_grad or bool(getattr(self.thresholds, "requires_grad", False))):
             output = output + self.lut_backward_surrogate(route, lut).to(output.dtype)
@@ -616,6 +632,12 @@ def _sum_lut_rows(indices: Tensor, lut: Tensor, *, table_size: int, output_dim: 
         values = flat_lut.index_select(0, rows).view(items, stop - start, output_dim)
         output = output + values.sum(dim=1)
     return output.view(*prefix, output_dim)
+
+
+def _apply_table_dropout(lut: Tensor, probability: float) -> Tensor:
+    keep = 1.0 - float(probability)
+    mask = torch.empty(lut.shape[0], device=lut.device, dtype=torch.float32).bernoulli_(keep).div_(keep)
+    return lut * mask.to(dtype=lut.dtype).view(-1, 1, 1)
 
 
 def _single_bit_ste_delta(current_indices: Tensor, neighbor_indices: Tensor, ste_weight: Tensor, lut: Tensor, *, table_size: int, output_dim: int) -> Tensor:
