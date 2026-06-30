@@ -16,7 +16,7 @@ from torch import Tensor
 from .emnist_payload_dtype_sweep import _build_local_loaders, _eval_model
 from .emnist_route_conditioned import RouteConditionedEmnistClassifier, _train as _train_pairwise
 
-ModelKind = Literal["mlp", "pairwise_plain", "pairwise_sparse_mixing", "pairwise_anchor_transform"]
+ModelKind = Literal["mlp", "residual_mlp", "pairwise_plain", "pairwise_sparse_mixing", "pairwise_anchor_transform"]
 
 
 @dataclass(frozen=True)
@@ -84,9 +84,54 @@ class ReLUMlpWithSignatures(nn.Module):
         return y
 
 
+class ResidualReLUMlpWithSignatures(nn.Module):
+    def __init__(self, *, input_dim: int, hidden_dim: int, classes: int, depth: int, seed: int, residual_scale: float) -> None:
+        super().__init__()
+        torch.manual_seed(seed)
+        if depth <= 1:
+            self.input = nn.Linear(input_dim, classes)
+            self.blocks = nn.ModuleList()
+            self.readout = None
+        else:
+            self.input = nn.Linear(input_dim, hidden_dim)
+            self.blocks = nn.ModuleList(nn.Linear(hidden_dim, hidden_dim) for _ in range(max(0, depth - 2)))
+            self.readout = nn.Linear(hidden_dim, classes)
+        self.depth = int(depth)
+        self.residual_scale = float(residual_scale)
+        self.hidden_count = max(0, depth - 1)
+        self.last_signatures: list[Tensor] = []
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = x.flatten(1)
+        signatures: list[Tensor] = []
+        if self.depth <= 1:
+            self.last_signatures = signatures
+            return self.input(y)
+
+        z = self.input(y)
+        signatures.append((z > 0).detach())
+        y = F.relu(z)
+        for block in self.blocks:
+            z = block(y)
+            signatures.append((z > 0).detach())
+            y = y + self.residual_scale * F.relu(z)
+        self.last_signatures = signatures
+        assert self.readout is not None
+        return self.readout(y)
+
+
 def _build_probe_model(args: argparse.Namespace, classes: int) -> nn.Module:
     if args.model == "mlp":
         return ReLUMlpWithSignatures(input_dim=28 * 28, hidden_dim=args.hidden_dim, classes=classes, depth=args.depth, seed=args.seed)
+    if args.model == "residual_mlp":
+        return ResidualReLUMlpWithSignatures(
+            input_dim=28 * 28,
+            hidden_dim=args.hidden_dim,
+            classes=classes,
+            depth=args.depth,
+            seed=args.seed,
+            residual_scale=args.mlp_residual_scale,
+        )
     variant = {
         "pairwise_plain": "plain",
         "pairwise_sparse_mixing": "sparse_mixing",
@@ -171,7 +216,7 @@ def _batch_signatures(model: nn.Module, points: Tensor, *, device: torch.device,
         for start in range(0, points.shape[0], batch_size):
             x = points[start : start + batch_size].to(device)
             model(x)
-            if isinstance(model, ReLUMlpWithSignatures):
+            if isinstance(model, (ReLUMlpWithSignatures, ResidualReLUMlpWithSignatures)):
                 sigs = [sig.cpu().to(torch.int16) for sig in model.last_signatures]
             else:
                 sigs = [sig.cpu().to(torch.int16) for sig in model.last_routes]
@@ -268,11 +313,17 @@ def _interpolation_flips(model: nn.Module, x: Tensor, y: Tensor, *, device: torc
 
 
 def _normal_effective_rank(model: nn.Module) -> float:
-    if not isinstance(model, ReLUMlpWithSignatures):
+    if not isinstance(model, (ReLUMlpWithSignatures, ResidualReLUMlpWithSignatures)):
         return 0.0
+    if isinstance(model, ReLUMlpWithSignatures):
+        layers = list(model.layers)
+    elif model.readout is None:
+        layers = [model.input]
+    else:
+        layers = [model.input, *list(model.blocks), model.readout]
     normals: list[Tensor] = []
-    prefix = torch.eye(model.layers[0].in_features, device=next(model.parameters()).device)
-    for idx, layer in enumerate(model.layers[:-1]):
+    prefix = torch.eye(layers[0].in_features, device=next(model.parameters()).device)
+    for idx, layer in enumerate(layers[:-1]):
         w = layer.weight.detach()
         n = w @ prefix
         normals.append(n.cpu())
@@ -405,7 +456,7 @@ def main() -> None:
     parser.add_argument("--root", default="data/emnist")
     parser.add_argument("--split", default="balanced")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--model", choices=("mlp", "pairwise_plain", "pairwise_sparse_mixing", "pairwise_anchor_transform"), default="mlp")
+    parser.add_argument("--model", choices=("mlp", "residual_mlp", "pairwise_plain", "pairwise_sparse_mixing", "pairwise_anchor_transform"), default="mlp")
     parser.add_argument("--backend", choices=("auto", "torch", "tilelang", "triton"), default="tilelang")
     parser.add_argument("--optimizer", choices=("adamw", "discrete"), default="adamw")
     parser.add_argument("--discrete-method", choices=("ef_sgd", "adam_ef", "factored_adam_ef", "integer_adam_ef", "scaled_integer_adam_ef", "bop2_ternary"), default="adam_ef")
@@ -419,6 +470,7 @@ def main() -> None:
     parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--mlp-residual-scale", type=float, default=1.0)
     parser.add_argument("--tables", type=int, default=64)
     parser.add_argument("--comparisons", type=int, default=6)
     parser.add_argument("--lut-init-std", type=float, default=0.0)

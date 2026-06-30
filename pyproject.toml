@@ -35,6 +35,7 @@ dev = [
 ]
 
 [project.scripts]
+tropnn-emnist-payload-width = "tropnn.tools.emnist_payload_width:main"
 tropnn-emnist = "tropnn.examples.emnist:main"
 tropnn-recovery-lut-structures = "tropnn.examples.recovery_lut_structures:main"
 tropnn-scaling-benchmark = "tropnn.tools.scaling_benchmark:main"
@@ -47,6 +48,8 @@ tropnn-emnist-payload-dtype-sweep = "tropnn.tools.emnist_payload_dtype_sweep:mai
 tropnn-emnist-discrete-payload = "tropnn.tools.emnist_discrete_payload:main"
 tropnn-emnist-route-conditioned = "tropnn.tools.emnist_route_conditioned:main"
 tropnn-partition-geometry-probe = "tropnn.tools.partition_geometry_probe:main"
+tropnn-emnist-braid-generators = "tropnn.tools.emnist_braid_generators:main"
+tropnn-emnist-cross-layer-anchor-sharing = "tropnn.tools.emnist_cross_layer_anchor_sharing:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

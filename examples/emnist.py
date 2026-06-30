@@ -128,6 +128,8 @@ class PairwiseWalshImageClassifier(nn.Module):
         seed: int,
         coeff_init_std: float,
         anchor_policy: str,
+        slope_order: int = 0,
+        lut_dtype: str = "fp32",
     ) -> None:
         super().__init__()
         self.layer = PairwiseWalshLUT(
@@ -136,9 +138,11 @@ class PairwiseWalshImageClassifier(nn.Module):
             tables=tables,
             comparisons=comparisons,
             walsh_order=walsh_order,  # type: ignore[arg-type]
+            slope_order=slope_order,  # type: ignore[arg-type]
             seed=seed,
             coeff_init_std=coeff_init_std,
             anchor_policy=anchor_policy,
+            lut_dtype=lut_dtype,  # type: ignore[arg-type]
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -159,6 +163,8 @@ class EmnistPairwiseWalshClassifier(PairwiseWalshImageClassifier):
         seed: int = 0,
         coeff_init_std: float = 0.02,
         anchor_policy: str = "random",
+        slope_order: int = 0,
+        lut_dtype: str = "fp32",
         **_: object,
     ) -> None:
         super().__init__(
@@ -167,9 +173,11 @@ class EmnistPairwiseWalshClassifier(PairwiseWalshImageClassifier):
             tables=pairwise_tables,
             comparisons=comparisons,
             walsh_order=walsh_order,
+            slope_order=slope_order,
             seed=seed,
             coeff_init_std=coeff_init_std,
             anchor_policy=anchor_policy,
+            lut_dtype=lut_dtype,
         )
 
 
@@ -239,9 +247,11 @@ def _build_model(args: argparse.Namespace, classes: int) -> nn.Module:
             tables=args.tables,
             comparisons=args.comparisons,
             walsh_order=args.walsh_order,
+            slope_order=args.slope_order,
             seed=args.seed,
             coeff_init_std=args.lut_init_std,
             anchor_policy=args.anchor_policy,
+            lut_dtype=args.lut_dtype,
         )
     raise ValueError(f"unknown family {args.family!r}")
 
@@ -284,6 +294,7 @@ def main() -> None:
     parser.add_argument("--tables", type=int, default=64)
     parser.add_argument("--comparisons", type=int, default=6)
     parser.add_argument("--walsh-order", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--slope-order", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--lut-init-std", type=float, default=0.02)
     parser.add_argument("--anchor-policy", default="random")
     parser.add_argument("--backend", choices=("auto", "torch", "tilelang", "triton"), default="auto")

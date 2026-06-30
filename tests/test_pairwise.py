@@ -6,6 +6,7 @@ from tropnn.backends.pairwise_zig import has_pairwise_zig, pairwise_zig_forward,
 from tropnn import AbsDiffLUT, PairwiseLUT, PairwiseWalshLUT
 from tropnn.examples.emnist import EmnistPairwiseWalshClassifier
 from tropnn.layers.surrogate import surrogate_gradient
+from tropnn.tools.emnist_payload_width import ComparatorGeneratorLayer
 
 
 def test_fast_sigmoid_odd_surrogate_has_lut_direction() -> None:
@@ -186,6 +187,105 @@ def test_pairwise_walsh_gradient_uses_selected_row_and_neighbor_delta() -> None:
     assert layer.thresholds.grad[0, 1] == 0
 
 
+def test_pairwise_walsh_slope_coeff_materializes_order2_rows() -> None:
+    layer = PairwiseWalshLUT(4, 2, tables=1, comparisons=3, walsh_order=1, slope_order=2, use_output_scaling=False, seed=1)
+    assert layer.walsh_term_count == 4
+    assert layer.slope_term_count == 7
+    assert layer.slope_constant is not None
+    assert layer.slope_linear_coeff is not None
+    assert layer.slope_pair_coeff is not None
+
+    with torch.no_grad():
+        layer.slope_constant.copy_(torch.tensor([[1.0, -2.0, 0.5]]))
+        layer.slope_linear_coeff.copy_(
+            torch.tensor(
+                [
+                    [
+                        [0.5, 1.0, -0.25],
+                        [-1.0, 0.25, 2.0],
+                        [0.75, -0.5, 1.5],
+                    ]
+                ]
+            )
+        )
+        layer.slope_pair_coeff.copy_(
+            torch.tensor(
+                [
+                    [
+                        [0.25, -0.5, 1.0],
+                        [1.5, 0.75, -0.25],
+                        [-1.0, 0.5, 0.25],
+                    ]
+                ]
+            )
+        )
+
+    coeff = layer.materialize_slope_coeff()
+    signs = torch.tensor([-1.0, 1.0, -1.0])
+    pairs = torch.tensor([signs[0] * signs[1], signs[0] * signs[2], signs[1] * signs[2]])
+    expected = layer.slope_constant[0] + layer.slope_linear_coeff[0] @ signs + layer.slope_pair_coeff[0] @ pairs
+    assert torch.allclose(coeff[0, 2], expected)
+
+
+def test_pairwise_walsh_margin_affine_forward_matches_formula() -> None:
+    layer = PairwiseWalshLUT(4, 2, tables=1, comparisons=2, walsh_order=2, slope_order=1, use_output_scaling=False, seed=1)
+    assert layer.slope_constant is not None
+    assert layer.slope_linear_coeff is not None
+    assert layer.slope_pair_coeff is not None
+    assert layer.slope_generator is not None
+    with torch.no_grad():
+        layer.anchors[0, :, 0] = torch.tensor([0, 2])
+        layer.anchors[0, :, 1] = torch.tensor([1, 3])
+        layer.thresholds.zero_()
+        layer.constant.zero_()
+        layer.linear_coeff.zero_()
+        layer.pair_coeff.zero_()
+        layer.slope_constant.copy_(torch.tensor([[0.5, -0.25]]))
+        layer.slope_linear_coeff.copy_(torch.tensor([[[1.0, -0.5], [0.25, 2.0]]]))
+        layer.slope_pair_coeff.zero_()
+        layer.slope_generator.copy_(torch.tensor([[[1.0, 2.0], [-3.0, 0.5]]]))
+
+    x = torch.tensor([[0.3, 0.1, -0.2, 0.4]])
+    layer.eval()
+    out = layer(x).squeeze(1)
+
+    margins = torch.tensor([0.2, -0.6])
+    signs = torch.tensor([1.0, -1.0])
+    coeff = layer.slope_constant[0] + layer.slope_linear_coeff[0] @ signs
+    expected = (coeff[:, None] * margins[:, None] * layer.slope_generator[0]).sum(dim=0)
+    assert torch.allclose(out[0], expected)
+
+
+def test_pairwise_walsh_margin_affine_ste_trains_slope_selector() -> None:
+    layer = PairwiseWalshLUT(2, 1, tables=1, comparisons=1, walsh_order=1, slope_order=1, use_output_scaling=False, seed=1)
+    assert layer.slope_constant is not None
+    assert layer.slope_linear_coeff is not None
+    assert layer.slope_generator is not None
+    with torch.no_grad():
+        layer.anchors[0, 0] = torch.tensor([0, 1])
+        layer.thresholds.zero_()
+        layer.constant.zero_()
+        layer.linear_coeff.zero_()
+        layer.slope_constant[0, 0] = 0.5
+        layer.slope_linear_coeff[0, 0, 0] = 2.0
+        layer.slope_generator[0, 0, 0] = 3.0
+
+    x = torch.tensor([[0.25, 0.0]], requires_grad=True)
+    out = layer(x)
+    out.sum().backward()
+
+    margin = torch.tensor(0.25)
+    current_coeff = torch.tensor(2.5)
+    neighbor_coeff = torch.tensor(-1.5)
+    generator = torch.tensor(3.0)
+    expected_grad = current_coeff * generator + surrogate_gradient(margin) * (neighbor_coeff - current_coeff) * margin * generator
+
+    assert torch.allclose(out.detach().reshape(()), current_coeff * margin * generator)
+    assert torch.allclose(x.grad[0, 0], expected_grad)
+    assert torch.allclose(x.grad[0, 1], -expected_grad)
+    assert torch.allclose(layer.thresholds.grad[0, 0], -expected_grad)
+
+
 def test_pairwise_walsh_emnist_classifier_shape() -> None:
     model = EmnistPairwiseWalshClassifier(
         input_dim=28 * 28,
@@ -206,3 +306,112 @@ def test_pairwise_walsh_emnist_classifier_shape() -> None:
     )
     logits = model(torch.randn(4, 28 * 28))
     assert logits.shape == (4, 10)
+
+
+def test_comparator_generator_sign_writes_endpoint_payload() -> None:
+    layer = ComparatorGeneratorLayer(
+        3,
+        3,
+        tables=1,
+        comparisons=1,
+        source="sign",
+        write_policy="endpoint",
+        k_c=2,
+        anchor_policy="local",
+        seed=0,
+        use_output_scaling=False,
+        use_min_margin_ste=True,
+    )
+    with torch.no_grad():
+        layer.anchors[0, 0] = torch.tensor([0, 1])
+        layer.thresholds.zero_()
+        layer.write_indices[0] = torch.tensor([0, 1])
+        layer.write_weight[0] = torch.tensor([2.0, -3.0])
+
+    out, route = layer.compute(torch.tensor([[0.25, 0.0, 0.0]]))
+
+    assert torch.equal(route, torch.tensor([[1]]))
+    assert torch.allclose(out, torch.tensor([[2.0, -3.0, 0.0]]))
+
+
+def test_comparator_generator_margin_uses_signed_distance() -> None:
+    layer = ComparatorGeneratorLayer(
+        2,
+        2,
+        tables=1,
+        comparisons=1,
+        source="margin",
+        write_policy="endpoint",
+        k_c=1,
+        anchor_policy="local",
+        seed=0,
+        use_output_scaling=False,
+        use_min_margin_ste=True,
+    )
+    with torch.no_grad():
+        layer.anchors[0, 0] = torch.tensor([0, 1])
+        layer.thresholds.zero_()
+        layer.write_indices[0] = torch.tensor([1])
+        layer.write_weight[0] = torch.tensor([4.0])
+
+    out, route = layer.compute(torch.tensor([[0.0, 0.25]]))
+
+    assert torch.equal(route, torch.tensor([[0]]))
+    assert torch.allclose(out, torch.tensor([[0.0, -1.0]]))
+
+
+def test_comparator_generator_signed_margin_uses_magnitude() -> None:
+    layer = ComparatorGeneratorLayer(
+        2,
+        2,
+        tables=1,
+        comparisons=1,
+        source="signed_margin",
+        write_policy="endpoint",
+        k_c=1,
+        anchor_policy="local",
+        seed=0,
+        use_output_scaling=False,
+        use_min_margin_ste=True,
+    )
+    with torch.no_grad():
+        layer.anchors[0, 0] = torch.tensor([0, 1])
+        layer.thresholds.zero_()
+        layer.write_indices[0] = torch.tensor([1])
+        layer.write_weight[0] = torch.tensor([4.0])
+
+    out, route = layer.compute(torch.tensor([[0.0, 0.25]]))
+
+    assert torch.equal(route, torch.tensor([[0]]))
+    assert torch.allclose(out, torch.tensor([[0.0, 1.0]]))
+
+
+def test_comparator_generator_sign_ste_routes_gradient_to_threshold_split() -> None:
+    layer = ComparatorGeneratorLayer(
+        2,
+        1,
+        tables=1,
+        comparisons=1,
+        source="sign",
+        write_policy="endpoint",
+        k_c=1,
+        anchor_policy="local",
+        seed=0,
+        use_output_scaling=False,
+        use_min_margin_ste=True,
+    )
+    with torch.no_grad():
+        layer.anchors[0, 0] = torch.tensor([0, 1])
+        layer.thresholds.zero_()
+        layer.write_indices[0] = torch.tensor([0])
+        layer.write_weight[0] = torch.tensor([3.0])
+
+    x = torch.tensor([[0.25, 0.0]], requires_grad=True)
+    out = layer(x)
+    out.sum().backward()
+
+    expected = 2.0 * surrogate_gradient(torch.tensor(0.25)) * torch.tensor(3.0)
+    assert torch.allclose(out.detach().reshape(()), torch.tensor(3.0))
+    assert torch.allclose(x.grad[0, 0], expected)
+    assert torch.allclose(x.grad[0, 1], -expected)
+    assert torch.allclose(layer.thresholds.grad[0, 0], -expected)

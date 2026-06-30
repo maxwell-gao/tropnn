@@ -30,7 +30,34 @@ print(relation(x, x).shape)
 
 walsh = PairwiseWalshLUT(256, 512, tables=64, comparisons=6, walsh_order=2)
 print(walsh(x).shape)
+
+affine = PairwiseWalshLUT(
+    256,
+    512,
+    tables=64,
+    comparisons=6,
+    walsh_order=2,
+    slope_order=2,
+    lut_dtype="int2",
+)
+print(affine(x).shape)
 ```
+
+`PairwiseWalshLUT(..., slope_order=2, lut_dtype="int2")` is the structured
+low-bit baseline.  It replaces a free row payload with low-degree Boolean
+generators over the comparison signs:
+
+```text
+sign_i = 2 * bit_i - 1
+basis = [1, sign_i, sign_i * sign_j]
+
+update =
+  basis @ shared_bias_generators
+  + sum_i low_degree_coeff_i(bits) * margin_i * shared_slope_generator_i
+```
+
+The generated bias rows, generated slope coefficients, and slope generators are
+materialized through the same low-bit LUT dtype path as `PairwiseLUT`.
 
 ## Backends
 
@@ -57,7 +84,11 @@ uv run tropnn-emnist \
 
 The library core exports only PC-LUT layers. Experiment scripts may include dense baselines, including `nn.Linear`, to reproduce report comparisons.
 
-- `tropnn-emnist --family linear|pairwise|pairwise_walsh`
-- `tropnn-scaling-benchmark --families paper,untied_paper,linear,pairwise,tied_pairwise,pairwise_walsh,tied_pairwise_walsh`
+- `tropnn-emnist --family linear|pairwise|pairwise_walsh`; use `--family pairwise_walsh --slope-order 2 --lut-dtype int2` for the Walsh affine baseline
+- `tropnn-scaling-benchmark --families paper,untied_paper,linear,pairwise,tied_pairwise,pairwise_walsh,tied_pairwise_walsh,pairwise_walsh_affine,tied_pairwise_walsh_affine`
 - `tropnn-recovery-lut-structures --variants free,walsh1,walsh2,coarse`
 - `tropnn-dense-projection-fit --variants dense_exact,linear,pairwise`
+
+For EMNIST payload-width/depth sweeps, `scripts/run_tropnn_payload_width_4gpu.sh`
+exposes the baseline as `VARIANTS="walsh_affine"` with default
+`WALSH_LUT_DTYPE=int2`, `WALSH_ORDER=2`, and `WALSH_SLOPE_ORDER=2`.

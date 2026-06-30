@@ -23,10 +23,12 @@ FAMILIES = (
     "tied_pairwise",
     "pairwise_walsh",
     "tied_pairwise_walsh",
+    "pairwise_walsh_affine",
+    "tied_pairwise_walsh_affine",
 )
-PAIRWISE_FAMILIES = ("pairwise", "tied_pairwise", "pairwise_walsh", "tied_pairwise_walsh")
-WALSH_PAIRWISE_FAMILIES = ("pairwise_walsh", "tied_pairwise_walsh")
-TIED_RECOVERY_FAMILIES = ("tied_pairwise", "tied_pairwise_walsh")
+PAIRWISE_FAMILIES = ("pairwise", "tied_pairwise", "pairwise_walsh", "tied_pairwise_walsh", "pairwise_walsh_affine", "tied_pairwise_walsh_affine")
+WALSH_PAIRWISE_FAMILIES = ("pairwise_walsh", "tied_pairwise_walsh", "pairwise_walsh_affine", "tied_pairwise_walsh_affine")
+TIED_RECOVERY_FAMILIES = ("tied_pairwise", "tied_pairwise_walsh", "tied_pairwise_walsh_affine")
 
 
 def feature_probabilities(n_features: int, alpha: float, activation_density: float, *, device: torch.device) -> Tensor:
@@ -58,6 +60,8 @@ class RunConfig:
     tables: int
     comparisons: int
     walsh_order: int
+    walsh_slope_order: int
+    lut_dtype: str
     seed: int
     device: str
 
@@ -125,7 +129,7 @@ def _build_pairwise(config: RunConfig) -> nn.Module:
     return PairwiseLUT(config.n_features, config.n_features, tables=tables, comparisons=comparisons, seed=config.seed)
 
 
-def _build_pairwise_walsh(config: RunConfig) -> nn.Module:
+def _build_pairwise_walsh(config: RunConfig, *, affine: bool = False) -> nn.Module:
     tables, comparisons = _pairwise_shape(config)
     return PairwiseWalshLUT(
         config.n_features,
@@ -133,6 +137,8 @@ def _build_pairwise_walsh(config: RunConfig) -> nn.Module:
         tables=tables,
         comparisons=comparisons,
         walsh_order=config.walsh_order,  # type: ignore[arg-type]
+        slope_order=config.walsh_slope_order if affine else 0,  # type: ignore[arg-type]
+        lut_dtype=config.lut_dtype,  # type: ignore[arg-type]
         seed=config.seed,
     )
 
@@ -145,6 +151,8 @@ BUILDERS: dict[str, Callable[[RunConfig], nn.Module]] = {
     "tied_pairwise": lambda c: TiedRecovery(_build_pairwise(c)),
     "pairwise_walsh": _build_pairwise_walsh,
     "tied_pairwise_walsh": lambda c: TiedRecovery(_build_pairwise_walsh(c)),
+    "pairwise_walsh_affine": lambda c: _build_pairwise_walsh(c, affine=True),
+    "tied_pairwise_walsh_affine": lambda c: TiedRecovery(_build_pairwise_walsh(c, affine=True)),
 }
 
 
@@ -189,7 +197,7 @@ def _parse_str_list(value: str) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Recovery scaling benchmark with nn.Linear baseline and Pairwise LUT families.")
-    parser.add_argument("--families", default="paper,untied_paper,linear,pairwise,tied_pairwise,pairwise_walsh,tied_pairwise_walsh")
+    parser.add_argument("--families", default="paper,untied_paper,linear,pairwise,tied_pairwise,pairwise_walsh,tied_pairwise_walsh,pairwise_walsh_affine,tied_pairwise_walsh_affine")
     parser.add_argument("--n-features", type=int, default=256)
     parser.add_argument("--model-dims", default="8,16,32,64")
     parser.add_argument("--alphas", default="1.0")
@@ -201,6 +209,8 @@ def main() -> None:
     parser.add_argument("--tables", type=int, default=32)
     parser.add_argument("--comparisons", type=int, default=6)
     parser.add_argument("--walsh-order", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--walsh-slope-order", type=int, choices=(0, 1, 2), default=2)
+    parser.add_argument("--lut-dtype", choices=["fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"], default="int2")
     parser.add_argument("--seeds", default="0")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", default="results/scaling_benchmark/summary.csv")
@@ -224,6 +234,8 @@ def main() -> None:
                         tables=args.tables,
                         comparisons=args.comparisons,
                         walsh_order=args.walsh_order,
+                        walsh_slope_order=args.walsh_slope_order,
+                        lut_dtype=args.lut_dtype,
                         seed=seed,
                         device=args.device,
                     )

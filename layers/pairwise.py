@@ -315,7 +315,21 @@ class PairwiseLUT(LUTModuleBase):
 
 
 class PairwiseWalshLUT(PairwiseLUT):
-    """PairwiseLUT with a structured Walsh payload table."""
+    """PairwiseLUT with low-degree Boolean/Walsh generators.
+
+    The bias path materializes a structured payload table
+
+        V(z) = c + sum_i s_i a_i + sum_{i<j} s_i s_j a_{ij},
+
+    where z are route bits and s = 2z - 1.  When ``slope_order`` is non-zero,
+    the layer also adds a route-conditioned affine term
+
+        sum_i alpha_i(z) margin_i u_i,
+
+    using the same low-degree Walsh basis for scalar alpha_i(z).  This keeps
+    the generator identity tied to the comparison coordinate instead of adding
+    a separate learned slope-id lookup.
+    """
 
     def __init__(
         self,
@@ -325,33 +339,42 @@ class PairwiseWalshLUT(PairwiseLUT):
         tables: int = 16,
         comparisons: int = 4,
         walsh_order: Literal[1, 2] = 2,
+        slope_order: Literal[0, 1, 2] = 0,
         backend: Backend = "torch",
         seed: int = 0,
         coeff_init_std: float = 0.02,
+        slope_coeff_init_std: float = 0.02,
+        slope_generator_init_std: float = 0.02,
         use_min_margin_ste: bool = True,
         use_output_scaling: bool = True,
         surrogate: str = "fast_sigmoid_odd",
         fixed_zero_threshold: bool = False,
         anchor_policy: str = "random",
         anchor_seed: int | None = None,
+        lut_dtype: LutDType = "fp32",
     ) -> None:
         if walsh_order not in {1, 2}:
             raise ValueError("walsh_order must be 1 or 2")
+        if slope_order not in {0, 1, 2}:
+            raise ValueError("slope_order must be 0, 1, or 2")
         if backend != "torch":
             raise ValueError("PairwiseWalshLUT only supports backend='torch'")
-        super().__init__(input_dim, output_dim, tables=tables, comparisons=comparisons, backend=backend, seed=seed, lut_init_std=0.0, use_min_margin_ste=use_min_margin_ste, use_output_scaling=use_output_scaling, fixed_zero_threshold=fixed_zero_threshold, surrogate=surrogate, anchor_policy=anchor_policy, anchor_seed=anchor_seed)
+        super().__init__(input_dim, output_dim, tables=tables, comparisons=comparisons, backend=backend, seed=seed, lut_init_std=0.0, use_min_margin_ste=use_min_margin_ste, use_output_scaling=use_output_scaling, fixed_zero_threshold=fixed_zero_threshold, surrogate=surrogate, anchor_policy=anchor_policy, anchor_seed=anchor_seed, lut_dtype=lut_dtype)
         del self.lut
         self.walsh_order = int(walsh_order)
-        pair_indices = torch.combinations(torch.arange(comparisons, dtype=torch.long), r=2)
-        if self.walsh_order == 1:
-            pair_indices = pair_indices[:0]
+        self.slope_order = int(slope_order)
+        all_pair_indices = torch.combinations(torch.arange(comparisons, dtype=torch.long), r=2)
+        pair_indices = all_pair_indices if self.walsh_order == 2 else all_pair_indices[:0]
         self.register_buffer("pair_indices", pair_indices)
+        slope_pair_indices = all_pair_indices if self.slope_order == 2 else all_pair_indices[:0]
+        self.register_buffer("slope_pair_indices", slope_pair_indices)
         term_count = 1 + comparisons + int(pair_indices.shape[0])
         init_std = coeff_init_std / math.sqrt(term_count)
         gen = torch.Generator(device="cpu").manual_seed(seed + 1)
         self.constant = nn.Parameter(torch.randn(tables, output_dim, generator=gen) * init_std)
         self.linear_coeff = nn.Parameter(torch.randn(tables, comparisons, output_dim, generator=gen) * init_std)
         self.pair_coeff = nn.Parameter(torch.randn(tables, pair_indices.shape[0], output_dim, generator=gen) * init_std)
+        self._init_slope_generators(tables, comparisons, output_dim, slope_coeff_init_std, slope_generator_init_std, gen)
         bit_values = torch.arange(self.table_size, dtype=torch.long).unsqueeze(-1).bitwise_and(self.powers.view(1, -1))
         self.register_buffer("walsh_bits", torch.where(bit_values > 0, torch.ones_like(bit_values), -torch.ones_like(bit_values)).float())
 
@@ -359,8 +382,49 @@ class PairwiseWalshLUT(PairwiseLUT):
     def walsh_term_count(self) -> int:
         return 1 + self.comparisons + int(self.pair_indices.shape[0])
 
+    @property
+    def slope_term_count(self) -> int:
+        if self.slope_order == 0:
+            return 0
+        return 1 + self.comparisons + int(self.slope_pair_indices.shape[0])
+
+    def _init_slope_generators(
+        self,
+        tables: int,
+        comparisons: int,
+        output_dim: int,
+        coeff_init_std: float,
+        generator_init_std: float,
+        gen: torch.Generator,
+    ) -> None:
+        if self.slope_order == 0:
+            self.register_parameter("slope_constant", None)
+            self.register_parameter("slope_linear_coeff", None)
+            self.register_parameter("slope_pair_coeff", None)
+            self.register_parameter("slope_generator", None)
+            return
+
+        init_std = coeff_init_std / math.sqrt(self.slope_term_count)
+        self.slope_constant = nn.Parameter(torch.randn(tables, comparisons, generator=gen) * init_std)
+        self.slope_linear_coeff = nn.Parameter(torch.randn(tables, comparisons, comparisons, generator=gen) * init_std)
+        self.slope_pair_coeff = nn.Parameter(torch.randn(tables, comparisons, self.slope_pair_indices.shape[0], generator=gen) * init_std)
+        self.slope_generator = nn.Parameter(torch.randn(tables, comparisons, output_dim, generator=gen) * generator_init_std)
+
     def extra_repr(self) -> str:
-        return f"{super().extra_repr()}, walsh_order={self.walsh_order}"
+        return f"{super().extra_repr()}, walsh_order={self.walsh_order}, slope_order={self.slope_order}, lut_dtype={self.lut_dtype}"
+
+    def compute(self, x: Tensor, *, compute_dtype: torch.dtype, training: bool) -> tuple[Tensor, PairwiseRoute]:
+        x = x.to(compute_dtype)
+        route = self.cache_index(x)
+        lut = self.materialize_lut(dtype=compute_dtype, device=route.indices.device)
+        output = self.lut_forward(route, lut, compute_dtype=compute_dtype)
+        if training and (x.requires_grad or bool(getattr(self.thresholds, "requires_grad", False))):
+            output = output + self.lut_backward_surrogate(route, lut).to(output.dtype)
+        if self.slope_order != 0:
+            output = output + self.margin_affine_output(route, compute_dtype=compute_dtype)
+            if training and (x.requires_grad or bool(getattr(self.thresholds, "requires_grad", False))):
+                output = output + self.margin_affine_backward_surrogate(route).to(output.dtype)
+        return output, route
 
     def lut_payload(self, *, dtype: torch.dtype, device: torch.device) -> Tensor:
         return self.materialize_lut(dtype=dtype, device=device)
@@ -375,7 +439,88 @@ class PairwiseWalshLUT(PairwiseLUT):
             pairs = self.pair_indices.to(device=device)
             pair_bits = bits[:, pairs[:, 0]] * bits[:, pairs[:, 1]]
             output = output + (pair_bits.view(1, self.table_size, -1, 1) * self.pair_coeff.to(dtype=dtype, device=device).view(self.tables, 1, -1, self.output_dim)).sum(dim=2)
+        return _materialize_lut_payload(output, self.lut_dtype, dtype=dtype, device=device)
+
+    def materialize_slope_coeff(self, *, dtype: torch.dtype | None = None, device: torch.device | None = None) -> Tensor:
+        dtype = dtype if dtype is not None else self.constant.dtype
+        device = device if device is not None else self.constant.device
+        if self.slope_order == 0 or self.slope_constant is None or self.slope_linear_coeff is None or self.slope_pair_coeff is None:
+            return torch.zeros(self.tables, self.table_size, self.comparisons, dtype=dtype, device=device)
+
+        bits = self.walsh_bits.to(dtype=dtype, device=device)
+        output = self.slope_constant.to(dtype=dtype, device=device).unsqueeze(1)
+        linear = self.slope_linear_coeff.to(dtype=dtype, device=device)
+        output = output + (bits.view(1, self.table_size, 1, self.comparisons) * linear.view(self.tables, 1, self.comparisons, self.comparisons)).sum(dim=-1)
+        if self.slope_pair_indices.numel() > 0:
+            pairs = self.slope_pair_indices.to(device=device)
+            pair_bits = bits[:, pairs[:, 0]] * bits[:, pairs[:, 1]]
+            pair = self.slope_pair_coeff.to(dtype=dtype, device=device)
+            output = output + (pair_bits.view(1, self.table_size, 1, -1) * pair.view(self.tables, 1, self.comparisons, -1)).sum(dim=-1)
+        return _materialize_lut_payload(output, self.lut_dtype, dtype=dtype, device=device)
+
+    def margin_affine_output(self, route: PairwiseRoute, *, compute_dtype: torch.dtype) -> Tensor:
+        if self.slope_order == 0 or self.slope_generator is None:
+            return torch.zeros(*route.indices.shape[:-1], self.output_dim, dtype=compute_dtype, device=route.indices.device)
+
+        prefix, routes = route.indices.shape[:-1], route.indices.shape[-1]
+        items = max(1, route.indices.numel() // routes)
+        flat_indices = route.indices.reshape(items, routes)
+        flat_coeff = self.materialize_slope_coeff(dtype=compute_dtype, device=route.indices.device).reshape(routes * self.table_size, self.comparisons)
+        margins = route.margins.reshape(items, routes, self.comparisons).to(dtype=compute_dtype)
+        generators = _materialize_lut_payload(self.slope_generator, self.lut_dtype, dtype=compute_dtype, device=route.indices.device)
+        generators = generators.reshape(routes, self.comparisons, self.output_dim)
+        output = torch.zeros(items, self.output_dim, dtype=compute_dtype, device=route.indices.device)
+        chunk = _route_chunk_size(item_count=items, payload_width=self.output_dim * self.comparisons, compute_dtype=compute_dtype, route_count=routes, target_bytes=8 * 1024 * 1024)
+        for start in range(0, routes, chunk):
+            stop = min(start + chunk, routes)
+            offsets = (torch.arange(start, stop, device=route.indices.device) * self.table_size).view(1, -1)
+            rows = (flat_indices[:, start:stop] + offsets).reshape(-1)
+            coeff = flat_coeff.index_select(0, rows).view(items, stop - start, self.comparisons)
+            output = output + torch.einsum("brc,rco->bo", margins[:, start:stop] * coeff, generators[start:stop])
+        return output.view(*prefix, self.output_dim)
+
+    def margin_affine_backward_surrogate(self, route: PairwiseRoute) -> Tensor:
+        if self.slope_order == 0 or self.slope_generator is None:
+            return torch.zeros(*route.indices.shape[:-1], self.output_dim, dtype=torch.float32, device=route.indices.device)
+
+        if self.use_min_margin_ste:
+            bit = route.margins.abs().argmin(dim=-1)
+            margin = route.margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
+            neighbor = route.indices ^ (2**bit).long()
+            ste = ste_heaviside(margin, self.surrogate) - (margin > 0).to(margin.dtype)
+            return self._margin_affine_code_delta(route, neighbor, ste)
+
+        output = torch.zeros(*route.indices.shape[:-1], self.output_dim, dtype=torch.float32, device=route.indices.device)
+        for bit_idx in range(self.comparisons):
+            margin = route.margins[..., bit_idx]
+            neighbor = route.indices ^ int(self.powers[bit_idx].item())
+            ste = ste_heaviside(margin, self.surrogate) - (margin > 0).to(margin.dtype)
+            output = output + self._margin_affine_code_delta(route, neighbor, ste)
         return output
+
+    def _margin_affine_code_delta(self, route: PairwiseRoute, neighbor_indices: Tensor, ste_weight: Tensor) -> Tensor:
+        prefix, routes = route.indices.shape[:-1], route.indices.shape[-1]
+        items = max(1, route.indices.numel() // routes)
+        current = route.indices.reshape(items, routes)
+        neighbor = neighbor_indices.reshape(items, routes)
+        margins = route.margins.reshape(items, routes, self.comparisons).float()
+        weight = ste_weight.reshape(items, routes, 1).float()
+        flat_coeff = self.materialize_slope_coeff(dtype=torch.float32, device=route.indices.device).reshape(routes * self.table_size, self.comparisons)
+        generators = _materialize_lut_payload(self.slope_generator, self.lut_dtype, dtype=torch.float32, device=route.indices.device)
+        generators = generators.reshape(routes, self.comparisons, self.output_dim)
+        output = torch.zeros(items, self.output_dim, dtype=torch.float32, device=route.indices.device)
+        chunk = _route_chunk_size(item_count=items, payload_width=self.output_dim * self.comparisons, compute_dtype=torch.float32, route_count=routes, target_bytes=8 * 1024 * 1024)
+        for start in range(0, routes, chunk):
+            stop = min(start + chunk, routes)
+            offsets = (torch.arange(start, stop, device=route.indices.device) * self.table_size).view(1, -1)
+            current_rows = (current[:, start:stop] + offsets).reshape(-1)
+            neighbor_rows = (neighbor[:, start:stop] + offsets).reshape(-1)
+            current_coeff = flat_coeff.index_select(0, current_rows).view(items, stop - start, self.comparisons)
+            neighbor_coeff = flat_coeff.index_select(0, neighbor_rows).view(items, stop - start, self.comparisons)
+            delta = (neighbor_coeff - current_coeff) * margins[:, start:stop]
+            table_delta = torch.einsum("brc,rco->bro", delta, generators[start:stop])
+            output = output + (weight[:, start:stop] * table_delta).sum(dim=1)
+        return output.view(*prefix, self.output_dim)
 
 
 class AbsDiffLUT(nn.Module):
