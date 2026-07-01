@@ -57,6 +57,7 @@ PayloadVariant = Literal[
     "comparator_sign_kc",
     "comparator_margin_kc",
     "comparator_signed_margin_kc",
+    "comparator_two_sided_margin_kc",
 ]
 ComparatorWritePolicy = Literal["endpoint", "local-linegraph", "expander"]
 OptimizerName = Literal[
@@ -81,6 +82,7 @@ VARIANT_PAYLOAD_WIDTH: dict[str, int | None] = {
     "comparator_sign_kc": None,
     "comparator_margin_kc": None,
     "comparator_signed_margin_kc": None,
+    "comparator_two_sided_margin_kc": None,
 }
 DISCRETE_METHODS: dict[str, DiscreteMethod] = {
     "ef_sgd": "ef_sgd",
@@ -428,7 +430,7 @@ class ComparatorGeneratorLayer(nn.Module):
         *,
         tables: int,
         comparisons: int,
-        source: Literal["sign", "margin", "signed_margin"],
+        source: Literal["sign", "margin", "signed_margin", "two_sided_margin"],
         write_policy: ComparatorWritePolicy,
         k_c: int,
         anchor_policy: str,
@@ -459,10 +461,11 @@ class ComparatorGeneratorLayer(nn.Module):
         self.routes = self.tables * self.comparisons
         self.variant: PayloadVariant = f"comparator_{source}_kc"  # type: ignore[assignment]
         self.source = source
+        self.sides = 2 if source == "two_sided_margin" else 1
         self.write_policy = write_policy
         self.k_c = int(k_c)
         self.payload_width = int(k_c)
-        self.write_degree = int(k_c)
+        self.write_degree = int(k_c * self.sides)
         self.output_scale = 1.0 / math.sqrt(self.routes) if use_output_scaling else 1.0
         self.use_min_margin_ste = bool(use_min_margin_ste)
         self.register_buffer("anchors", template.anchors.detach().clone())
@@ -495,6 +498,9 @@ class ComparatorGeneratorLayer(nn.Module):
         return None
 
     def _make_write_pattern(self, seed: int) -> tuple[Tensor, Tensor]:
+        if self.sides == 2:
+            return self._make_two_sided_write_pattern(seed)
+
         anchors = self.anchors.reshape(self.routes, 2).cpu()
         indices = torch.empty(self.routes, self.k_c, dtype=torch.long)
         signs = torch.empty(self.routes, self.k_c, dtype=torch.float32)
@@ -521,6 +527,36 @@ class ComparatorGeneratorLayer(nn.Module):
             indices = (indices + jitter) % self.output_dim
         return indices, signs
 
+    def _make_two_sided_write_pattern(self, seed: int) -> tuple[Tensor, Tensor]:
+        anchors = self.anchors.reshape(self.routes, 2).cpu()
+        indices = torch.empty(self.routes, 2, self.k_c, dtype=torch.long)
+        signs = torch.empty(self.routes, 2, self.k_c, dtype=torch.float32)
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        for route in range(self.routes):
+            a = int(anchors[route, 0].item()) % self.output_dim
+            b = int(anchors[route, 1].item()) % self.output_dim
+            for side in range(2):
+                virtual_route = route * 2 + side
+                side_sign = 1.0 if side == 0 else -1.0
+                for slot in range(self.k_c):
+                    if self.write_policy == "endpoint":
+                        indices[route, side, slot] = a if slot % 2 == 0 else b
+                        signs[route, side, slot] = side_sign if slot % 2 == 0 else -side_sign
+                    elif self.write_policy == "local-linegraph":
+                        neighbor = (virtual_route + slot // 2 + 1) % self.routes
+                        na = int(anchors[neighbor, 0].item()) % self.output_dim
+                        nb = int(anchors[neighbor, 1].item()) % self.output_dim
+                        indices[route, side, slot] = na if slot % 2 == 0 else nb
+                        signs[route, side, slot] = side_sign if slot % 2 == 0 else -side_sign
+                    else:
+                        hashed = (virtual_route * 1103515245 + slot * 12345 + 97) & 0x7FFFFFFF
+                        indices[route, side, slot] = hashed % self.output_dim
+                        signs[route, side, slot] = 1.0 if ((hashed // max(1, self.output_dim)) & 1) == 0 else -1.0
+        if self.write_policy == "expander":
+            jitter = torch.randint(0, max(1, self.output_dim), (self.routes, 2, self.k_c), generator=gen, dtype=torch.long)
+            indices = (indices + jitter) % self.output_dim
+        return indices, signs
+
     def _route(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         anchor_a = self.anchors[:, :, 0].flatten()
         anchor_b = self.anchors[:, :, 1].flatten()
@@ -542,10 +578,20 @@ class ComparatorGeneratorLayer(nn.Module):
             return sign
         if self.source == "margin":
             return margins
+        if self.source == "two_sided_margin":
+            return torch.stack((F.relu(margins), F.relu(-margins)), dim=-1)
         return sign * margins
 
     def _write_output(self, values: Tensor) -> Tensor:
         batch = values.shape[0]
+        if self.sides == 2:
+            flat_values = values.reshape(batch, self.routes, 2)
+            weighted = flat_values.unsqueeze(-1) * self.write_weight.to(device=values.device, dtype=values.dtype).unsqueeze(0)
+            output = torch.zeros(batch, self.output_dim, device=values.device, dtype=values.dtype)
+            indices = self.write_indices.to(device=values.device).view(1, self.routes, 2, self.k_c).expand(batch, -1, -1, -1)
+            output.scatter_add_(1, indices.reshape(batch, -1), weighted.reshape(batch, -1))
+            return output * self.output_scale
+
         flat_values = values.reshape(batch, self.routes)
         weighted = flat_values.unsqueeze(-1) * self.write_weight.to(device=values.device, dtype=values.dtype).unsqueeze(0)
         output = torch.zeros(batch, self.output_dim, device=values.device, dtype=values.dtype)
@@ -612,7 +658,7 @@ class PayloadWidthEmnistClassifier(nn.Module):
                 )
             if variant.startswith("comparator_"):
                 source = variant.removeprefix("comparator_").removesuffix("_kc")
-                if source not in {"sign", "margin", "signed_margin"}:
+                if source not in {"sign", "margin", "signed_margin", "two_sided_margin"}:
                     raise ValueError(f"unknown comparator source from variant {variant!r}")
                 return ComparatorGeneratorLayer(
                     input_features,
