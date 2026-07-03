@@ -141,6 +141,8 @@ def _build_model(args: argparse.Namespace, classes: int) -> nn.Module:
         use_min_margin_ste=not args.full_ste,
         comparator_kc=args.comparator_kc,
         comparator_write_policy=args.comparator_write_policy,
+        comparator_reduction_layout="scatter",
+        comparator_output_tile_size=32,
     )
 
 

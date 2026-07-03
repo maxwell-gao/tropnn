@@ -10,6 +10,8 @@ written by each routed table row:
 * scalar_sign: each scalar row writes a fixed dense sign basis vector.
 * walsh_affine: low-degree Boolean generators plus margin-affine shared slopes.
 * comparator_*_kc: each comparator activation directly writes to k_c output coordinates.
+* ladder_*: explicit ablation ladder separating full-code payload width,
+  margin-strength output, comparator-side routing, and sparse writes.
 """
 
 from __future__ import annotations
@@ -26,7 +28,8 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from tropnn.layers.pairwise import PAIRWISE_ANCHOR_POLICIES, LutDType, PairwiseLUT, PairwiseWalshLUT, ste_heaviside
+from tropnn.layers import ComparatorTwoSidedMargin
+from tropnn.layers.pairwise import PAIRWISE_ANCHOR_POLICIES, LutDType, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT, ste_heaviside
 from tropnn.tools.emnist_discrete_payload import (
     AccumulatorMode,
     DiscreteMethod,
@@ -58,6 +61,11 @@ PayloadVariant = Literal[
     "comparator_margin_kc",
     "comparator_signed_margin_kc",
     "comparator_two_sided_margin_kc",
+    "ladder_a_full_code_full_payload",
+    "ladder_b_full_code_sparse_payload",
+    "ladder_c_full_code_margin_sparse",
+    "ladder_d_comparator_side_full_payload",
+    "ladder_e_comparator_side_sparse",
 ]
 ComparatorWritePolicy = Literal["endpoint", "local-linegraph", "expander"]
 OptimizerName = Literal[
@@ -83,6 +91,11 @@ VARIANT_PAYLOAD_WIDTH: dict[str, int | None] = {
     "comparator_margin_kc": None,
     "comparator_signed_margin_kc": None,
     "comparator_two_sided_margin_kc": None,
+    "ladder_a_full_code_full_payload": None,
+    "ladder_b_full_code_sparse_payload": None,
+    "ladder_c_full_code_margin_sparse": None,
+    "ladder_d_comparator_side_full_payload": None,
+    "ladder_e_comparator_side_sparse": None,
 }
 DISCRETE_METHODS: dict[str, DiscreteMethod] = {
     "ef_sgd": "ef_sgd",
@@ -111,6 +124,8 @@ class PayloadSpec:
 
     @property
     def payload_label(self) -> str:
+        if self.variant.startswith("ladder_"):
+            return self.variant
         if self.variant == "walsh_affine":
             return "walsh_affine"
         if self.variant.startswith("comparator_"):
@@ -127,6 +142,10 @@ class PayloadSpec:
 
 
 def _payload_spec(variant: PayloadVariant, output_dim: int, write_degree: int) -> PayloadSpec:
+    if variant.startswith("ladder_"):
+        if variant in {"ladder_a_full_code_full_payload", "ladder_d_comparator_side_full_payload"}:
+            return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=False)
+        return PayloadSpec(variant=variant, payload_width=max(1, min(write_degree, output_dim)), write_degree=max(1, min(write_degree, output_dim)), dense_sign_basis=False)
     if variant == "walsh_affine" or variant.startswith("comparator_"):
         return PayloadSpec(variant=variant, payload_width=0, write_degree=0, dense_sign_basis=False)
     width = VARIANT_PAYLOAD_WIDTH[variant]
@@ -331,6 +350,275 @@ class PayloadWidthLUTLayer(nn.Module):
         return output.to(dtype=input_dtype), indices
 
 
+class FullCodeSparsePayloadLayer(nn.Module):
+    """Full 2^C table code, but each selected cell writes only k fixed coordinates."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        anchor_policy: str,
+        seed: int,
+        lut_init_std: float,
+        write_degree: int,
+        use_output_scaling: bool,
+        use_min_margin_ste: bool,
+    ) -> None:
+        super().__init__()
+        template = PairwiseLUT(
+            input_dim,
+            1,
+            tables=tables,
+            comparisons=comparisons,
+            anchor_policy=anchor_policy,
+            seed=seed,
+            anchor_seed=seed,
+            backend="torch",
+        )
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.tables = int(tables)
+        self.comparisons = int(comparisons)
+        self.table_size = 1 << int(comparisons)
+        self.payload_width = max(1, min(int(write_degree), output_dim))
+        self.write_degree = self.payload_width
+        self.output_scale = 1.0 / math.sqrt(float(tables)) if use_output_scaling else 1.0
+        self.use_min_margin_ste = bool(use_min_margin_ste)
+        self.variant: PayloadVariant = "ladder_b_full_code_sparse_payload"
+        self.register_buffer("anchors", template.anchors.detach().clone())
+        self.register_buffer("powers", 2 ** torch.arange(comparisons, dtype=torch.long))
+        self.register_buffer("write_indices", self._make_write_indices(seed + 379))
+        self.thresholds = nn.Parameter(torch.zeros(tables, comparisons))
+        self.lut = nn.Parameter(torch.randn(tables, self.table_size, self.payload_width) * lut_init_std)
+
+    @property
+    def payload_params(self) -> int:
+        return self.lut.numel()
+
+    @property
+    def bias_generator_params(self) -> int:
+        return self.lut.numel()
+
+    @property
+    def slope_coeff_params(self) -> int:
+        return 0
+
+    @property
+    def slope_generator_params(self) -> int:
+        return 0
+
+    def payload_parameters(self) -> list[Tensor]:
+        return [self.lut]
+
+    def clear_packed_payload_cache(self) -> None:
+        return None
+
+    def _make_write_indices(self, seed: int) -> Tensor:
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        base = torch.arange(self.tables * self.table_size, dtype=torch.long).view(self.tables, self.table_size, 1)
+        offsets = torch.arange(self.payload_width, dtype=torch.long).view(1, 1, self.payload_width)
+        jitter = torch.randint(0, max(1, self.output_dim), (self.tables, self.table_size, self.payload_width), generator=generator, dtype=torch.long)
+        return (base * 1103515245 + offsets * 12345 + 97 + jitter) % self.output_dim
+
+    def _route(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        anchor_a = self.anchors[:, :, 0].flatten()
+        anchor_b = self.anchors[:, :, 1].flatten()
+        x_a = x.index_select(-1, anchor_a).view(x.shape[0], self.tables, self.comparisons)
+        x_b = x.index_select(-1, anchor_b).view(x.shape[0], self.tables, self.comparisons)
+        margins = x_a - x_b - self.thresholds.to(device=x.device, dtype=x.dtype)
+        bits = (margins > 0).to(torch.long)
+        indices = (bits * self.powers.to(device=x.device).view(1, 1, -1)).sum(dim=-1)
+        return indices, margins
+
+    def _select_payload_and_writes(self, indices: Tensor) -> tuple[Tensor, Tensor]:
+        table_offsets = torch.arange(self.tables, device=indices.device, dtype=torch.long).view(1, self.tables) * self.table_size
+        flat_indices = (indices + table_offsets).reshape(-1)
+        payload = self.lut.reshape(self.tables * self.table_size, self.payload_width).index_select(0, flat_indices)
+        writes = self.write_indices.to(device=indices.device).reshape(self.tables * self.table_size, self.payload_width).index_select(0, flat_indices)
+        return payload.view(indices.shape[0], self.tables, self.payload_width), writes.view(indices.shape[0], self.tables, self.payload_width)
+
+    def _payload_to_output(self, payload: Tensor, writes: Tensor) -> Tensor:
+        output = torch.zeros(payload.shape[0], self.output_dim, device=payload.device, dtype=payload.dtype)
+        output.scatter_add_(1, writes.reshape(payload.shape[0], -1), payload.reshape(payload.shape[0], -1))
+        return output * self.output_scale
+
+    def _ste_correction(self, indices: Tensor, margins: Tensor, payload: Tensor, writes: Tensor) -> Tensor:
+        if self.use_min_margin_ste:
+            bit = margins.abs().argmin(dim=-1)
+            margin = margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
+            neighbor_indices = indices ^ (2 ** bit).long()
+            neighbor_payload, neighbor_writes = self._select_payload_and_writes(neighbor_indices)
+            ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
+            return self._payload_to_output(neighbor_payload * ste_delta.unsqueeze(-1), neighbor_writes) - self._payload_to_output(
+                payload * ste_delta.unsqueeze(-1), writes
+            )
+
+        correction = torch.zeros(indices.shape[0], self.output_dim, device=payload.device, dtype=payload.dtype)
+        for bit_idx in range(self.comparisons):
+            margin = margins[:, :, bit_idx]
+            ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
+            neighbor_payload, neighbor_writes = self._select_payload_and_writes(indices ^ int(self.powers[bit_idx].item()))
+            correction = correction + self._payload_to_output(neighbor_payload * ste_delta.unsqueeze(-1), neighbor_writes)
+            correction = correction - self._payload_to_output(payload * ste_delta.unsqueeze(-1), writes)
+        return correction
+
+    def compute(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        input_dtype = x.dtype
+        indices, margins = self._route(x.float())
+        payload, writes = self._select_payload_and_writes(indices)
+        output = self._payload_to_output(payload, writes)
+        if self.training and (x.requires_grad or self.thresholds.requires_grad):
+            output = output + self._ste_correction(indices, margins, payload, writes)
+        return output.to(dtype=input_dtype), indices
+
+    def forward(self, x: Tensor) -> Tensor:
+        output, _indices = self.compute(x)
+        return output
+
+
+class FullCodeMarginSparseLayer(FullCodeSparsePayloadLayer):
+    """Full 2^C table code; margin magnitude provides scalar output strength."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.variant = "ladder_c_full_code_margin_sparse"
+        del self.lut
+        self.write_weight = nn.Parameter(_fixed_signs((self.tables, self.table_size, self.payload_width), 7919) / math.sqrt(float(self.payload_width)))
+
+    @property
+    def payload_params(self) -> int:
+        return self.write_weight.numel()
+
+    @property
+    def bias_generator_params(self) -> int:
+        return self.write_weight.numel()
+
+    def payload_parameters(self) -> list[Tensor]:
+        return [self.write_weight]
+
+    def _select_weight_and_writes(self, indices: Tensor) -> tuple[Tensor, Tensor]:
+        table_offsets = torch.arange(self.tables, device=indices.device, dtype=torch.long).view(1, self.tables) * self.table_size
+        flat_indices = (indices + table_offsets).reshape(-1)
+        weight = self.write_weight.reshape(self.tables * self.table_size, self.payload_width).index_select(0, flat_indices)
+        writes = self.write_indices.to(device=indices.device).reshape(self.tables * self.table_size, self.payload_width).index_select(0, flat_indices)
+        return weight.view(indices.shape[0], self.tables, self.payload_width), writes.view(indices.shape[0], self.tables, self.payload_width)
+
+    def _ste_correction(self, indices: Tensor, margins: Tensor, payload: Tensor, writes: Tensor) -> Tensor:
+        bit = margins.abs().argmin(dim=-1)
+        margin = margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
+        neighbor_indices = indices ^ (2 ** bit).long()
+        neighbor_weight, neighbor_writes = self._select_weight_and_writes(neighbor_indices)
+        ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
+        amplitude = margins.abs().mean(dim=-1).unsqueeze(-1)
+        return self._payload_to_output(neighbor_weight * amplitude * ste_delta.unsqueeze(-1), neighbor_writes) - self._payload_to_output(
+            payload * ste_delta.unsqueeze(-1), writes
+        )
+
+    def compute(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        input_dtype = x.dtype
+        indices, margins = self._route(x.float())
+        weight, writes = self._select_weight_and_writes(indices)
+        payload = margins.abs().mean(dim=-1).unsqueeze(-1) * weight
+        output = self._payload_to_output(payload, writes)
+        if self.training and (x.requires_grad or self.thresholds.requires_grad):
+            output = output + self._ste_correction(indices, margins, payload, writes)
+        return output.to(dtype=input_dtype), indices
+
+
+class ComparatorSideFullPayloadLayer(nn.Module):
+    """Independent comparator-side routes, each writing a full output vector."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        anchor_policy: str,
+        seed: int,
+        lut_init_std: float,
+        use_output_scaling: bool,
+    ) -> None:
+        super().__init__()
+        template = PairwiseLUT(
+            input_dim,
+            1,
+            tables=tables,
+            comparisons=comparisons,
+            anchor_policy=anchor_policy,
+            seed=seed,
+            anchor_seed=seed,
+            backend="torch",
+        )
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.tables = int(tables)
+        self.comparisons = int(comparisons)
+        self.table_size = 2
+        self.payload_width = int(output_dim)
+        self.write_degree = int(output_dim)
+        self.output_scale = 1.0 / math.sqrt(float(tables * comparisons)) if use_output_scaling else 1.0
+        self.variant: PayloadVariant = "ladder_d_comparator_side_full_payload"
+        self.register_buffer("anchors", template.anchors.detach().clone())
+        self.thresholds = nn.Parameter(torch.zeros(tables, comparisons))
+        self.lut = nn.Parameter(torch.randn(tables, comparisons, 2, output_dim) * lut_init_std)
+
+    @property
+    def payload_params(self) -> int:
+        return self.lut.numel()
+
+    @property
+    def bias_generator_params(self) -> int:
+        return self.lut.numel()
+
+    @property
+    def slope_coeff_params(self) -> int:
+        return 0
+
+    @property
+    def slope_generator_params(self) -> int:
+        return 0
+
+    def payload_parameters(self) -> list[Tensor]:
+        return [self.lut]
+
+    def clear_packed_payload_cache(self) -> None:
+        return None
+
+    def _route(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        anchor_a = self.anchors[:, :, 0].flatten()
+        anchor_b = self.anchors[:, :, 1].flatten()
+        x_a = x.index_select(-1, anchor_a).view(x.shape[0], self.tables, self.comparisons)
+        x_b = x.index_select(-1, anchor_b).view(x.shape[0], self.tables, self.comparisons)
+        margins = x_a - x_b - self.thresholds.to(device=x.device, dtype=x.dtype)
+        bits = (margins > 0).to(torch.long)
+        return bits, margins
+
+    def _select_payload(self, bits: Tensor) -> Tensor:
+        table = torch.arange(self.tables, device=bits.device).view(1, self.tables, 1).expand_as(bits)
+        comp = torch.arange(self.comparisons, device=bits.device).view(1, 1, self.comparisons).expand_as(bits)
+        return self.lut.to(device=bits.device)[table, comp, bits]
+
+    def compute(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        input_dtype = x.dtype
+        bits, margins = self._route(x.float())
+        payload = self._select_payload(bits)
+        output = payload.sum(dim=(1, 2)) * self.output_scale
+        if self.training and (x.requires_grad or self.thresholds.requires_grad):
+            flipped = self._select_payload(1 - bits)
+            ste_delta = ste_heaviside(margins) - bits.to(margins.dtype)
+            output = output + ((flipped - payload) * ste_delta.unsqueeze(-1)).sum(dim=(1, 2)) * self.output_scale
+        return output.to(dtype=input_dtype), bits.reshape(bits.shape[0], -1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        output, _indices = self.compute(x)
+        return output
+
+
 class WalshAffinePayloadLayer(nn.Module):
     """Payload-width compatible wrapper for the low-degree Walsh affine layer."""
 
@@ -432,6 +720,8 @@ class ComparatorGeneratorLayer(nn.Module):
         comparisons: int,
         source: Literal["sign", "margin", "signed_margin", "two_sided_margin"],
         write_policy: ComparatorWritePolicy,
+        reduction_layout: Literal["scatter", "output_major", "tile_local"],
+        output_tile_size: int,
         k_c: int,
         anchor_policy: str,
         seed: int,
@@ -443,6 +733,14 @@ class ComparatorGeneratorLayer(nn.Module):
             raise ValueError(f"k_c must be >= 1, got {k_c}")
         if write_policy not in {"endpoint", "local-linegraph", "expander"}:
             raise ValueError(f"unknown comparator write policy {write_policy!r}")
+        if reduction_layout not in {"scatter", "output_major", "tile_local"}:
+            raise ValueError(f"unknown comparator reduction layout {reduction_layout!r}")
+        if reduction_layout == "output_major":
+            raise ValueError("output_major comparator reduction is only implemented for comparator_two_sided_margin_kc")
+        if reduction_layout == "tile_local" and write_policy != "expander":
+            raise ValueError("tile_local comparator reduction currently requires write_policy='expander'")
+        if output_tile_size not in {16, 32, 64, 128}:
+            raise ValueError("output_tile_size must be one of 16, 32, 64, or 128")
         template = PairwiseLUT(
             input_dim,
             1,
@@ -463,6 +761,8 @@ class ComparatorGeneratorLayer(nn.Module):
         self.source = source
         self.sides = 2 if source == "two_sided_margin" else 1
         self.write_policy = write_policy
+        self.reduction_layout = reduction_layout
+        self.output_tile_size = int(output_tile_size)
         self.k_c = int(k_c)
         self.payload_width = int(k_c)
         self.write_degree = int(k_c * self.sides)
@@ -505,11 +805,21 @@ class ComparatorGeneratorLayer(nn.Module):
         indices = torch.empty(self.routes, self.k_c, dtype=torch.long)
         signs = torch.empty(self.routes, self.k_c, dtype=torch.float32)
         gen = torch.Generator(device="cpu").manual_seed(seed)
+        tiles = max(1, math.ceil(self.output_dim / self.output_tile_size))
+        routes_per_tile = max(1, math.ceil(self.routes / tiles))
         for route in range(self.routes):
             a = int(anchors[route, 0].item()) % self.output_dim
             b = int(anchors[route, 1].item()) % self.output_dim
+            tile = min(route // routes_per_tile, tiles - 1)
+            tile_start = tile * self.output_tile_size
+            tile_width = max(1, min(self.output_tile_size, self.output_dim - tile_start))
             for slot in range(self.k_c):
-                if self.write_policy == "endpoint":
+                if self.reduction_layout == "tile_local":
+                    hashed = (route * 1103515245 + slot * 12345 + 97) & 0x7FFFFFFF
+                    jitter = int(torch.randint(0, tile_width, (1,), generator=gen).item())
+                    indices[route, slot] = tile_start + ((hashed + jitter) % tile_width)
+                    signs[route, slot] = 1.0 if ((hashed // max(1, tile_width)) & 1) == 0 else -1.0
+                elif self.write_policy == "endpoint":
                     indices[route, slot] = a if slot % 2 == 0 else b
                     signs[route, slot] = 1.0 if slot % 2 == 0 else -1.0
                 elif self.write_policy == "local-linegraph":
@@ -522,7 +832,7 @@ class ComparatorGeneratorLayer(nn.Module):
                     hashed = (route * 1103515245 + slot * 12345 + 97) & 0x7FFFFFFF
                     indices[route, slot] = hashed % self.output_dim
                     signs[route, slot] = 1.0 if ((hashed // max(1, self.output_dim)) & 1) == 0 else -1.0
-        if self.write_policy == "expander":
+        if self.write_policy == "expander" and self.reduction_layout != "tile_local":
             jitter = torch.randint(0, max(1, self.output_dim), (self.routes, self.k_c), generator=gen, dtype=torch.long)
             indices = (indices + jitter) % self.output_dim
         return indices, signs
@@ -532,14 +842,24 @@ class ComparatorGeneratorLayer(nn.Module):
         indices = torch.empty(self.routes, 2, self.k_c, dtype=torch.long)
         signs = torch.empty(self.routes, 2, self.k_c, dtype=torch.float32)
         gen = torch.Generator(device="cpu").manual_seed(seed)
+        tiles = max(1, math.ceil(self.output_dim / self.output_tile_size))
+        routes_per_tile = max(1, math.ceil(self.routes / tiles))
         for route in range(self.routes):
             a = int(anchors[route, 0].item()) % self.output_dim
             b = int(anchors[route, 1].item()) % self.output_dim
+            tile = min(route // routes_per_tile, tiles - 1)
+            tile_start = tile * self.output_tile_size
+            tile_width = max(1, min(self.output_tile_size, self.output_dim - tile_start))
             for side in range(2):
                 virtual_route = route * 2 + side
                 side_sign = 1.0 if side == 0 else -1.0
                 for slot in range(self.k_c):
-                    if self.write_policy == "endpoint":
+                    if self.reduction_layout == "tile_local":
+                        hashed = (virtual_route * 1103515245 + slot * 12345 + 97) & 0x7FFFFFFF
+                        jitter = int(torch.randint(0, tile_width, (1,), generator=gen).item())
+                        indices[route, side, slot] = tile_start + ((hashed + jitter) % tile_width)
+                        signs[route, side, slot] = 1.0 if ((hashed // max(1, tile_width)) & 1) == 0 else -1.0
+                    elif self.write_policy == "endpoint":
                         indices[route, side, slot] = a if slot % 2 == 0 else b
                         signs[route, side, slot] = side_sign if slot % 2 == 0 else -side_sign
                     elif self.write_policy == "local-linegraph":
@@ -552,7 +872,7 @@ class ComparatorGeneratorLayer(nn.Module):
                         hashed = (virtual_route * 1103515245 + slot * 12345 + 97) & 0x7FFFFFFF
                         indices[route, side, slot] = hashed % self.output_dim
                         signs[route, side, slot] = 1.0 if ((hashed // max(1, self.output_dim)) & 1) == 0 else -1.0
-        if self.write_policy == "expander":
+        if self.write_policy == "expander" and self.reduction_layout != "tile_local":
             jitter = torch.randint(0, max(1, self.output_dim), (self.routes, 2, self.k_c), generator=gen, dtype=torch.long)
             indices = (indices + jitter) % self.output_dim
         return indices, signs
@@ -636,9 +956,77 @@ class PayloadWidthEmnistClassifier(nn.Module):
         use_min_margin_ste: bool,
         comparator_kc: int,
         comparator_write_policy: ComparatorWritePolicy,
+        comparator_reduction_layout: Literal["scatter", "output_major", "tile_local"],
+        comparator_output_tile_size: int,
     ) -> None:
         super().__init__()
         def make_layer(input_features: int, output_features: int, layer_seed: int) -> nn.Module:
+            if variant == "ladder_a_full_code_full_payload":
+                return PayloadWidthLUTLayer(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    variant="full_vector",
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    write_degree=write_degree,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                )
+            if variant == "ladder_b_full_code_sparse_payload":
+                return FullCodeSparsePayloadLayer(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    write_degree=write_degree,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                )
+            if variant == "ladder_c_full_code_margin_sparse":
+                return FullCodeMarginSparseLayer(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    write_degree=write_degree,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                )
+            if variant == "ladder_d_comparator_side_full_payload":
+                return ComparatorSideFullPayloadLayer(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    use_output_scaling=use_output_scaling,
+                )
+            if variant == "ladder_e_comparator_side_sparse":
+                return ComparatorTwoSidedMargin(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    k_c=comparator_kc,
+                    backend="auto",
+                    write_policy=comparator_write_policy,
+                    reduction_layout=comparator_reduction_layout,
+                    output_tile_size=comparator_output_tile_size,
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    use_output_scaling=use_output_scaling,
+                )
             if variant == "walsh_affine":
                 return WalshAffinePayloadLayer(
                     input_features,
@@ -660,6 +1048,21 @@ class PayloadWidthEmnistClassifier(nn.Module):
                 source = variant.removeprefix("comparator_").removesuffix("_kc")
                 if source not in {"sign", "margin", "signed_margin", "two_sided_margin"}:
                     raise ValueError(f"unknown comparator source from variant {variant!r}")
+                if source == "two_sided_margin":
+                    return ComparatorTwoSidedMargin(
+                        input_features,
+                        output_features,
+                        tables=tables,
+                        comparisons=comparisons,
+                        k_c=comparator_kc,
+                        backend="auto",
+                        write_policy=comparator_write_policy,
+                        reduction_layout=comparator_reduction_layout,
+                        output_tile_size=comparator_output_tile_size,
+                        anchor_policy=anchor_policy,
+                        seed=layer_seed,
+                        use_output_scaling=use_output_scaling,
+                    )
                 return ComparatorGeneratorLayer(
                     input_features,
                     output_features,
@@ -667,6 +1070,8 @@ class PayloadWidthEmnistClassifier(nn.Module):
                     comparisons=comparisons,
                     source=source,  # type: ignore[arg-type]
                     write_policy=comparator_write_policy,
+                    reduction_layout=comparator_reduction_layout,
+                    output_tile_size=comparator_output_tile_size,
                     k_c=comparator_kc,
                     anchor_policy=anchor_policy,
                     seed=layer_seed,
@@ -706,13 +1111,17 @@ class PayloadWidthEmnistClassifier(nn.Module):
     def payload_layers(self) -> list[nn.Module]:
         return [*self.blocks, self.readout]
 
+    @staticmethod
+    def _route_indices(route: Tensor | PairwiseRoute) -> Tensor:
+        return route.indices if isinstance(route, PairwiseRoute) else route
+
     def forward(self, x: Tensor) -> Tensor:
         y = x.flatten(start_dim=1).float()
         routes: list[Tensor] = []
         for block in self.blocks:
             output, indices = block.compute(y)
             y = y + self.residual_scale * output
-            routes.append(indices.detach())
+            routes.append(self._route_indices(indices).detach())
         logits, _readout_indices = self.readout.compute(y)
         self.last_routes = routes
         return logits
@@ -868,7 +1277,7 @@ def _optimizer_name(args: argparse.Namespace) -> OptimizerName:
 def _build_optimizers(args: argparse.Namespace, model: PayloadWidthEmnistClassifier):
     if args.optimizer == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay), None
-    if args.payload_variant == "walsh_affine" or args.payload_variant.startswith("comparator_"):
+    if args.payload_variant == "walsh_affine" or args.payload_variant.startswith("comparator_") or args.payload_variant.startswith("ladder_"):
         raise ValueError(f"{args.payload_variant} uses generator parameters and currently supports --optimizer adamw only")
 
     payload_optimizer = RowLocalDiscretePayloadOptimizer(
@@ -924,6 +1333,8 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         use_min_margin_ste=not args.full_ste,
         comparator_kc=args.comparator_kc,
         comparator_write_policy=args.comparator_write_policy,
+        comparator_reduction_layout=args.comparator_reduction_layout,
+        comparator_output_tile_size=args.comparator_output_tile_size,
     ).to(device)
     main_optimizer, payload_optimizer = _build_optimizers(args, model)
 
@@ -990,8 +1401,10 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         "walsh_lut_dtype": args.walsh_lut_dtype if args.payload_variant == "walsh_affine" else "none",
         "walsh_order": args.walsh_order if args.payload_variant == "walsh_affine" else 0,
         "walsh_slope_order": args.walsh_slope_order if args.payload_variant == "walsh_affine" else 0,
-        "comparator_kc": args.comparator_kc if args.payload_variant.startswith("comparator_") else 0,
-        "comparator_write_policy": args.comparator_write_policy if args.payload_variant.startswith("comparator_") else "none",
+        "comparator_kc": args.comparator_kc if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else 0,
+        "comparator_write_policy": args.comparator_write_policy if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else "none",
+        "comparator_reduction_layout": args.comparator_reduction_layout if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else "none",
+        "comparator_output_tile_size": args.comparator_output_tile_size if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else 0,
         "output_scale": first_layer.output_scale,
         "residual_scale": args.residual_scale,
         "train_examples": train_examples,
@@ -1053,6 +1466,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--walsh-slope-generator-init-std", type=float, default=0.02)
     parser.add_argument("--comparator-kc", type=int, default=4)
     parser.add_argument("--comparator-write-policy", choices=["endpoint", "local-linegraph", "expander"], default="endpoint")
+    parser.add_argument("--comparator-reduction-layout", choices=["scatter", "output_major", "tile_local"], default="scatter")
+    parser.add_argument("--comparator-output-tile-size", type=int, choices=[16, 32, 64, 128], default=32)
     parser.add_argument("--residual-scale", type=float, default=1.0)
     parser.add_argument("--lut-init-std", type=float, default=0.0)
     parser.add_argument("--full-ste", action="store_true")

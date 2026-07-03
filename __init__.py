@@ -1,5 +1,6 @@
 from .layers import (
     AbsDiffLUT,
+    ComparatorTwoSidedMargin,
     LUTModuleBase,
     PAIRWISE_ANCHOR_POLICIES,
     PairwiseLinear,
@@ -11,6 +12,7 @@ from .layers import (
 
 __all__ = [
     "AbsDiffLUT",
+    "ComparatorTwoSidedMargin",
     "LUTModuleBase",
     "PAIRWISE_ANCHOR_POLICIES",
     "PairwiseLinear",

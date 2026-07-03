@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tropnn.backends.comparator_margin_triton import has_comparator_margin_triton
 from tropnn.backends.pairwise_zig import has_pairwise_zig, pairwise_zig_forward, pairwise_zig_paged_forward, pairwise_zig_soa_forward, pairwise_zig_tree_tiled_forward
-from tropnn import AbsDiffLUT, PairwiseLUT, PairwiseWalshLUT
+from tropnn import AbsDiffLUT, ComparatorTwoSidedMargin, PairwiseLUT, PairwiseWalshLUT
 from tropnn.examples.emnist import EmnistPairwiseWalshClassifier
 from tropnn.layers.surrogate import surrogate_gradient
 from tropnn.tools.emnist_payload_width import ComparatorGeneratorLayer
@@ -53,6 +54,150 @@ def test_pairwise_zig_tree_tiled_forward_matches_standard_zig_forward() -> None:
     standard = pairwise_zig_forward(x.float(), layer.anchors, layer.thresholds.detach().float(), layer.lut.detach().float(), lut_dtype="f32")
     tree = pairwise_zig_tree_tiled_forward(x.float(), layer.anchors, layer.thresholds.detach().float(), layer.lut.detach().float())
     assert torch.allclose(tree, standard, atol=1e-6)
+
+
+def test_comparator_output_major_layout_preserves_sparse_writes() -> None:
+    layer = ComparatorTwoSidedMargin(
+        16,
+        11,
+        tables=5,
+        comparisons=3,
+        k_c=7,
+        backend="torch",
+        seed=4,
+        use_output_scaling=False,
+        reduction_layout="output_major",
+    )
+    counts = torch.bincount(layer.write_indices.reshape(-1), minlength=layer.output_dim)
+
+    assert layer.csr_offsets[0].item() == 0
+    assert layer.csr_offsets[-1].item() == layer.routes * 2 * layer.k_c
+    assert torch.equal(layer.csr_offsets[1:] - layer.csr_offsets[:-1], counts)
+    for dst in range(layer.output_dim):
+        start = int(layer.csr_offsets[dst].item())
+        end = int(layer.csr_offsets[dst + 1].item())
+        for source, weight_idx in zip(layer.csr_sources[start:end].tolist(), layer.csr_weight_indices[start:end].tolist(), strict=True):
+            slot = weight_idx % layer.k_c
+            route = source // 2
+            side = source - route * 2
+            assert int(layer.write_indices[route, side, slot].item()) == dst
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not has_comparator_margin_triton(), reason="CUDA Triton backend is not available")
+def test_comparator_output_major_triton_matches_scatter_forward_backward() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    scatter = ComparatorTwoSidedMargin(
+        32,
+        19,
+        tables=7,
+        comparisons=4,
+        k_c=9,
+        backend="triton",
+        seed=5,
+        use_output_scaling=False,
+        reduction_layout="scatter",
+    ).to(device)
+    output_major = ComparatorTwoSidedMargin(
+        32,
+        19,
+        tables=7,
+        comparisons=4,
+        k_c=9,
+        backend="triton",
+        seed=5,
+        use_output_scaling=False,
+        reduction_layout="output_major",
+    ).to(device)
+    with torch.no_grad():
+        output_major.thresholds.copy_(scatter.thresholds)
+        output_major.write_weight.copy_(scatter.write_weight)
+
+    x_scatter = torch.randn(6, 3, 32, device=device, requires_grad=True)
+    x_output_major = x_scatter.detach().clone().requires_grad_(True)
+    y_scatter = scatter(x_scatter)
+    y_output_major = output_major(x_output_major)
+    assert torch.allclose(y_output_major, y_scatter, atol=1e-5, rtol=1e-5)
+
+    grad = torch.randn_like(y_scatter)
+    y_scatter.backward(grad)
+    y_output_major.backward(grad)
+
+    assert torch.allclose(x_output_major.grad, x_scatter.grad, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(output_major.thresholds.grad, scatter.thresholds.grad, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(output_major.write_weight.grad, scatter.write_weight.grad, atol=1e-4, rtol=1e-4)
+
+
+def test_comparator_tile_local_write_pattern_stays_inside_route_tile() -> None:
+    layer = ComparatorTwoSidedMargin(
+        32,
+        48,
+        tables=8,
+        comparisons=3,
+        k_c=5,
+        backend="torch",
+        seed=7,
+        use_output_scaling=False,
+        reduction_layout="tile_local",
+        output_tile_size=16,
+    )
+    tiles = (layer.output_dim + layer.output_tile_size - 1) // layer.output_tile_size
+    routes_per_tile = (layer.routes + tiles - 1) // tiles
+
+    for route in range(layer.routes):
+        tile = min(route // routes_per_tile, tiles - 1)
+        start = tile * layer.output_tile_size
+        end = min(start + layer.output_tile_size, layer.output_dim)
+        route_indices = layer.write_indices[route].reshape(-1)
+        assert int(route_indices.min().item()) >= start
+        assert int(route_indices.max().item()) < end
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not has_comparator_margin_triton(), reason="CUDA Triton backend is not available")
+def test_comparator_tile_local_triton_matches_torch_forward_backward() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    torch_ref = ComparatorTwoSidedMargin(
+        32,
+        48,
+        tables=8,
+        comparisons=3,
+        k_c=5,
+        backend="torch",
+        seed=7,
+        use_output_scaling=False,
+        reduction_layout="tile_local",
+        output_tile_size=16,
+    ).to(device)
+    tiled = ComparatorTwoSidedMargin(
+        32,
+        48,
+        tables=8,
+        comparisons=3,
+        k_c=5,
+        backend="triton",
+        seed=7,
+        use_output_scaling=False,
+        reduction_layout="tile_local",
+        output_tile_size=16,
+    ).to(device)
+    with torch.no_grad():
+        tiled.thresholds.copy_(torch_ref.thresholds)
+        tiled.write_weight.copy_(torch_ref.write_weight)
+
+    x_ref = torch.randn(4, 2, 32, device=device, requires_grad=True)
+    x_tiled = x_ref.detach().clone().requires_grad_(True)
+    y_ref = torch_ref(x_ref)
+    y_tiled = tiled(x_tiled)
+    assert torch.allclose(y_tiled, y_ref, atol=1e-5, rtol=1e-5)
+
+    grad = torch.randn_like(y_ref)
+    y_ref.backward(grad)
+    y_tiled.backward(grad)
+
+    assert torch.allclose(x_tiled.grad, x_ref.grad, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(tiled.thresholds.grad, torch_ref.thresholds.grad, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(tiled.write_weight.grad, torch_ref.write_weight.grad, atol=1e-4, rtol=1e-4)
 
 
 def test_absdiff_lut_selects_rows_from_coordinate_closeness() -> None:
