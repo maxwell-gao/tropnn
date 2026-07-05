@@ -12,6 +12,8 @@ written by each routed table row:
 * comparator_*_kc: each comparator activation directly writes to k_c output coordinates.
 * ladder_*: explicit ablation ladder separating full-code payload width,
   margin-strength output, comparator-side routing, and sparse writes.
+* code_bits_k_hidden: hidden full-vector LUT plus explicit comparator-bit
+  group coordinates; readout remains full-vector LUT.
 """
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ PayloadVariant = Literal[
     "comparator_margin_kc",
     "comparator_signed_margin_kc",
     "comparator_two_sided_margin_kc",
+    "code_bits_k_hidden",
     "ladder_a_full_code_full_payload",
     "ladder_b_full_code_sparse_payload",
     "ladder_c_full_code_margin_sparse",
@@ -91,6 +94,7 @@ VARIANT_PAYLOAD_WIDTH: dict[str, int | None] = {
     "comparator_margin_kc": None,
     "comparator_signed_margin_kc": None,
     "comparator_two_sided_margin_kc": None,
+    "code_bits_k_hidden": None,
     "ladder_a_full_code_full_payload": None,
     "ladder_b_full_code_sparse_payload": None,
     "ladder_c_full_code_margin_sparse": None,
@@ -130,6 +134,8 @@ class PayloadSpec:
             return "walsh_affine"
         if self.variant.startswith("comparator_"):
             return self.variant
+        if self.variant == "code_bits_k_hidden":
+            return f"code_bits_k{self.write_degree}_hidden"
         if self.variant == "full_vector":
             return "full_vector"
         if self.variant.startswith("group_"):
@@ -148,6 +154,9 @@ def _payload_spec(variant: PayloadVariant, output_dim: int, write_degree: int) -
         return PayloadSpec(variant=variant, payload_width=max(1, min(write_degree, output_dim)), write_degree=max(1, min(write_degree, output_dim)), dense_sign_basis=False)
     if variant == "walsh_affine" or variant.startswith("comparator_"):
         return PayloadSpec(variant=variant, payload_width=0, write_degree=0, dense_sign_basis=False)
+    if variant == "code_bits_k_hidden":
+        group_size = max(1, min(write_degree, output_dim))
+        return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=group_size, dense_sign_basis=False)
     width = VARIANT_PAYLOAD_WIDTH[variant]
     if width is None:
         return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=False)
@@ -348,6 +357,113 @@ class PayloadWidthLUTLayer(nn.Module):
         if self.training and (x.requires_grad or self.thresholds.requires_grad):
             output = output + self._ste_correction(indices, margins, payload)
         return output.to(dtype=input_dtype), indices
+
+
+class CodeBitsHiddenLayer(nn.Module):
+    """Full-vector LUT plus explicit comparator-bit group coordinates.
+
+    This mirrors the C-reference `code_bits` hidden mode: each comparator sign
+    writes one learned scalar per output group, and that scalar is broadcast over
+    the coordinates in the group. The coefficients start at zero, so the layer
+    initially behaves exactly like the full-vector LUT baseline.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        anchor_policy: str,
+        seed: int,
+        lut_init_std: float,
+        group_size: int,
+        use_output_scaling: bool,
+        use_min_margin_ste: bool,
+    ) -> None:
+        super().__init__()
+        self.full_lut = PayloadWidthLUTLayer(
+            input_dim,
+            output_dim,
+            tables=tables,
+            comparisons=comparisons,
+            variant="full_vector",
+            anchor_policy=anchor_policy,
+            seed=seed,
+            lut_init_std=lut_init_std,
+            write_degree=output_dim,
+            use_output_scaling=use_output_scaling,
+            use_min_margin_ste=use_min_margin_ste,
+        )
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.tables = int(tables)
+        self.comparisons = int(comparisons)
+        self.routes = self.tables * self.comparisons
+        self.table_size = 1 << int(comparisons)
+        self.variant: PayloadVariant = "code_bits_k_hidden"
+        self.payload_width = int(output_dim)
+        self.write_degree = max(1, min(int(group_size), self.output_dim))
+        self.group_count = math.ceil(self.output_dim / self.write_degree)
+        self.output_scale = self.full_lut.output_scale
+        self.code_scale = 1.0 / math.sqrt(float(self.routes)) if use_output_scaling else 1.0
+        self.use_min_margin_ste = bool(use_min_margin_ste)
+        self.code_coeff = nn.Parameter(torch.zeros(self.routes, self.group_count))
+
+    @property
+    def thresholds(self) -> Tensor:
+        return self.full_lut.thresholds
+
+    @property
+    def payload_params(self) -> int:
+        return self.full_lut.payload_params + self.code_coeff.numel()
+
+    @property
+    def bias_generator_params(self) -> int:
+        return self.payload_params
+
+    @property
+    def slope_coeff_params(self) -> int:
+        return 0
+
+    @property
+    def slope_generator_params(self) -> int:
+        return 0
+
+    def payload_parameters(self) -> list[Tensor]:
+        return [*self.full_lut.payload_parameters(), self.code_coeff]
+
+    def clear_packed_payload_cache(self) -> None:
+        self.full_lut.clear_packed_payload_cache()
+
+    def _code_bits_output(self, margins: Tensor) -> Tensor:
+        hard = (margins > 0).to(dtype=margins.dtype)
+        hard_sign = hard.mul(2.0).sub(1.0)
+        if self.training and (margins.requires_grad or self.thresholds.requires_grad):
+            signs = hard_sign + 2.0 * (ste_heaviside(margins) - hard)
+        else:
+            signs = hard_sign
+        group_values = signs.reshape(signs.shape[0], self.routes).matmul(self.code_coeff.to(device=margins.device, dtype=margins.dtype))
+        group_values = group_values * self.code_scale
+        if self.write_degree == 1:
+            return group_values[:, : self.output_dim]
+        return group_values.repeat_interleave(self.write_degree, dim=-1)[:, : self.output_dim]
+
+    def compute(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        input_dtype = x.dtype
+        x32 = x.float()
+        indices, margins = self.full_lut._route(x32)
+        payload = self.full_lut._lookup(indices)
+        output = self.full_lut._payload_to_output(payload)
+        if self.training and (x.requires_grad or self.thresholds.requires_grad):
+            output = output + self.full_lut._ste_correction(indices, margins, payload)
+        output = output + self._code_bits_output(margins)
+        return output.to(dtype=input_dtype), indices
+
+    def forward(self, x: Tensor) -> Tensor:
+        output, _indices = self.compute(x)
+        return output
 
 
 class FullCodeSparsePayloadLayer(nn.Module):
@@ -960,7 +1076,34 @@ class PayloadWidthEmnistClassifier(nn.Module):
         comparator_output_tile_size: int,
     ) -> None:
         super().__init__()
-        def make_layer(input_features: int, output_features: int, layer_seed: int) -> nn.Module:
+        def make_layer(input_features: int, output_features: int, layer_seed: int, *, is_hidden: bool) -> nn.Module:
+            if variant == "code_bits_k_hidden":
+                if is_hidden:
+                    return CodeBitsHiddenLayer(
+                        input_features,
+                        output_features,
+                        tables=tables,
+                        comparisons=comparisons,
+                        anchor_policy=anchor_policy,
+                        seed=layer_seed,
+                        lut_init_std=lut_init_std,
+                        group_size=write_degree,
+                        use_output_scaling=use_output_scaling,
+                        use_min_margin_ste=use_min_margin_ste,
+                    )
+                return PayloadWidthLUTLayer(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    variant="full_vector",
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    write_degree=write_degree,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                )
             if variant == "ladder_a_full_code_full_payload":
                 return PayloadWidthLUTLayer(
                     input_features,
@@ -1097,6 +1240,7 @@ class PayloadWidthEmnistClassifier(nn.Module):
                 input_dim,
                 input_dim,
                 seed + 101 * idx,
+                is_hidden=True,
             )
             for idx in range(depth)
         )
@@ -1104,6 +1248,7 @@ class PayloadWidthEmnistClassifier(nn.Module):
             input_dim,
             classes,
             seed + 10007,
+            is_hidden=False,
         )
         self.residual_scale = float(residual_scale)
         self.last_routes: list[Tensor] = []
@@ -1277,7 +1422,12 @@ def _optimizer_name(args: argparse.Namespace) -> OptimizerName:
 def _build_optimizers(args: argparse.Namespace, model: PayloadWidthEmnistClassifier):
     if args.optimizer == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay), None
-    if args.payload_variant == "walsh_affine" or args.payload_variant.startswith("comparator_") or args.payload_variant.startswith("ladder_"):
+    if (
+        args.payload_variant == "walsh_affine"
+        or args.payload_variant == "code_bits_k_hidden"
+        or args.payload_variant.startswith("comparator_")
+        or args.payload_variant.startswith("ladder_")
+    ):
         raise ValueError(f"{args.payload_variant} uses generator parameters and currently supports --optimizer adamw only")
 
     payload_optimizer = RowLocalDiscretePayloadOptimizer(
