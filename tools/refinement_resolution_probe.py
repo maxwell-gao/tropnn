@@ -34,6 +34,7 @@ class ResolutionRow:
     plane_span: float
     epochs: int
     params: int
+    mlp_output_dim: int
     train_loss: float
     train_acc: float
     valid_loss: float
@@ -100,7 +101,7 @@ def _build_model(args: argparse.Namespace, classes: int) -> nn.Module:
     if args.model == "residual_mlp":
         return ResidualReLUMlpWithSignatures(
             input_dim=28 * 28,
-            hidden_dim=args.hidden_dim,
+            hidden_dim=_residual_mlp_output_dim(args),
             classes=classes,
             depth=args.depth,
             seed=args.seed,
@@ -144,6 +145,15 @@ def _build_model(args: argparse.Namespace, classes: int) -> nn.Module:
         comparator_reduction_layout="scatter",
         comparator_output_tile_size=32,
     )
+
+
+def _residual_mlp_output_dim(args: argparse.Namespace) -> int:
+    requested = int(args.residual_mlp_output_dim)
+    if requested > 0:
+        return requested
+    if int(args.depth) == 16:
+        return 28 * 28
+    return int(args.hidden_dim)
 
 
 def _train(model: nn.Module, train_loader, args: argparse.Namespace, *, device: torch.device) -> tuple[float, float]:
@@ -380,6 +390,7 @@ def run(args: argparse.Namespace) -> list[ResolutionRow]:
                 plane_span=args.plane_span,
                 epochs=args.epochs,
                 params=sum(param.numel() for param in model.parameters()),
+                mlp_output_dim=_residual_mlp_output_dim(args) if args.model == "residual_mlp" else 0,
                 train_loss=train_loss,
                 train_acc=train_acc,
                 valid_loss=valid_loss,
@@ -446,6 +457,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--residual-mlp-output-dim", type=int, default=0)
     parser.add_argument("--mlp-residual-scale", type=float, default=1.0)
     parser.add_argument("--tables", type=int, default=64)
     parser.add_argument("--comparisons", type=int, default=6)

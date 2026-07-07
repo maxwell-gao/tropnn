@@ -14,6 +14,10 @@ written by each routed table row:
   margin-strength output, comparator-side routing, and sparse writes.
 * code_bits_k_hidden: hidden full-vector LUT plus explicit comparator-bit
   group coordinates; readout remains full-vector LUT.
+* compare_swap_*_hidden: hidden full-vector LUT plus a zero-gated
+  compare-swap geometry scaffold; readout remains full-vector LUT.
+* full_lut_*_hidden: hidden full-vector LUT plus a zero-gated correction
+  map; readout remains full-vector LUT.
 """
 
 from __future__ import annotations
@@ -64,6 +68,13 @@ PayloadVariant = Literal[
     "comparator_signed_margin_kc",
     "comparator_two_sided_margin_kc",
     "code_bits_k_hidden",
+    "compare_swap_independent_hidden",
+    "compare_swap_reused_anchor_hidden",
+    "compare_swap_anchor_delta_hidden",
+    "full_lut_gated_twosided_margin_hidden",
+    "full_lut_gated_signed_margin_hidden",
+    "full_lut_chamber_diagonal_hidden",
+    "full_lut_route_2x2_affine_hidden",
     "ladder_a_full_code_full_payload",
     "ladder_b_full_code_sparse_payload",
     "ladder_c_full_code_margin_sparse",
@@ -95,6 +106,13 @@ VARIANT_PAYLOAD_WIDTH: dict[str, int | None] = {
     "comparator_signed_margin_kc": None,
     "comparator_two_sided_margin_kc": None,
     "code_bits_k_hidden": None,
+    "compare_swap_independent_hidden": None,
+    "compare_swap_reused_anchor_hidden": None,
+    "compare_swap_anchor_delta_hidden": None,
+    "full_lut_gated_twosided_margin_hidden": None,
+    "full_lut_gated_signed_margin_hidden": None,
+    "full_lut_chamber_diagonal_hidden": None,
+    "full_lut_route_2x2_affine_hidden": None,
     "ladder_a_full_code_full_payload": None,
     "ladder_b_full_code_sparse_payload": None,
     "ladder_c_full_code_margin_sparse": None,
@@ -136,6 +154,10 @@ class PayloadSpec:
             return self.variant
         if self.variant == "code_bits_k_hidden":
             return f"code_bits_k{self.write_degree}_hidden"
+        if self.variant.startswith("compare_swap_"):
+            return self.variant
+        if self.variant.startswith("full_lut_"):
+            return self.variant
         if self.variant == "full_vector":
             return "full_vector"
         if self.variant.startswith("group_"):
@@ -157,6 +179,10 @@ def _payload_spec(variant: PayloadVariant, output_dim: int, write_degree: int) -
     if variant == "code_bits_k_hidden":
         group_size = max(1, min(write_degree, output_dim))
         return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=group_size, dense_sign_basis=False)
+    if variant.startswith("compare_swap_"):
+        return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=False)
+    if variant.startswith("full_lut_"):
+        return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=False)
     width = VARIANT_PAYLOAD_WIDTH[variant]
     if width is None:
         return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=False)
@@ -459,6 +485,486 @@ class CodeBitsHiddenLayer(nn.Module):
         if self.training and (x.requires_grad or self.thresholds.requires_grad):
             output = output + self.full_lut._ste_correction(indices, margins, payload)
         output = output + self._code_bits_output(margins)
+        return output.to(dtype=input_dtype), indices
+
+    def forward(self, x: Tensor) -> Tensor:
+        output, _indices = self.compute(x)
+        return output
+
+
+class CompareSwapHiddenLayer(nn.Module):
+    """Full-vector LUT plus a compare-swap geometry scaffold.
+
+    The LUT path is exactly the full-vector payload baseline. The scaffold is a
+    residual vector field built from fixed pairwise comparisons:
+
+    * independent: a fixed non-overlapping random matching.
+    * reused_anchor: a non-overlapping matching greedily extracted from the LUT anchors.
+    * anchor_delta: all LUT anchors accumulate compare-swap deltas with degree normalization.
+
+    A scalar gate starts at compare_swap_alpha_init. At zero, the layer is
+    functionally identical to the full-vector LUT baseline, while the gate still
+    receives gradients through the piecewise-linear compare-swap delta.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        variant: PayloadVariant,
+        anchor_policy: str,
+        seed: int,
+        lut_init_std: float,
+        compare_swap_alpha_init: float,
+        compare_swap_pair_count: int,
+        use_output_scaling: bool,
+        use_min_margin_ste: bool,
+    ) -> None:
+        super().__init__()
+        if input_dim != output_dim:
+            raise ValueError("CompareSwapHiddenLayer requires input_dim == output_dim; use it only in hidden blocks")
+        if variant not in {
+            "compare_swap_independent_hidden",
+            "compare_swap_reused_anchor_hidden",
+            "compare_swap_anchor_delta_hidden",
+        }:
+            raise ValueError(f"unknown compare-swap variant {variant!r}")
+        self.full_lut = PayloadWidthLUTLayer(
+            input_dim,
+            output_dim,
+            tables=tables,
+            comparisons=comparisons,
+            variant="full_vector",
+            anchor_policy=anchor_policy,
+            seed=seed,
+            lut_init_std=lut_init_std,
+            write_degree=output_dim,
+            use_output_scaling=use_output_scaling,
+            use_min_margin_ste=use_min_margin_ste,
+        )
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.tables = int(tables)
+        self.comparisons = int(comparisons)
+        self.table_size = 1 << int(comparisons)
+        self.variant = variant
+        self.payload_width = int(output_dim)
+        self.write_degree = int(output_dim)
+        self.output_scale = self.full_lut.output_scale
+        self.use_min_margin_ste = bool(use_min_margin_ste)
+        self.compare_swap_alpha = nn.Parameter(torch.tensor(float(compare_swap_alpha_init), dtype=torch.float32))
+
+        desired_pairs = self._desired_pair_count(compare_swap_pair_count)
+        if variant == "compare_swap_independent_hidden":
+            pairs = self._independent_matching(desired_pairs, seed + 1009)
+            norm = torch.ones(self.input_dim, dtype=torch.float32)
+        elif variant == "compare_swap_reused_anchor_hidden":
+            pairs = self._reused_anchor_matching(desired_pairs)
+            norm = torch.ones(self.input_dim, dtype=torch.float32)
+        else:
+            pairs = self.full_lut.anchors.detach().cpu().reshape(-1, 2).contiguous()
+            if compare_swap_pair_count > 0:
+                pairs = pairs[: min(int(compare_swap_pair_count), pairs.shape[0])]
+            norm = self._anchor_delta_norm(pairs)
+        self.register_buffer("compare_swap_pairs", pairs.to(dtype=torch.long).contiguous())
+        self.register_buffer("compare_swap_norm", norm)
+
+    @property
+    def thresholds(self) -> Tensor:
+        return self.full_lut.thresholds
+
+    @property
+    def payload_params(self) -> int:
+        return self.full_lut.payload_params + self.compare_swap_alpha.numel()
+
+    @property
+    def bias_generator_params(self) -> int:
+        return self.payload_params
+
+    @property
+    def slope_coeff_params(self) -> int:
+        return 0
+
+    @property
+    def slope_generator_params(self) -> int:
+        return 0
+
+    @property
+    def compare_swap_pair_count(self) -> int:
+        return int(self.compare_swap_pairs.shape[0])
+
+    def payload_parameters(self) -> list[Tensor]:
+        return [*self.full_lut.payload_parameters(), self.compare_swap_alpha]
+
+    def clear_packed_payload_cache(self) -> None:
+        self.full_lut.clear_packed_payload_cache()
+
+    def _desired_pair_count(self, requested: int) -> int:
+        if requested > 0:
+            return max(1, min(int(requested), self.input_dim // 2))
+        return self.input_dim // 2
+
+    def _independent_matching(self, pair_count: int, seed: int) -> Tensor:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        perm = torch.randperm(self.input_dim, generator=generator)
+        return perm[: 2 * pair_count].view(pair_count, 2).contiguous()
+
+    def _reused_anchor_matching(self, pair_count: int) -> Tensor:
+        used = torch.zeros(self.input_dim, dtype=torch.bool)
+        selected: list[tuple[int, int]] = []
+        for left, right in self.full_lut.anchors.detach().cpu().reshape(-1, 2).tolist():
+            if left == right or used[left] or used[right]:
+                continue
+            used[left] = True
+            used[right] = True
+            selected.append((int(left), int(right)))
+            if len(selected) >= pair_count:
+                break
+        if not selected:
+            return self._independent_matching(pair_count, seed=0)
+        return torch.tensor(selected, dtype=torch.long)
+
+    def _anchor_delta_norm(self, pairs: Tensor) -> Tensor:
+        if pairs.numel() == 0:
+            return torch.ones(self.input_dim, dtype=torch.float32)
+        counts = torch.zeros(self.input_dim, dtype=torch.float32)
+        ones = torch.ones(pairs.shape[0], dtype=torch.float32)
+        counts.scatter_add_(0, pairs[:, 0], ones)
+        counts.scatter_add_(0, pairs[:, 1], ones)
+        return counts.clamp_min(1.0).sqrt()
+
+    def _matching_delta(self, x: Tensor) -> Tensor:
+        if self.compare_swap_pairs.numel() == 0:
+            return torch.zeros_like(x)
+        pairs = self.compare_swap_pairs.to(device=x.device)
+        left = pairs[:, 0]
+        right = pairs[:, 1]
+        x_left = x.index_select(-1, left)
+        x_right = x.index_select(-1, right)
+        high = torch.maximum(x_left, x_right)
+        low = torch.minimum(x_left, x_right)
+        delta = torch.zeros_like(x)
+        delta.index_copy_(1, left, high - x_left)
+        delta.index_copy_(1, right, low - x_right)
+        return delta
+
+    def _anchor_delta(self, x: Tensor) -> Tensor:
+        if self.compare_swap_pairs.numel() == 0:
+            return torch.zeros_like(x)
+        pairs = self.compare_swap_pairs.to(device=x.device)
+        left = pairs[:, 0]
+        right = pairs[:, 1]
+        x_left = x.index_select(-1, left)
+        x_right = x.index_select(-1, right)
+        high = torch.maximum(x_left, x_right)
+        low = torch.minimum(x_left, x_right)
+        updates = torch.cat((high - x_left, low - x_right), dim=-1)
+        indices = torch.cat((left, right), dim=0).view(1, -1).expand(x.shape[0], -1)
+        delta = torch.zeros_like(x)
+        delta.scatter_add_(1, indices, updates)
+        return delta / self.compare_swap_norm.to(device=x.device, dtype=x.dtype).view(1, -1)
+
+    def _compare_swap_delta(self, x: Tensor) -> Tensor:
+        if self.variant == "compare_swap_anchor_delta_hidden":
+            return self._anchor_delta(x)
+        return self._matching_delta(x)
+
+    def compute(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        input_dtype = x.dtype
+        x32 = x.float()
+        indices, margins = self.full_lut._route(x32)
+        payload = self.full_lut._lookup(indices)
+        output = self.full_lut._payload_to_output(payload)
+        if self.training and (x.requires_grad or self.thresholds.requires_grad):
+            output = output + self.full_lut._ste_correction(indices, margins, payload)
+        output = output + self.compare_swap_alpha.to(device=output.device, dtype=output.dtype) * self._compare_swap_delta(x32)
+        return output.to(dtype=input_dtype), indices
+
+    def forward(self, x: Tensor) -> Tensor:
+        output, _indices = self.compute(x)
+        return output
+
+
+class FullLutGatedCorrectionLayer(nn.Module):
+    """Hidden full-vector LUT plus a zero-gated route/margin correction.
+
+    The full LUT path is unchanged. The correction path is deliberately gated by
+    one scalar so gate=0 is exactly the full-vector LUT baseline, while nonzero
+    correction parameters still let the gate receive gradients on the first
+    update.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        variant: PayloadVariant,
+        anchor_policy: str,
+        seed: int,
+        lut_init_std: float,
+        correction_gate_init: float,
+        correction_kc: int,
+        correction_init_std: float,
+        route_affine_pair_count: int,
+        correction_write_policy: ComparatorWritePolicy,
+        correction_output_tile_size: int,
+        use_output_scaling: bool,
+        use_min_margin_ste: bool,
+    ) -> None:
+        super().__init__()
+        if input_dim != output_dim:
+            raise ValueError("FullLutGatedCorrectionLayer requires input_dim == output_dim; use it only in hidden blocks")
+        if variant not in {
+            "full_lut_gated_twosided_margin_hidden",
+            "full_lut_gated_signed_margin_hidden",
+            "full_lut_chamber_diagonal_hidden",
+            "full_lut_route_2x2_affine_hidden",
+        }:
+            raise ValueError(f"unknown full-LUT correction variant {variant!r}")
+        if correction_kc < 1:
+            raise ValueError(f"correction_kc must be >= 1, got {correction_kc}")
+        if correction_init_std <= 0.0:
+            raise ValueError(f"correction_init_std must be > 0, got {correction_init_std}")
+        if correction_write_policy not in {"endpoint", "local-linegraph", "expander"}:
+            raise ValueError(f"unknown correction write policy {correction_write_policy!r}")
+        if correction_output_tile_size not in {16, 32, 64, 128}:
+            raise ValueError("correction_output_tile_size must be one of 16, 32, 64, or 128")
+
+        self.full_lut = PayloadWidthLUTLayer(
+            input_dim,
+            output_dim,
+            tables=tables,
+            comparisons=comparisons,
+            variant="full_vector",
+            anchor_policy=anchor_policy,
+            seed=seed,
+            lut_init_std=lut_init_std,
+            write_degree=output_dim,
+            use_output_scaling=use_output_scaling,
+            use_min_margin_ste=use_min_margin_ste,
+        )
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.tables = int(tables)
+        self.comparisons = int(comparisons)
+        self.routes = self.tables * self.comparisons
+        self.table_size = 1 << int(comparisons)
+        self.variant = variant
+        self.payload_width = int(output_dim)
+        self.write_degree = int(output_dim)
+        self.output_scale = self.full_lut.output_scale
+        self.correction_scale = 1.0 / math.sqrt(float(self.routes)) if use_output_scaling else 1.0
+        self.use_min_margin_ste = bool(use_min_margin_ste)
+        self.correction_kc = int(correction_kc)
+        self.correction_gate = nn.Parameter(torch.tensor(float(correction_gate_init), dtype=torch.float32))
+
+        if variant in {"full_lut_gated_twosided_margin_hidden", "full_lut_gated_signed_margin_hidden"}:
+            sides = 2 if variant == "full_lut_gated_twosided_margin_hidden" else 1
+            write_indices, write_signs = self._make_sparse_write_pattern(
+                seed + 7919,
+                sides=sides,
+                write_policy=correction_write_policy,
+                output_tile_size=correction_output_tile_size,
+            )
+            self.register_buffer("correction_write_indices", write_indices)
+            self.correction_write_weight = nn.Parameter(write_signs / math.sqrt(float(self.correction_kc)))
+        elif variant == "full_lut_chamber_diagonal_hidden":
+            diag = torch.randn(self.tables, self.table_size, self.output_dim) * float(correction_init_std)
+            self.chamber_diag = nn.Parameter(diag)
+        else:
+            pairs, route_indices = self._route_conditioned_pairs(route_affine_pair_count, seed + 1543)
+            self.register_buffer("route_affine_pairs", pairs)
+            self.register_buffer("route_affine_indices", route_indices)
+            pair_count = int(pairs.shape[0])
+            weight = torch.randn(pair_count, 2, 2, 2) * float(correction_init_std)
+            bias = torch.randn(pair_count, 2, 2) * float(correction_init_std)
+            self.route_affine_weight = nn.Parameter(weight)
+            self.route_affine_bias = nn.Parameter(bias)
+
+    @property
+    def thresholds(self) -> Tensor:
+        return self.full_lut.thresholds
+
+    @property
+    def payload_params(self) -> int:
+        return self.full_lut.payload_params + sum(param.numel() for param in self._correction_parameters())
+
+    @property
+    def bias_generator_params(self) -> int:
+        return self.payload_params
+
+    @property
+    def slope_coeff_params(self) -> int:
+        return 0
+
+    @property
+    def slope_generator_params(self) -> int:
+        return 0
+
+    @property
+    def route_affine_pair_count(self) -> int:
+        return int(getattr(self, "route_affine_pairs", torch.empty(0, 2)).shape[0])
+
+    def payload_parameters(self) -> list[Tensor]:
+        return [*self.full_lut.payload_parameters(), *self._correction_parameters()]
+
+    def clear_packed_payload_cache(self) -> None:
+        self.full_lut.clear_packed_payload_cache()
+
+    def _correction_parameters(self) -> list[Tensor]:
+        params: list[Tensor] = [self.correction_gate]
+        if hasattr(self, "correction_write_weight"):
+            params.append(self.correction_write_weight)
+        if hasattr(self, "chamber_diag"):
+            params.append(self.chamber_diag)
+        if hasattr(self, "route_affine_weight"):
+            params.extend([self.route_affine_weight, self.route_affine_bias])
+        return params
+
+    def _make_sparse_write_pattern(
+        self,
+        seed: int,
+        *,
+        sides: int,
+        write_policy: ComparatorWritePolicy,
+        output_tile_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        anchors = self.full_lut.anchors.reshape(self.routes, 2).cpu()
+        if sides == 1:
+            indices = torch.empty(self.routes, self.correction_kc, dtype=torch.long)
+            signs = torch.empty(self.routes, self.correction_kc, dtype=torch.float32)
+        else:
+            indices = torch.empty(self.routes, 2, self.correction_kc, dtype=torch.long)
+            signs = torch.empty(self.routes, 2, self.correction_kc, dtype=torch.float32)
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        tiles = max(1, math.ceil(self.output_dim / output_tile_size))
+        routes_per_tile = max(1, math.ceil(self.routes / tiles))
+
+        for route in range(self.routes):
+            a = int(anchors[route, 0].item()) % self.output_dim
+            b = int(anchors[route, 1].item()) % self.output_dim
+            tile = min(route // routes_per_tile, tiles - 1)
+            tile_start = tile * output_tile_size
+            tile_width = max(1, min(output_tile_size, self.output_dim - tile_start))
+            for side in range(sides):
+                virtual_route = route * sides + side
+                side_sign = 1.0 if side == 0 else -1.0
+                for slot in range(self.correction_kc):
+                    if write_policy == "endpoint":
+                        dst = a if slot % 2 == 0 else b
+                        sign = side_sign if slot % 2 == 0 else -side_sign
+                    elif write_policy == "local-linegraph":
+                        neighbor = (virtual_route + slot // 2 + 1) % self.routes
+                        na = int(anchors[neighbor, 0].item()) % self.output_dim
+                        nb = int(anchors[neighbor, 1].item()) % self.output_dim
+                        dst = na if slot % 2 == 0 else nb
+                        sign = side_sign if slot % 2 == 0 else -side_sign
+                    else:
+                        hashed = (virtual_route * 1103515245 + slot * 12345 + 97) & 0x7FFFFFFF
+                        jitter = int(torch.randint(0, tile_width, (1,), generator=gen).item())
+                        dst = tile_start + ((hashed + jitter) % tile_width)
+                        sign = 1.0 if ((hashed // max(1, tile_width)) & 1) == 0 else -1.0
+                    if sides == 1:
+                        indices[route, slot] = dst
+                        signs[route, slot] = sign
+                    else:
+                        indices[route, side, slot] = dst
+                        signs[route, side, slot] = sign
+        return indices, signs
+
+    def _route_conditioned_pairs(self, requested: int, seed: int) -> tuple[Tensor, Tensor]:
+        desired = max(1, min(int(requested), self.input_dim // 2)) if requested > 0 else self.input_dim // 2
+        used = torch.zeros(self.input_dim, dtype=torch.bool)
+        selected_pairs: list[tuple[int, int]] = []
+        selected_routes: list[int] = []
+        for route, (left, right) in enumerate(self.full_lut.anchors.detach().cpu().reshape(-1, 2).tolist()):
+            if left == right or used[left] or used[right]:
+                continue
+            used[left] = True
+            used[right] = True
+            selected_pairs.append((int(left), int(right)))
+            selected_routes.append(int(route))
+            if len(selected_pairs) >= desired:
+                break
+        if selected_pairs:
+            return torch.tensor(selected_pairs, dtype=torch.long), torch.tensor(selected_routes, dtype=torch.long)
+
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        perm = torch.randperm(self.input_dim, generator=generator)
+        pairs = perm[: 2 * desired].view(desired, 2).contiguous()
+        route_indices = torch.arange(desired, dtype=torch.long) % self.routes
+        return pairs, route_indices
+
+    def _signed_margin_correction(self, margins: Tensor) -> Tensor:
+        batch = margins.shape[0]
+        values = margins.reshape(batch, self.routes)
+        weighted = values.unsqueeze(-1) * self.correction_write_weight.to(device=margins.device, dtype=margins.dtype).unsqueeze(0)
+        output = torch.zeros(batch, self.output_dim, device=margins.device, dtype=margins.dtype)
+        indices = self.correction_write_indices.to(device=margins.device).view(1, self.routes, self.correction_kc).expand(batch, -1, -1)
+        output.scatter_add_(1, indices.reshape(batch, -1), weighted.reshape(batch, -1))
+        return output * self.correction_scale
+
+    def _twosided_margin_correction(self, margins: Tensor) -> Tensor:
+        batch = margins.shape[0]
+        values = torch.stack((F.relu(margins), F.relu(-margins)), dim=-1).reshape(batch, self.routes, 2)
+        weighted = values.unsqueeze(-1) * self.correction_write_weight.to(device=margins.device, dtype=margins.dtype).unsqueeze(0)
+        output = torch.zeros(batch, self.output_dim, device=margins.device, dtype=margins.dtype)
+        indices = self.correction_write_indices.to(device=margins.device).view(1, self.routes, 2, self.correction_kc).expand(batch, -1, -1, -1)
+        output.scatter_add_(1, indices.reshape(batch, -1), weighted.reshape(batch, -1))
+        return output * self.correction_scale
+
+    def _chamber_diagonal_correction(self, x: Tensor, indices: Tensor) -> Tensor:
+        table_offsets = torch.arange(self.tables, device=indices.device, dtype=torch.long).view(1, self.tables) * self.table_size
+        flat_indices = (indices + table_offsets).reshape(-1)
+        rows = self.chamber_diag.to(device=x.device, dtype=x.dtype).reshape(self.tables * self.table_size, self.output_dim).index_select(0, flat_indices)
+        scale = rows.view(x.shape[0], self.tables, self.output_dim).sum(dim=1) * self.correction_scale
+        return x * scale
+
+    def _route_affine_correction(self, x: Tensor, margins: Tensor) -> Tensor:
+        if self.route_affine_pair_count == 0:
+            return torch.zeros_like(x)
+        batch = x.shape[0]
+        pairs = self.route_affine_pairs.to(device=x.device)
+        route_indices = self.route_affine_indices.to(device=x.device)
+        left = pairs[:, 0]
+        right = pairs[:, 1]
+        pair_x = torch.stack((x.index_select(-1, left), x.index_select(-1, right)), dim=-1)
+        sides = (margins.reshape(batch, self.routes).index_select(1, route_indices) > 0).to(torch.long)
+        pair_ids = torch.arange(pairs.shape[0], device=x.device).view(1, -1).expand(batch, -1)
+        weight = self.route_affine_weight.to(device=x.device, dtype=x.dtype)[pair_ids, sides]
+        bias = self.route_affine_bias.to(device=x.device, dtype=x.dtype)[pair_ids, sides]
+        delta_pair = torch.einsum("bpij,bpj->bpi", weight, pair_x) + bias
+        output = torch.zeros_like(x)
+        output.scatter_add_(1, left.view(1, -1).expand(batch, -1), delta_pair[..., 0])
+        output.scatter_add_(1, right.view(1, -1).expand(batch, -1), delta_pair[..., 1])
+        return output / math.sqrt(float(max(1, pairs.shape[0])))
+
+    def _correction(self, x: Tensor, indices: Tensor, margins: Tensor) -> Tensor:
+        if self.variant == "full_lut_gated_twosided_margin_hidden":
+            return self._twosided_margin_correction(margins)
+        if self.variant == "full_lut_gated_signed_margin_hidden":
+            return self._signed_margin_correction(margins)
+        if self.variant == "full_lut_chamber_diagonal_hidden":
+            return self._chamber_diagonal_correction(x, indices)
+        return self._route_affine_correction(x, margins)
+
+    def compute(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        input_dtype = x.dtype
+        x32 = x.float()
+        indices, margins = self.full_lut._route(x32)
+        payload = self.full_lut._lookup(indices)
+        output = self.full_lut._payload_to_output(payload)
+        if self.training and (x.requires_grad or self.thresholds.requires_grad):
+            output = output + self.full_lut._ste_correction(indices, margins, payload)
+        gate = self.correction_gate.to(device=output.device, dtype=output.dtype)
+        output = output + gate * self._correction(x32, indices, margins)
         return output.to(dtype=input_dtype), indices
 
     def forward(self, x: Tensor) -> Tensor:
@@ -1074,9 +1580,77 @@ class PayloadWidthEmnistClassifier(nn.Module):
         comparator_write_policy: ComparatorWritePolicy,
         comparator_reduction_layout: Literal["scatter", "output_major", "tile_local"],
         comparator_output_tile_size: int,
+        compare_swap_alpha_init: float,
+        compare_swap_pair_count: int,
+        correction_gate_init: float,
+        correction_kc: int,
+        correction_init_std: float,
+        route_affine_pair_count: int,
     ) -> None:
         super().__init__()
         def make_layer(input_features: int, output_features: int, layer_seed: int, *, is_hidden: bool) -> nn.Module:
+            if variant.startswith("full_lut_"):
+                if is_hidden:
+                    return FullLutGatedCorrectionLayer(
+                        input_features,
+                        output_features,
+                        tables=tables,
+                        comparisons=comparisons,
+                        variant=variant,
+                        anchor_policy=anchor_policy,
+                        seed=layer_seed,
+                        lut_init_std=lut_init_std,
+                        correction_gate_init=correction_gate_init,
+                        correction_kc=correction_kc,
+                        correction_init_std=correction_init_std,
+                        route_affine_pair_count=route_affine_pair_count,
+                        correction_write_policy=comparator_write_policy,
+                        correction_output_tile_size=comparator_output_tile_size,
+                        use_output_scaling=use_output_scaling,
+                        use_min_margin_ste=use_min_margin_ste,
+                    )
+                return PayloadWidthLUTLayer(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    variant="full_vector",
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    write_degree=write_degree,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                )
+            if variant.startswith("compare_swap_"):
+                if is_hidden:
+                    return CompareSwapHiddenLayer(
+                        input_features,
+                        output_features,
+                        tables=tables,
+                        comparisons=comparisons,
+                        variant=variant,
+                        anchor_policy=anchor_policy,
+                        seed=layer_seed,
+                        lut_init_std=lut_init_std,
+                        compare_swap_alpha_init=compare_swap_alpha_init,
+                        compare_swap_pair_count=compare_swap_pair_count,
+                        use_output_scaling=use_output_scaling,
+                        use_min_margin_ste=use_min_margin_ste,
+                    )
+                return PayloadWidthLUTLayer(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    variant="full_vector",
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    write_degree=write_degree,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                )
             if variant == "code_bits_k_hidden":
                 if is_hidden:
                     return CodeBitsHiddenLayer(
@@ -1309,6 +1883,52 @@ def _count_layer_attr(model: PayloadWidthEmnistClassifier, name: str) -> int:
     return sum(int(getattr(layer, name, 0)) for layer in _payload_layers(model))
 
 
+def _compare_swap_layers(model: PayloadWidthEmnistClassifier) -> list[CompareSwapHiddenLayer]:
+    return [layer for layer in model.blocks if isinstance(layer, CompareSwapHiddenLayer)]
+
+
+def _compare_swap_alpha_values(model: PayloadWidthEmnistClassifier) -> list[float]:
+    return [float(layer.compare_swap_alpha.detach().cpu().item()) for layer in _compare_swap_layers(model)]
+
+
+def _compare_swap_alpha_mean(model: PayloadWidthEmnistClassifier) -> float:
+    values = _compare_swap_alpha_values(model)
+    return sum(values) / len(values) if values else 0.0
+
+
+def _compare_swap_alpha_absmax(model: PayloadWidthEmnistClassifier) -> float:
+    values = _compare_swap_alpha_values(model)
+    return max((abs(value) for value in values), default=0.0)
+
+
+def _compare_swap_pair_count(model: PayloadWidthEmnistClassifier) -> int:
+    layers = _compare_swap_layers(model)
+    return int(layers[0].compare_swap_pair_count) if layers else 0
+
+
+def _full_lut_correction_layers(model: PayloadWidthEmnistClassifier) -> list[FullLutGatedCorrectionLayer]:
+    return [layer for layer in model.blocks if isinstance(layer, FullLutGatedCorrectionLayer)]
+
+
+def _correction_gate_values(model: PayloadWidthEmnistClassifier) -> list[float]:
+    return [float(layer.correction_gate.detach().cpu().item()) for layer in _full_lut_correction_layers(model)]
+
+
+def _correction_gate_mean(model: PayloadWidthEmnistClassifier) -> float:
+    values = _correction_gate_values(model)
+    return sum(values) / len(values) if values else 0.0
+
+
+def _correction_gate_absmax(model: PayloadWidthEmnistClassifier) -> float:
+    values = _correction_gate_values(model)
+    return max((abs(value) for value in values), default=0.0)
+
+
+def _route_affine_pair_count(model: PayloadWidthEmnistClassifier) -> int:
+    layers = _full_lut_correction_layers(model)
+    return int(layers[0].route_affine_pair_count) if layers else 0
+
+
 @dataclass(frozen=True)
 class EvalResult:
     loss: float
@@ -1425,6 +2045,8 @@ def _build_optimizers(args: argparse.Namespace, model: PayloadWidthEmnistClassif
     if (
         args.payload_variant == "walsh_affine"
         or args.payload_variant == "code_bits_k_hidden"
+        or args.payload_variant.startswith("compare_swap_")
+        or args.payload_variant.startswith("full_lut_")
         or args.payload_variant.startswith("comparator_")
         or args.payload_variant.startswith("ladder_")
     ):
@@ -1485,6 +2107,12 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         comparator_write_policy=args.comparator_write_policy,
         comparator_reduction_layout=args.comparator_reduction_layout,
         comparator_output_tile_size=args.comparator_output_tile_size,
+        compare_swap_alpha_init=args.compare_swap_alpha_init,
+        compare_swap_pair_count=args.compare_swap_pair_count,
+        correction_gate_init=args.correction_gate_init,
+        correction_kc=args.correction_kc,
+        correction_init_std=args.correction_init_std,
+        route_affine_pair_count=args.route_affine_pair_count,
     ).to(device)
     main_optimizer, payload_optimizer = _build_optimizers(args, model)
 
@@ -1555,6 +2183,16 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         "comparator_write_policy": args.comparator_write_policy if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else "none",
         "comparator_reduction_layout": args.comparator_reduction_layout if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else "none",
         "comparator_output_tile_size": args.comparator_output_tile_size if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else 0,
+        "compare_swap_alpha_init": args.compare_swap_alpha_init if args.payload_variant.startswith("compare_swap_") else 0.0,
+        "compare_swap_pair_count": _compare_swap_pair_count(model),
+        "compare_swap_alpha_mean": _compare_swap_alpha_mean(model),
+        "compare_swap_alpha_absmax": _compare_swap_alpha_absmax(model),
+        "correction_gate_init": args.correction_gate_init if args.payload_variant.startswith("full_lut_") else 0.0,
+        "correction_gate_mean": _correction_gate_mean(model),
+        "correction_gate_absmax": _correction_gate_absmax(model),
+        "correction_kc": args.correction_kc if args.payload_variant.startswith("full_lut_") else 0,
+        "correction_init_std": args.correction_init_std if args.payload_variant.startswith("full_lut_") else 0.0,
+        "route_affine_pair_count": _route_affine_pair_count(model),
         "output_scale": first_layer.output_scale,
         "residual_scale": args.residual_scale,
         "train_examples": train_examples,
@@ -1618,6 +2256,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comparator-write-policy", choices=["endpoint", "local-linegraph", "expander"], default="endpoint")
     parser.add_argument("--comparator-reduction-layout", choices=["scatter", "output_major", "tile_local"], default="scatter")
     parser.add_argument("--comparator-output-tile-size", type=int, choices=[16, 32, 64, 128], default=32)
+    parser.add_argument("--compare-swap-alpha-init", type=float, default=0.0)
+    parser.add_argument("--compare-swap-pair-count", type=int, default=0)
+    parser.add_argument("--correction-gate-init", type=float, default=0.0)
+    parser.add_argument("--correction-kc", type=int, default=48)
+    parser.add_argument("--correction-init-std", type=float, default=0.02)
+    parser.add_argument("--route-affine-pair-count", type=int, default=0)
     parser.add_argument("--residual-scale", type=float, default=1.0)
     parser.add_argument("--lut-init-std", type=float, default=0.0)
     parser.add_argument("--full-ste", action="store_true")
