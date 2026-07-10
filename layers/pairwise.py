@@ -14,7 +14,7 @@ from .base import LUTLayerSpec, LUTModuleBase, finish_lut_output
 from .surrogate import ste_heaviside, surrogate_gradient
 
 PAIRWISE_ANCHOR_POLICIES = ("random", "random_no_replace", "local", "cyclic", "block", "expander", "permuted")
-LutDType = Literal["fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"]
+LutDType = Literal["fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "ternary_int2", "ternary_fixed", "binary01_fixed", "binary01_1bit", "binary01_bf16", "fp4", "nf4"]
 
 __all__ = ["AbsDiffLUT", "AbsDiffSpec", "PAIRWISE_ANCHOR_POLICIES", "PairwiseLUT", "PairwiseRoute", "PairwiseSpec", "PairwiseWalshLUT"]
 
@@ -44,7 +44,7 @@ class PairwiseSpec:
             raise ValueError("cpu_lut_dtype must be 'f32' or 'f16'")
         if self.anchor_policy not in PAIRWISE_ANCHOR_POLICIES:
             raise ValueError(f"unsupported anchor policy {self.anchor_policy!r}")
-        if self.lut_dtype not in {"fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"}:
+        if self.lut_dtype not in {"fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "ternary_int2", "ternary_fixed", "binary01_fixed", "binary01_1bit", "binary01_bf16", "fp4", "nf4"}:
             raise ValueError(f"unsupported lut_dtype {self.lut_dtype!r}")
         if not 0.0 <= self.table_dropout < 1.0:
             raise ValueError("table_dropout must be in [0, 1)")
@@ -632,6 +632,12 @@ def _fake_quantize_lut(x: Tensor, mode: LutDType) -> Tensor:
         return _ste_quantize_signed_integer(x, qmin=-8.0, qmax=7.0)
     if mode == "int2":
         return _ste_quantize_signed_integer(x, qmin=-2.0, qmax=1.0)
+    if mode == "ternary_int2":
+        return _ste_quantize_signed_integer(x, qmin=-1.0, qmax=1.0)
+    if mode == "ternary_fixed":
+        return _ste_quantize_fixed_integer(x, qmin=-1.0, qmax=1.0)
+    if mode in {"binary01_fixed", "binary01_1bit", "binary01_bf16"}:
+        return _ste_quantize_fixed_integer(x, qmin=0.0, qmax=1.0)
     if mode == "fp4":
         return _ste_quantize_codebook(x, [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0])
     if mode == "nf4":
@@ -672,6 +678,11 @@ def _ste_quantize_fp8(x: Tensor) -> Tensor:
 def _ste_quantize_signed_integer(x: Tensor, *, qmin: float, qmax: float) -> Tensor:
     scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / max(1.0, qmax)
     dequant = torch.round(x / scale).clamp(min=qmin, max=qmax) * scale
+    return x + (dequant - x).detach()
+
+
+def _ste_quantize_fixed_integer(x: Tensor, *, qmin: float, qmax: float) -> Tensor:
+    dequant = torch.round(x).clamp(min=qmin, max=qmax)
     return x + (dequant - x).detach()
 
 

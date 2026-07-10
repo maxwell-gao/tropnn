@@ -18,6 +18,10 @@ written by each routed table row:
   compare-swap geometry scaffold; readout remains full-vector LUT.
 * full_lut_*_hidden: hidden full-vector LUT plus a zero-gated correction
   map; readout remains full-vector LUT.
+* pairwise_glu_*: full-vector pairwise LUT value branch gated by another
+  pairwise LUT branch, with either shared or independent route.
+* binary_count_gated_lut: shared-route binary payload count value branch gated
+  by a second binary count branch.
 """
 
 from __future__ import annotations
@@ -75,6 +79,9 @@ PayloadVariant = Literal[
     "full_lut_gated_signed_margin_hidden",
     "full_lut_chamber_diagonal_hidden",
     "full_lut_route_2x2_affine_hidden",
+    "pairwise_glu_shared_route",
+    "pairwise_glu_dual_route",
+    "binary_count_gated_lut",
     "ladder_a_full_code_full_payload",
     "ladder_b_full_code_sparse_payload",
     "ladder_c_full_code_margin_sparse",
@@ -113,6 +120,9 @@ VARIANT_PAYLOAD_WIDTH: dict[str, int | None] = {
     "full_lut_gated_signed_margin_hidden": None,
     "full_lut_chamber_diagonal_hidden": None,
     "full_lut_route_2x2_affine_hidden": None,
+    "pairwise_glu_shared_route": None,
+    "pairwise_glu_dual_route": None,
+    "binary_count_gated_lut": None,
     "ladder_a_full_code_full_payload": None,
     "ladder_b_full_code_sparse_payload": None,
     "ladder_c_full_code_margin_sparse": None,
@@ -158,6 +168,8 @@ class PayloadSpec:
             return self.variant
         if self.variant.startswith("full_lut_"):
             return self.variant
+        if self.variant.startswith("pairwise_glu_") or self.variant == "binary_count_gated_lut":
+            return self.variant
         if self.variant == "full_vector":
             return "full_vector"
         if self.variant.startswith("group_"):
@@ -182,6 +194,8 @@ def _payload_spec(variant: PayloadVariant, output_dim: int, write_degree: int) -
     if variant.startswith("compare_swap_"):
         return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=False)
     if variant.startswith("full_lut_"):
+        return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=False)
+    if variant.startswith("pairwise_glu_") or variant == "binary_count_gated_lut":
         return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=False)
     width = VARIANT_PAYLOAD_WIDTH[variant]
     if width is None:
@@ -383,6 +397,402 @@ class PayloadWidthLUTLayer(nn.Module):
         if self.training and (x.requires_grad or self.thresholds.requires_grad):
             output = output + self._ste_correction(indices, margins, payload)
         return output.to(dtype=input_dtype), indices
+
+
+class SharedRoutePairwiseGLULayer(nn.Module):
+    """Full-vector pairwise LUT with a second LUT branch used only as a gate.
+
+    This is the no-extra-comparison analogue of SwiGLU: the same route selects
+    value and gate rows, then the layer returns ``v * 2 sigmoid(g)``.  The
+    multiplier is exactly one when the gate branch is zero, so the variant can
+    start as the ordinary full-vector LUT.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        anchor_policy: str,
+        seed: int,
+        lut_init_std: float,
+        use_output_scaling: bool,
+        use_min_margin_ste: bool,
+    ) -> None:
+        super().__init__()
+        self.value_lut = PayloadWidthLUTLayer(
+            input_dim,
+            output_dim,
+            tables=tables,
+            comparisons=comparisons,
+            variant="full_vector",
+            anchor_policy=anchor_policy,
+            seed=seed,
+            lut_init_std=lut_init_std,
+            write_degree=output_dim,
+            use_output_scaling=use_output_scaling,
+            use_min_margin_ste=use_min_margin_ste,
+        )
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.tables = int(tables)
+        self.comparisons = int(comparisons)
+        self.table_size = 1 << int(comparisons)
+        self.variant: PayloadVariant = "pairwise_glu_shared_route"
+        self.payload_width = int(output_dim)
+        self.write_degree = int(output_dim)
+        self.output_scale = self.value_lut.output_scale
+        self.use_min_margin_ste = bool(use_min_margin_ste)
+        self.gate_lut = nn.Parameter(torch.zeros(tables, self.table_size, output_dim))
+
+    @property
+    def thresholds(self) -> Tensor:
+        return self.value_lut.thresholds
+
+    @property
+    def payload_params(self) -> int:
+        return self.value_lut.payload_params + self.gate_lut.numel()
+
+    @property
+    def bias_generator_params(self) -> int:
+        return self.payload_params
+
+    @property
+    def slope_coeff_params(self) -> int:
+        return 0
+
+    @property
+    def slope_generator_params(self) -> int:
+        return 0
+
+    def threshold_parameters(self) -> list[Tensor]:
+        return [self.value_lut.thresholds]
+
+    def payload_parameters(self) -> list[Tensor]:
+        return [*self.value_lut.payload_parameters(), self.gate_lut]
+
+    def clear_packed_payload_cache(self) -> None:
+        self.value_lut.clear_packed_payload_cache()
+
+    def _lookup_gate(self, indices: Tensor) -> Tensor:
+        table_offsets = torch.arange(self.tables, device=indices.device, dtype=torch.long).view(1, self.tables) * self.table_size
+        flat_indices = (indices + table_offsets).reshape(-1)
+        rows = self.gate_lut.reshape(self.tables * self.table_size, self.output_dim).index_select(0, flat_indices)
+        return rows.view(indices.shape[0], self.tables, self.output_dim)
+
+    def _sum_payload(self, payload: Tensor) -> Tensor:
+        return payload.sum(dim=1) * self.output_scale
+
+    @staticmethod
+    def _compose(value: Tensor, gate: Tensor) -> Tensor:
+        return value * (2.0 * torch.sigmoid(gate))
+
+    def _ste_correction(
+        self,
+        indices: Tensor,
+        margins: Tensor,
+        value_payload: Tensor,
+        gate_payload: Tensor,
+        value: Tensor,
+        gate: Tensor,
+        output: Tensor,
+    ) -> Tensor:
+        if self.use_min_margin_ste:
+            bit = margins.abs().argmin(dim=-1)
+            margin = margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
+            neighbor_indices = indices ^ (2 ** bit).long()
+            ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
+            neighbor_value_payload = self.value_lut._lookup(neighbor_indices)
+            neighbor_gate_payload = self._lookup_gate(neighbor_indices)
+            neighbor_value = value.unsqueeze(1) + (neighbor_value_payload - value_payload) * self.output_scale
+            neighbor_gate = gate.unsqueeze(1) + (neighbor_gate_payload - gate_payload) * self.output_scale
+            neighbor_output = self._compose(neighbor_value, neighbor_gate)
+            return ((neighbor_output - output.unsqueeze(1)) * ste_delta.unsqueeze(-1)).sum(dim=1)
+
+        correction = torch.zeros_like(output)
+        for bit_idx in range(self.comparisons):
+            margin = margins[:, :, bit_idx]
+            neighbor_indices = indices ^ int(self.value_lut.powers[bit_idx].item())
+            ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
+            neighbor_value_payload = self.value_lut._lookup(neighbor_indices)
+            neighbor_gate_payload = self._lookup_gate(neighbor_indices)
+            neighbor_value = value.unsqueeze(1) + (neighbor_value_payload - value_payload) * self.output_scale
+            neighbor_gate = gate.unsqueeze(1) + (neighbor_gate_payload - gate_payload) * self.output_scale
+            neighbor_output = self._compose(neighbor_value, neighbor_gate)
+            correction = correction + ((neighbor_output - output.unsqueeze(1)) * ste_delta.unsqueeze(-1)).sum(dim=1)
+        return correction
+
+    def compute(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        input_dtype = x.dtype
+        x32 = x.float()
+        indices, margins = self.value_lut._route(x32)
+        value_payload = self.value_lut._lookup(indices)
+        gate_payload = self._lookup_gate(indices)
+        value = self._sum_payload(value_payload)
+        gate = self._sum_payload(gate_payload)
+        output = self._compose(value, gate)
+        if self.training and (x.requires_grad or self.thresholds.requires_grad):
+            output = output + self._ste_correction(indices, margins, value_payload, gate_payload, value, gate, output)
+        return output.to(dtype=input_dtype), indices
+
+    def forward(self, x: Tensor) -> Tensor:
+        output, _indices = self.compute(x)
+        return output
+
+
+class DualRoutePairwiseGLULayer(nn.Module):
+    """Two independent pairwise LUT routes composed as a GLU gate."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        anchor_policy: str,
+        seed: int,
+        lut_init_std: float,
+        use_output_scaling: bool,
+        use_min_margin_ste: bool,
+    ) -> None:
+        super().__init__()
+        self.value_lut = PayloadWidthLUTLayer(
+            input_dim,
+            output_dim,
+            tables=tables,
+            comparisons=comparisons,
+            variant="full_vector",
+            anchor_policy=anchor_policy,
+            seed=seed,
+            lut_init_std=lut_init_std,
+            write_degree=output_dim,
+            use_output_scaling=use_output_scaling,
+            use_min_margin_ste=use_min_margin_ste,
+        )
+        self.gate_lut = PayloadWidthLUTLayer(
+            input_dim,
+            output_dim,
+            tables=tables,
+            comparisons=comparisons,
+            variant="full_vector",
+            anchor_policy=anchor_policy,
+            seed=seed + 7919,
+            lut_init_std=0.0,
+            write_degree=output_dim,
+            use_output_scaling=use_output_scaling,
+            use_min_margin_ste=use_min_margin_ste,
+        )
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.tables = int(tables)
+        self.comparisons = int(comparisons)
+        self.table_size = 1 << int(comparisons)
+        self.variant: PayloadVariant = "pairwise_glu_dual_route"
+        self.payload_width = int(output_dim)
+        self.write_degree = int(output_dim)
+        self.output_scale = self.value_lut.output_scale
+        self.use_min_margin_ste = bool(use_min_margin_ste)
+
+    @property
+    def thresholds(self) -> Tensor:
+        return self.value_lut.thresholds
+
+    @property
+    def payload_params(self) -> int:
+        return self.value_lut.payload_params + self.gate_lut.payload_params
+
+    @property
+    def bias_generator_params(self) -> int:
+        return self.payload_params
+
+    @property
+    def slope_coeff_params(self) -> int:
+        return 0
+
+    @property
+    def slope_generator_params(self) -> int:
+        return 0
+
+    def threshold_parameters(self) -> list[Tensor]:
+        return [self.value_lut.thresholds, self.gate_lut.thresholds]
+
+    def payload_parameters(self) -> list[Tensor]:
+        return [*self.value_lut.payload_parameters(), *self.gate_lut.payload_parameters()]
+
+    def clear_packed_payload_cache(self) -> None:
+        self.value_lut.clear_packed_payload_cache()
+        self.gate_lut.clear_packed_payload_cache()
+
+    def compute(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        value, value_indices = self.value_lut.compute(x)
+        gate, gate_indices = self.gate_lut.compute(x)
+        output = value * (2.0 * torch.sigmoid(gate))
+        return output.to(dtype=x.dtype), torch.cat((value_indices, gate_indices), dim=-1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        output, _indices = self.compute(x)
+        return output
+
+
+class BinaryCountGatedLUTLayer(nn.Module):
+    """Shared-route binary payload counts with a second count branch as gate."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        tables: int,
+        comparisons: int,
+        anchor_policy: str,
+        seed: int,
+        lut_init_std: float,
+        use_output_scaling: bool,
+        use_min_margin_ste: bool,
+    ) -> None:
+        super().__init__()
+        template = PairwiseLUT(
+            input_dim,
+            1,
+            tables=tables,
+            comparisons=comparisons,
+            anchor_policy=anchor_policy,
+            seed=seed,
+            anchor_seed=seed,
+            backend="torch",
+        )
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.tables = int(tables)
+        self.comparisons = int(comparisons)
+        self.table_size = 1 << int(comparisons)
+        self.variant: PayloadVariant = "binary_count_gated_lut"
+        self.payload_width = int(output_dim)
+        self.write_degree = int(output_dim)
+        self.output_scale = 1.0 / math.sqrt(tables) if use_output_scaling else 1.0
+        self.use_min_margin_ste = bool(use_min_margin_ste)
+        init_std = float(lut_init_std) if lut_init_std > 0.0 else 0.02
+        self.register_buffer("anchors", template.anchors.detach().clone())
+        self.register_buffer("powers", 2 ** torch.arange(comparisons, dtype=torch.long))
+        self.thresholds = nn.Parameter(torch.zeros(tables, comparisons))
+        self.value_logits = nn.Parameter(torch.randn(tables, self.table_size, output_dim) * init_std)
+        self.gate_logits = nn.Parameter(torch.randn(tables, self.table_size, output_dim) * init_std)
+
+    @property
+    def payload_params(self) -> int:
+        return self.value_logits.numel() + self.gate_logits.numel()
+
+    @property
+    def bias_generator_params(self) -> int:
+        return self.payload_params
+
+    @property
+    def slope_coeff_params(self) -> int:
+        return 0
+
+    @property
+    def slope_generator_params(self) -> int:
+        return 0
+
+    def threshold_parameters(self) -> list[Tensor]:
+        return [self.thresholds]
+
+    def payload_parameters(self) -> list[Tensor]:
+        return [self.value_logits, self.gate_logits]
+
+    def clear_packed_payload_cache(self) -> None:
+        return None
+
+    @staticmethod
+    def _centered_binary(logits: Tensor) -> Tensor:
+        prob = torch.sigmoid(logits)
+        hard = (logits > 0).to(logits.dtype)
+        return hard.detach() - prob.detach() + prob - 0.5
+
+    def _route(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        anchor_a = self.anchors[:, :, 0].flatten()
+        anchor_b = self.anchors[:, :, 1].flatten()
+        x_a = x.index_select(-1, anchor_a).view(x.shape[0], self.tables, self.comparisons)
+        x_b = x.index_select(-1, anchor_b).view(x.shape[0], self.tables, self.comparisons)
+        margins = x_a - x_b - self.thresholds.to(device=x.device, dtype=x.dtype)
+        bits = (margins > 0).to(torch.long)
+        indices = (bits * self.powers.to(device=x.device).view(1, 1, -1)).sum(dim=-1)
+        return indices, margins
+
+    def _lookup_payload(self, table: Tensor, indices: Tensor) -> Tensor:
+        table_offsets = torch.arange(self.tables, device=indices.device, dtype=torch.long).view(1, self.tables) * self.table_size
+        flat_indices = (indices + table_offsets).reshape(-1)
+        rows = table.reshape(self.tables * self.table_size, self.output_dim).index_select(0, flat_indices)
+        return rows.view(indices.shape[0], self.tables, self.output_dim)
+
+    def _payload_table(self, logits: Tensor) -> Tensor:
+        return self._centered_binary(logits).to(device=logits.device, dtype=torch.float32)
+
+    def _sum_payload(self, payload: Tensor) -> Tensor:
+        return payload.sum(dim=1) * self.output_scale
+
+    @staticmethod
+    def _compose(value: Tensor, gate: Tensor) -> Tensor:
+        return value * (2.0 * torch.sigmoid(gate))
+
+    def _ste_correction(
+        self,
+        indices: Tensor,
+        margins: Tensor,
+        value_payload: Tensor,
+        gate_payload: Tensor,
+        value: Tensor,
+        gate: Tensor,
+        output: Tensor,
+        value_table: Tensor,
+        gate_table: Tensor,
+    ) -> Tensor:
+        if self.use_min_margin_ste:
+            bit = margins.abs().argmin(dim=-1)
+            margin = margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
+            neighbor_indices = indices ^ (2 ** bit).long()
+            ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
+            neighbor_value_payload = self._lookup_payload(value_table, neighbor_indices)
+            neighbor_gate_payload = self._lookup_payload(gate_table, neighbor_indices)
+            neighbor_value = value.unsqueeze(1) + (neighbor_value_payload - value_payload) * self.output_scale
+            neighbor_gate = gate.unsqueeze(1) + (neighbor_gate_payload - gate_payload) * self.output_scale
+            neighbor_output = self._compose(neighbor_value, neighbor_gate)
+            return ((neighbor_output - output.unsqueeze(1)) * ste_delta.unsqueeze(-1)).sum(dim=1)
+
+        correction = torch.zeros_like(output)
+        for bit_idx in range(self.comparisons):
+            margin = margins[:, :, bit_idx]
+            neighbor_indices = indices ^ int(self.powers[bit_idx].item())
+            ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
+            neighbor_value_payload = self._lookup_payload(value_table, neighbor_indices)
+            neighbor_gate_payload = self._lookup_payload(gate_table, neighbor_indices)
+            neighbor_value = value.unsqueeze(1) + (neighbor_value_payload - value_payload) * self.output_scale
+            neighbor_gate = gate.unsqueeze(1) + (neighbor_gate_payload - gate_payload) * self.output_scale
+            neighbor_output = self._compose(neighbor_value, neighbor_gate)
+            correction = correction + ((neighbor_output - output.unsqueeze(1)) * ste_delta.unsqueeze(-1)).sum(dim=1)
+        return correction
+
+    def compute(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        input_dtype = x.dtype
+        x32 = x.float()
+        indices, margins = self._route(x32)
+        value_table = self._payload_table(self.value_logits)
+        gate_table = self._payload_table(self.gate_logits)
+        value_payload = self._lookup_payload(value_table, indices)
+        gate_payload = self._lookup_payload(gate_table, indices)
+        value = self._sum_payload(value_payload)
+        gate = self._sum_payload(gate_payload)
+        output = self._compose(value, gate)
+        if self.training and (x.requires_grad or self.thresholds.requires_grad):
+            output = output + self._ste_correction(indices, margins, value_payload, gate_payload, value, gate, output, value_table, gate_table)
+        return output.to(dtype=input_dtype), indices
+
+    def forward(self, x: Tensor) -> Tensor:
+        output, _indices = self.compute(x)
+        return output
 
 
 class CodeBitsHiddenLayer(nn.Module):
@@ -1342,8 +1752,8 @@ class ComparatorGeneratorLayer(nn.Module):
         comparisons: int,
         source: Literal["sign", "margin", "signed_margin", "two_sided_margin"],
         write_policy: ComparatorWritePolicy,
-        reduction_layout: Literal["scatter", "output_major", "tile_local"],
-        output_tile_size: int,
+        reduction_layout: Literal["scatter", "output_major", "tile_local"] = "scatter",
+        output_tile_size: int = 32,
         k_c: int,
         anchor_policy: str,
         seed: int,
@@ -1620,6 +2030,42 @@ class PayloadWidthEmnistClassifier(nn.Module):
                     lut_init_std=lut_init_std,
                     write_degree=write_degree,
                     use_output_scaling=use_output_scaling,
+                        use_min_margin_ste=use_min_margin_ste,
+                    )
+            if variant == "pairwise_glu_shared_route":
+                return SharedRoutePairwiseGLULayer(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                )
+            if variant == "pairwise_glu_dual_route":
+                return DualRoutePairwiseGLULayer(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                )
+            if variant == "binary_count_gated_lut":
+                return BinaryCountGatedLUTLayer(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    use_output_scaling=use_output_scaling,
                     use_min_margin_ste=use_min_margin_ste,
                 )
             if variant.startswith("compare_swap_"):
@@ -1861,7 +2307,13 @@ def _payload_layers(model: PayloadWidthEmnistClassifier) -> list[nn.Module]:
 
 
 def _threshold_params(model: PayloadWidthEmnistClassifier) -> list[Tensor]:
-    return [layer.thresholds for layer in _payload_layers(model)]
+    params: list[Tensor] = []
+    for layer in _payload_layers(model):
+        if hasattr(layer, "threshold_parameters"):
+            params.extend(layer.threshold_parameters())  # type: ignore[attr-defined]
+        else:
+            params.append(layer.thresholds)
+    return params
 
 
 def _payload_params(model: PayloadWidthEmnistClassifier) -> list[Tensor]:
@@ -2047,6 +2499,8 @@ def _build_optimizers(args: argparse.Namespace, model: PayloadWidthEmnistClassif
         or args.payload_variant == "code_bits_k_hidden"
         or args.payload_variant.startswith("compare_swap_")
         or args.payload_variant.startswith("full_lut_")
+        or args.payload_variant.startswith("pairwise_glu_")
+        or args.payload_variant == "binary_count_gated_lut"
         or args.payload_variant.startswith("comparator_")
         or args.payload_variant.startswith("ladder_")
     ):
