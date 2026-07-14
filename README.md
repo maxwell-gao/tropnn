@@ -1,94 +1,155 @@
-# tropnn
+# TropNN
 
-`tropnn` is a small demonstration package for PC-LUT networks: pairwise comparison, lookup table read, and accumulation. The public PC-LUT operator intentionally avoids GEMM in its forward path.
+TropNN is the minimal research implementation of Pairwise Comparison Lookup
+Table networks. It isolates the operator, its training rule, low-level backends,
+and controlled probes from the LutFlow language-model stack.
 
-## Core operator
+## Operator
 
-For an input row `x`, each table owns `L` fixed coordinate pairs `(a, b)` and trainable thresholds `theta`:
+For `T` tables and `C` comparisons per table:
 
 ```text
-bit_l = 1[x[a_l] - x[b_l] - theta_l > 0]
-index = sum_l bit_l * 2^l
-payload = LUT[table, index]
-y = sum_table payload
+m[t,c] = x[a[t,c]] - x[b[t,c]] - theta[t,c]
+r[t,c] = 1[m[t,c] > 0]
+code[t] = sum_c r[t,c] * 2**c
+y = sum_t payload[t, code[t], :]
 ```
 
-Training uses a finite-difference straight-through estimator. The selected LUT row receives ordinary gradient. The threshold and input-side gradient use the neighboring row across the closest active comparison boundary.
+`a` and `b` are fixed anchor indices in the standard layer. `theta` may be fixed
+or learned. Each table selects one of `2**C` payload rows. The output is an
+additive reduction across tables.
 
-## Public API
+Full comparison compares all coordinate pairs and is the clean geometric
+construction. Practical PC-LUT uses `C << input_dim`, multiple sparse tables,
+and usually a residual connection.
+
+## Why it is trainable
+
+A visited payload row receives the exact downstream gradient. Thresholds and
+upstream coordinates affect a discrete route, so TropNN uses a finite-difference
+STE based on the payload difference between the current and neighboring chamber.
+Min-margin STE updates the nearest comparison boundary; full STE considers each
+bit flip.
+
+This distinction is important:
+
+- Forward and inference use hard comparison plus lookup.
+- Payload gradients are exact sparse gradients.
+- Threshold and input route gradients are surrogate gradients.
+- Fixed-threshold probes remove route-gradient questions and isolate
+  representation and decoding.
+
+## API
 
 ```python
-import torch
-from tropnn import AbsDiffLUT, PairwiseLUT, PairwiseWalshLUT
+from tropnn import PairwiseLUT
 
-x = torch.randn(8, 256)
-lut = PairwiseLUT(256, 512, tables=64, comparisons=6)
-print(lut(x).shape)
-
-relation = AbsDiffLUT(256, 1, tables=16, comparisons=4)
-print(relation(x, x).shape)
-
-walsh = PairwiseWalshLUT(256, 512, tables=64, comparisons=6, walsh_order=2)
-print(walsh(x).shape)
-
-affine = PairwiseWalshLUT(
-    256,
-    512,
+layer = PairwiseLUT(
+    input_dim=256,
+    output_dim=256,
     tables=64,
     comparisons=6,
-    walsh_order=2,
-    slope_order=2,
-    lut_dtype="int2",
+    backend="torch",
 )
-print(affine(x).shape)
+y = layer(x)
 ```
 
-`PairwiseWalshLUT(..., slope_order=2, lut_dtype="int2")` is the structured
-low-bit baseline.  It replaces a free row payload with low-degree Boolean
-generators over the comparison signs:
-
-```text
-sign_i = 2 * bit_i - 1
-basis = [1, sign_i, sign_i * sign_j]
-
-update =
-  basis @ shared_bias_generators
-  + sum_i low_degree_coeff_i(bits) * margin_i * shared_slope_generator_i
-```
-
-The generated bias rows, generated slope coefficients, and slope generators are
-materialized through the same low-bit LUT dtype path as `PairwiseLUT`.
+Use Torch as the semantic reference. Optimized paths must preserve route,
+payload decode, output reduction, and STE semantics.
 
 ## Backends
 
-- `backend="torch"`: reference implementation.
-- `backend="tilelang"`: CUDA fused pairwise compare/LUT path.
-- `backend="zig"`: CPU inference path for `PairwiseLUT`.
+| Backend | Purpose |
+|---|---|
+| `torch` | Readable reference and correctness oracle |
+| `tilelang` | Fused GPU route, lookup, reduction, and backward |
+| `triton` | Alternative fused GPU and payload experiments |
+| `zig` | CPU packed-payload and anchor-layout implementation |
 
-## EMNIST demo
+Packed payloads are cached by parameter version. Training repacks after an
+optimizer update; evaluation can retain a packed representation. Low-bit forward
+storage does not imply that the optimizer master parameter is low-bit.
+
+## Current evidence
+
+### Low-bit payloads
+
+Binary payloads retain useful behavior in EMNIST and short LUTSSM runs. The
+retained kernels use byte-major decode and grouped exact min-margin backward.
+See [`../../report/binary_lut_kernel_optimization.md`](../../report/binary_lut_kernel_optimization.md).
+
+This does not make all parameters binary. Anchors are integer indices, routes
+are bits, thresholds may be continuous, and optimizer state may be floating
+point.
+
+### Depth and refinement
+
+Plain PC-LUT often improves weakly with recursive depth compared with MLPs.
+Generic premixing, shared generators, route-conditioned anchors, compare-swap,
+and payload-factorization variants have not supplied a robust general fix.
+
+Do not call an additive ensemble a depth sweep. If every route reads the same
+input and its scalar outputs are summed, `L x T` is exactly one wider additive
+route bank.
+
+### Relation selection
+
+A direct PC-LUT scorer learns a nontrivial binary bilinear relation but remains
+far behind dense controls. A fixed `T16/C5` scalar route reaches `0.0679`
+Top-16 recall and `0.0078` Top-1 in the controlled relation-energy probe.
+
+Sixteen independent banks improve MSE to `0.2285` Top-16 and `0.0977` Top-1
+with 8,192 parameters. A 529-parameter dense MLP reaches `0.2942` and `0.1172`.
+
+The decisive diagnostic freezes all 256 route codes, expands them into 1,280
+bits, and trains a dense decoder. Top-16 rises to `0.6597` and Top-1 to `0.4531`
+without changing any comparison. The fixed quotient retains substantial
+relation information; additive independent-table decoding is the primary
+bottleneck on this probe.
+
+The dense decoder is diagnostic, not a fast replacement. The active problem is
+cross-table interaction with sparse, bounded-order, or lookup-native execution.
+
+## Controlled probes
+
+From the repository root:
 
 ```bash
-uv run tropnn-emnist \
-  --root data/emnist \
-  --download \
-  --split digits \
-  --epochs 10 \
-  --batch-size 512 \
-  --tables 64 \
-  --comparisons 6 \
-  --device cuda
+PYTHONPATH=python/src/tropnn \
+python/src/tropnn/.venv/bin/python -m tropnn.tools.bilinear_retrieval_probe --help
+
+PYTHONPATH=python/src/tropnn \
+python/src/tropnn/.venv/bin/python -m tropnn.tools.fixed_route_relation_energy_probe --help
+
+PYTHONPATH=python/src/tropnn \
+python/src/tropnn/.venv/bin/python -m tropnn.tools.additive_relation_energy_sweep --help
+
+PYTHONPATH=python/src/tropnn \
+python/src/tropnn/.venv/bin/python -m tropnn.tools.fixed_l16_route_decoder_probe --help
 ```
 
+Relevant launchers:
 
-## Reproducible experiment categories
+- `scripts/run_tropnn_bilinear_retrieval_4gpu.sh`
+- `scripts/run_tropnn_fixed_route_relation_energy_5gpu.sh`
+- `scripts/run_tropnn_additive_relation_energy_depth_5gpu.sh`
+- `scripts/run_tropnn_fixed_l16_route_decoder_2gpu.sh`
 
-The library core exports only PC-LUT layers. Experiment scripts may include dense baselines, including `nn.Linear`, to reproduce report comparisons.
+## Benchmarking
 
-- `tropnn-emnist --family linear|pairwise|pairwise_walsh`; use `--family pairwise_walsh --slope-order 2 --lut-dtype int2` for the Walsh affine baseline
-- `tropnn-scaling-benchmark --families paper,untied_paper,linear,pairwise,tied_pairwise,pairwise_walsh,tied_pairwise_walsh,pairwise_walsh_affine,tied_pairwise_walsh_affine`
-- `tropnn-recovery-lut-structures --variants free,walsh1,walsh2,coarse`
-- `tropnn-dense-projection-fit --variants dense_exact,linear,pairwise`
+A comparison with `nn.Linear` must match batch, sequence length, dimensions,
+dtype, output shape, cache state, and forward/backward mode. Route time omits
+wide payload reads. Forward-only time omits finite-difference backward, which
+can dominate training.
 
-For EMNIST payload-width/depth sweeps, `scripts/run_tropnn_payload_width_4gpu.sh`
-exposes the baseline as `VARIANTS="walsh_affine"` with default
-`WALSH_LUT_DTYPE=int2`, `WALSH_ORDER=2`, and `WALSH_SLOPE_ORDER=2`.
+## Development
+
+```bash
+cd python/src/tropnn
+/home/ubuntu/.nix-profile/bin/uv sync --extra dev
+PYTHONPATH=. .venv/bin/pytest tests -q
+```
+
+Read [`../../report/README.md`](../../report/README.md) for evidence and
+[`../../../doc/PAIRWISE_LUT_CURRENT_STATE.md`](../../../doc/PAIRWISE_LUT_CURRENT_STATE.md)
+for the repository-level interpretation.
