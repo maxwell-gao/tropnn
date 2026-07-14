@@ -125,15 +125,19 @@ PYTHONPATH=python/src/tropnn \
 python/src/tropnn/.venv/bin/python -m tropnn.tools.additive_relation_energy_sweep --help
 
 PYTHONPATH=python/src/tropnn \
-python/src/tropnn/.venv/bin/python -m tropnn.tools.fixed_l16_route_decoder_probe --help
+python/src/tropnn/.venv/bin/python -m tropnn.tools.fixed_wide_route_decoder_probe --help
+
+PYTHONPATH=python/src/tropnn \
+python/src/tropnn/.venv/bin/python -m tropnn.tools.serial_pclut_decoder_probe --help
 ```
 
 Relevant launchers:
 
 - `scripts/run_tropnn_bilinear_retrieval_4gpu.sh`
 - `scripts/run_tropnn_fixed_route_relation_energy_5gpu.sh`
-- `scripts/run_tropnn_additive_relation_energy_depth_5gpu.sh`
-- `scripts/run_tropnn_fixed_l16_route_decoder_2gpu.sh`
+- `scripts/run_tropnn_additive_relation_energy_width_5gpu.sh`
+- `scripts/run_tropnn_fixed_wide_route_decoder_2gpu.sh`
+- `scripts/run_tropnn_serial_pclut_decoder_6gpu.sh`
 
 ## Benchmarking
 
