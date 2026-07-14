@@ -16,24 +16,24 @@ from tropnn.tools.fixed_route_relation_energy_probe import FixedPairwiseEnergy, 
 OBJECTIVES = ("mse", "pairwise")
 
 
-class FixedL16RouteBits(nn.Module):
-    def __init__(self, input_dim: int, tables: int, comparisons: int, depth: int, seed: int) -> None:
+class FixedWideRouteBits(nn.Module):
+    def __init__(self, input_dim: int, tables_per_seed_block: int, comparisons: int, seed_blocks: int, seed: int) -> None:
         super().__init__()
         self.comparisons = comparisons
-        self.routers = nn.ModuleList(
-            FixedPairwiseEnergy(input_dim, tables, comparisons, seed + 1009 * layer)
-            for layer in range(depth)
+        self.route_blocks = nn.ModuleList(
+            FixedPairwiseEnergy(input_dim, tables_per_seed_block, comparisons, seed + 1009 * block)
+            for block in range(seed_blocks)
         )
         for parameter in self.parameters():
             parameter.requires_grad_(False)
 
     @property
     def output_dim(self) -> int:
-        return len(self.routers) * self.routers[0].payload.shape[0] * self.comparisons
+        return len(self.route_blocks) * self.route_blocks[0].payload.shape[0] * self.comparisons
 
     @torch.no_grad()
     def forward(self, pair: Tensor) -> Tensor:
-        codes = torch.cat([router.route(pair) for router in self.routers], dim=-1)
+        codes = torch.cat([route_block.route(pair) for route_block in self.route_blocks], dim=-1)
         shifts = torch.arange(self.comparisons, device=pair.device)
         bits = ((codes.unsqueeze(-1) >> shifts) & 1).reshape(pair.shape[0], -1)
         return 2.0 * bits.to(pair.dtype) - 1.0
@@ -50,7 +50,7 @@ class DenseRouteDecoder(nn.Module):
 
 
 class RoutedDiagnostic(nn.Module):
-    def __init__(self, encoder: FixedL16RouteBits, decoder: DenseRouteDecoder) -> None:
+    def __init__(self, encoder: FixedWideRouteBits, decoder: DenseRouteDecoder) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -60,7 +60,7 @@ class RoutedDiagnostic(nn.Module):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Dense diagnostic decoder over frozen L16 PC-LUT route bits.")
+    parser = argparse.ArgumentParser(description="Dense diagnostic decoder over frozen wide T256/C5 PC-LUT route bits.")
     commands = parser.add_subparsers(dest="command", required=True)
 
     run = commands.add_parser("run")
@@ -71,9 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--test-queries", type=int, default=256)
     run.add_argument("--test-keys", type=int, default=512)
     run.add_argument("--max-value", type=int, default=15)
-    run.add_argument("--tables", type=int, default=16)
+    run.add_argument("--tables-per-seed-block", type=int, default=16)
     run.add_argument("--comparisons", type=int, default=5)
-    run.add_argument("--depth", type=int, default=16)
+    run.add_argument("--seed_blocks", type=int, default=16)
     run.add_argument("--hidden-dim", type=int, default=256)
     run.add_argument("--positive-per-query", type=int, default=16)
     run.add_argument("--hard-negative-per-query", type=int, default=8)
@@ -138,11 +138,11 @@ def run(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     pairs = make_relation_pairs(args, device)
-    encoder = FixedL16RouteBits(
+    encoder = FixedWideRouteBits(
         input_dim=2 * args.input_dim,
-        tables=args.tables,
+        tables_per_seed_block=args.tables_per_seed_block,
         comparisons=args.comparisons,
-        depth=args.depth,
+        seed_blocks=args.seed_blocks,
         seed=args.seed,
     ).to(device)
     decoder = DenseRouteDecoder(encoder.output_dim, args.hidden_dim).to(device)
@@ -195,8 +195,8 @@ def run(args: argparse.Namespace) -> None:
     metrics = retrieval_metrics(test_target, test_prediction, args.top_k, args.seed + 601)
     result: dict[str, object] = {
         "objective": args.objective,
-        "depth": args.depth,
-        "tables_per_layer": args.tables,
+        "seed_blocks": args.seed_blocks,
+        "tables_per_layer": args.tables_per_seed_block,
         "comparisons": args.comparisons,
         "route_bit_dim": encoder.output_dim,
         "hidden_dim": args.hidden_dim,
@@ -240,7 +240,7 @@ def summarize(args: argparse.Namespace) -> None:
 
     additive = read_csv(args.additive_summary)
     controls = {
-        (row["variant"], int(row["depth"])): row
+        (row["variant"], int(row["width"])): row
         for row in additive
         if row["variant"] in {"pc_mse_adamw", "dense_mlp_pairwise"}
     }
@@ -251,17 +251,19 @@ def summarize(args: argparse.Namespace) -> None:
     pairwise = by_objective["pairwise"]
 
     lines = [
-        "# Dense Decoder over Fixed L16 Route Bits",
+        "# Dense Decoder over Fixed Wide T256/C5 Route Bits",
         "",
-        "The encoder exactly reproduces the 256 fixed T16/C5 routes from the additive L16 sweep and expands every route code into its five comparison bits. The resulting 1,280-bit vector is a lossless representation of all route codes. Only the dense diagnostic decoder is trained.",
+        "The encoder exactly reproduces the fixed wide T256/C5 route from the additive width sweep and expands every route code into its five comparison bits. The resulting 1,280-bit vector is a lossless representation of all route codes. Only the dense diagnostic decoder is trained.",
+        "",
+        "The 16 seed blocks are flattened into one T256/C5 parallel route ensemble; no block consumes another block output.",
         "",
         "| Model | Trainable params | Train pair | Held-out pair | Hard-neg | Top-16 | Top-1 | Spearman |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
-        f"| PC additive MSE L16 | {int(pc['parameters']):,} | {float(pc['train_pair_accuracy']):.4f} | {float(pc['test_random_pair_order_accuracy']):.4f} | {float(pc['test_hard_negative_preference_accuracy']):.4f} | {float(pc['test_topk_recall']):.4f} | {float(pc['test_top1_accuracy']):.4f} | {float(pc['test_spearman']):.4f} |",
+        f"| PC additive MSE W16 (T256) | {int(pc['parameters']):,} | {float(pc['train_pair_accuracy']):.4f} | {float(pc['test_random_pair_order_accuracy']):.4f} | {float(pc['test_hard_negative_preference_accuracy']):.4f} | {float(pc['test_topk_recall']):.4f} | {float(pc['test_top1_accuracy']):.4f} | {float(pc['test_spearman']):.4f} |",
         f"| Route bits + dense H256 MSE | {mse['trainable_parameters']:,} | {mse['train_pair_accuracy']:.4f} | {mse['test_random_pair_order_accuracy']:.4f} | {mse['test_hard_negative_preference_accuracy']:.4f} | {mse['test_topk_recall']:.4f} | {mse['test_top1_accuracy']:.4f} | {mse['test_spearman']:.4f} |",
         f"| Route bits + dense H256 pairwise | {pairwise['trainable_parameters']:,} | {pairwise['train_pair_accuracy']:.4f} | {pairwise['test_random_pair_order_accuracy']:.4f} | {pairwise['test_hard_negative_preference_accuracy']:.4f} | {pairwise['test_topk_recall']:.4f} | {pairwise['test_top1_accuracy']:.4f} | {pairwise['test_spearman']:.4f} |",
         f"| Raw pair + dense MLP L1 | {int(dense_l1['parameters']):,} | {float(dense_l1['train_pair_accuracy']):.4f} | {float(dense_l1['test_random_pair_order_accuracy']):.4f} | {float(dense_l1['test_hard_negative_preference_accuracy']):.4f} | {float(dense_l1['test_topk_recall']):.4f} | {float(dense_l1['test_top1_accuracy']):.4f} | {float(dense_l1['test_spearman']):.4f} |",
-        f"| Raw pair + dense MLP L16 | {int(dense_l16['parameters']):,} | {float(dense_l16['train_pair_accuracy']):.4f} | {float(dense_l16['test_random_pair_order_accuracy']):.4f} | {float(dense_l16['test_hard_negative_preference_accuracy']):.4f} | {float(dense_l16['test_topk_recall']):.4f} | {float(dense_l16['test_top1_accuracy']):.4f} | {float(dense_l16['test_spearman']):.4f} |",
+        f"| Raw pair + dense MLP W16 | {int(dense_l16['parameters']):,} | {float(dense_l16['train_pair_accuracy']):.4f} | {float(dense_l16['test_random_pair_order_accuracy']):.4f} | {float(dense_l16['test_hard_negative_preference_accuracy']):.4f} | {float(dense_l16['test_topk_recall']):.4f} | {float(dense_l16['test_top1_accuracy']):.4f} | {float(dense_l16['test_spearman']):.4f} |",
         "",
         "## Decision rule",
         "",
@@ -271,7 +273,7 @@ def summarize(args: argparse.Namespace) -> None:
         "",
         f"The MSE diagnostic raises Top-16 recall from {float(pc['test_topk_recall']):.4f} to {mse['test_topk_recall']:.4f} and Top-1 from {float(pc['test_top1_accuracy']):.4f} to {mse['test_top1_accuracy']:.4f} without changing a single comparison. Held-out Spearman reaches {mse['test_spearman']:.4f}, showing that the route bits support generalizable relation reconstruction rather than only memorization of training pairs.",
         "",
-        f"Relative to the gap between additive PC-MSE and the raw-input dense L16 control, the route-bit decoder closes {(mse['test_topk_recall'] - float(pc['test_topk_recall'])) / (float(dense_l16['test_topk_recall']) - float(pc['test_topk_recall'])):.1%} of the Top-16 gap and {(mse['test_top1_accuracy'] - float(pc['test_top1_accuracy'])) / (float(dense_l16['test_top1_accuracy']) - float(pc['test_top1_accuracy'])):.1%} of the Top-1 gap. The primary failure is therefore the additive per-table factorization, though the 328k-parameter diagnostic is not itself an efficient replacement.",
+        f"Relative to the gap between additive PC-MSE and the raw-input dense W16 control, the route-bit decoder closes {(mse['test_topk_recall'] - float(pc['test_topk_recall'])) / (float(dense_l16['test_topk_recall']) - float(pc['test_topk_recall'])):.1%} of the Top-16 gap and {(mse['test_top1_accuracy'] - float(pc['test_top1_accuracy'])) / (float(dense_l16['test_top1_accuracy']) - float(pc['test_top1_accuracy'])):.1%} of the Top-1 gap. The primary failure is therefore the additive per-table factorization, though the 328k-parameter diagnostic is not itself an efficient replacement.",
         "",
         "MSE again outperforms pairwise ranking on held-out retrieval, indicating that continuous teacher scores provide useful within-positive and within-negative ordering information. The next structural question is how much cross-table interaction order is required to recover the dense-decoder gain without using a dense matrix.",
     ]

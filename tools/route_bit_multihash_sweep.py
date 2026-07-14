@@ -10,7 +10,7 @@ import torch
 from torch import Tensor, nn
 
 from tropnn.tools.bilinear_retrieval_probe import predict_score_matrix, retrieval_metrics, teacher_scores
-from tropnn.tools.fixed_l16_route_decoder_probe import FixedL16RouteBits
+from tropnn.tools.fixed_wide_route_decoder_probe import FixedWideRouteBits
 from tropnn.tools.fixed_route_relation_energy_probe import make_relation_pairs
 from tropnn.tools.route_bit_interaction_sweep import CrossTableLUT
 
@@ -35,7 +35,7 @@ class MultiHashCrossTableLUT(nn.Module):
 
 
 class RoutedMultiHashModel(nn.Module):
-    def __init__(self, encoder: FixedL16RouteBits, decoder: MultiHashCrossTableLUT) -> None:
+    def __init__(self, encoder: FixedWideRouteBits, decoder: MultiHashCrossTableLUT) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -57,9 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--test-queries", type=int, default=256)
     run.add_argument("--test-keys", type=int, default=512)
     run.add_argument("--max-value", type=int, default=15)
-    run.add_argument("--tables", type=int, default=16)
+    run.add_argument("--tables-per-seed-block", type=int, default=16)
     run.add_argument("--comparisons", type=int, default=5)
-    run.add_argument("--depth", type=int, default=16)
+    run.add_argument("--seed-blocks", type=int, default=16)
     run.add_argument("--positive-per-query", type=int, default=16)
     run.add_argument("--hard-negative-per-query", type=int, default=8)
     run.add_argument("--steps", type=int, default=10000)
@@ -101,11 +101,11 @@ def run(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     pairs = make_relation_pairs(args, device)
-    encoder = FixedL16RouteBits(
+    encoder = FixedWideRouteBits(
         input_dim=2 * args.input_dim,
-        tables=args.tables,
+        tables_per_seed_block=args.tables_per_seed_block,
         comparisons=args.comparisons,
-        depth=args.depth,
+        seed_blocks=args.seed_blocks,
         seed=args.seed,
     ).to(device)
     decoder = MultiHashCrossTableLUT(

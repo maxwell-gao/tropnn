@@ -11,7 +11,7 @@ import torch
 from torch import Tensor, nn
 
 from tropnn.tools.bilinear_retrieval_probe import predict_score_matrix, retrieval_metrics, teacher_scores
-from tropnn.tools.fixed_l16_route_decoder_probe import FixedL16RouteBits
+from tropnn.tools.fixed_wide_route_decoder_probe import FixedWideRouteBits
 from tropnn.tools.fixed_route_relation_energy_probe import make_relation_pairs
 
 
@@ -48,7 +48,7 @@ class CrossTableLUT(nn.Module):
 
 
 class RoutedInteractionModel(nn.Module):
-    def __init__(self, encoder: FixedL16RouteBits, decoder: CrossTableLUT) -> None:
+    def __init__(self, encoder: FixedWideRouteBits, decoder: CrossTableLUT) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -69,9 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--test-queries", type=int, default=256)
     run.add_argument("--test-keys", type=int, default=512)
     run.add_argument("--max-value", type=int, default=15)
-    run.add_argument("--tables", type=int, default=16)
+    run.add_argument("--tables-per-seed-block", type=int, default=16)
     run.add_argument("--comparisons", type=int, default=5)
-    run.add_argument("--depth", type=int, default=16)
+    run.add_argument("--seed-blocks", type=int, default=16)
     run.add_argument("--positive-per-query", type=int, default=16)
     run.add_argument("--hard-negative-per-query", type=int, default=8)
     run.add_argument("--steps", type=int, default=10000)
@@ -110,11 +110,11 @@ def run(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     pairs = make_relation_pairs(args, device)
-    encoder = FixedL16RouteBits(
+    encoder = FixedWideRouteBits(
         input_dim=2 * args.input_dim,
-        tables=args.tables,
+        tables_per_seed_block=args.tables_per_seed_block,
         comparisons=args.comparisons,
-        depth=args.depth,
+        seed_blocks=args.seed_blocks,
         seed=args.seed,
     ).to(device)
     decoder = CrossTableLUT(encoder.output_dim, args.group_size, args.comparisons, args.seed + 1601).to(device)
@@ -206,14 +206,14 @@ def summarize(args: argparse.Namespace) -> None:
 
     additive_rows = read_csv(args.additive_summary)
     additive = next(
-        row for row in additive_rows if row["variant"] == "pc_mse_adamw" and int(row["depth"]) == 16
+        row for row in additive_rows if row["variant"] == "pc_mse_adamw" and int(row["width"]) == 16
     )
     dense_rows = read_csv(args.dense_route_summary)
     dense = next(row for row in dense_rows if row["objective"] == "mse")
     lines = [
         "# Cross-Table Route-Bit Interaction Sweep",
         "",
-        "The fixed L16 route encoder is unchanged. Its 1,280 bits are permuted and partitioned into second-stage LUT addresses containing bits from different first-stage tables. Every route bit is used once before minimal padding. Only second-stage scalar payloads are trained with score MSE.",
+        "The fixed wide T256/C5 route encoder is unchanged. Its 1,280 bits are permuted and partitioned into second-stage LUT addresses containing bits from different first-stage tables. Every route bit is used once before minimal padding. Only second-stage scalar payloads are trained with score MSE.",
         "",
         "| Decoder | Interaction g | Groups | Params | Train pair | Held-out pair | Hard-neg | Top-16 | Top-1 | Spearman | Steps/s |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",

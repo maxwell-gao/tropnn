@@ -11,7 +11,7 @@ from torch import Tensor, nn
 
 from tropnn.tools.bilinear_retrieval_probe import predict_score_matrix, retrieval_metrics, teacher_scores
 from tropnn.tools.fixed_route_relation_energy_probe import (
-    DEFAULT_LEARNING_RATES,
+    DEFAULT_WEARNING_RATES,
     VARIANTS,
     DenseBilinearScorer,
     DensePairScorer,
@@ -24,28 +24,28 @@ from tropnn.tools.fixed_route_relation_energy_probe import (
 )
 
 
-DEPTHS = (1, 2, 4, 8, 16)
+WIDTHS = (1, 2, 4, 8, 16)
 
 
-class AdditiveEnergy(nn.Module):
-    def __init__(self, blocks: list[nn.Module]) -> None:
+class ParallelEnergyEnsemble(nn.Module):
+    def __init__(self, components: list[nn.Module]) -> None:
         super().__init__()
-        self.blocks = nn.ModuleList(blocks)
+        self.components = nn.ModuleList(components)
 
     def forward(self, pair: Tensor) -> Tensor:
-        score = self.blocks[0](pair)
-        for block in self.blocks[1:]:
-            score = score + block(pair)
+        score = self.components[0](pair)
+        for component in self.components[1:]:
+            score = score + component(pair)
         return score
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Additive fixed-route relation-energy depth sweep.")
+    parser = argparse.ArgumentParser(description="Additive fixed-route relation-energy width sweep.")
     commands = parser.add_subparsers(dest="command", required=True)
 
     run = commands.add_parser("run")
     run.add_argument("--variant", choices=VARIANTS, required=True)
-    run.add_argument("--depth", choices=DEPTHS, type=int, required=True)
+    run.add_argument("--width", choices=WIDTHS, type=int, required=True)
     run.add_argument("--input-dim", type=int, default=32)
     run.add_argument("--train-queries", type=int, default=2048)
     run.add_argument("--train-keys", type=int, default=2048)
@@ -74,45 +74,45 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def make_additive_model(args: argparse.Namespace) -> AdditiveEnergy:
-    blocks: list[nn.Module] = []
-    for layer in range(args.depth):
+def make_additive_model(args: argparse.Namespace) -> ParallelEnergyEnsemble:
+    components: list[nn.Module] = []
+    for component in range(args.width):
         if args.variant.startswith("pc_"):
-            blocks.append(
+            components.append(
                 FixedPairwiseEnergy(
                     2 * args.input_dim,
                     args.tables,
                     args.comparisons,
-                    args.seed + 1009 * layer,
+                    args.seed + 1009 * component,
                 )
             )
         elif args.variant == "dense_mlp_pairwise":
-            blocks.append(DensePairScorer(2 * args.input_dim, hidden_dim=8))
+            components.append(DensePairScorer(2 * args.input_dim, hidden_dim=8))
         else:
-            blocks.append(DenseBilinearScorer(args.input_dim))
-    return AdditiveEnergy(blocks)
+            components.append(DenseBilinearScorer(args.input_dim))
+    return ParallelEnergyEnsemble(components)
 
 
 def effective_learning_rate(args: argparse.Namespace) -> float | None:
     if args.variant == "pc_histogram_log_ratio":
         return None
-    learning_rate = args.lr if args.lr is not None else DEFAULT_LEARNING_RATES[args.variant]
+    learning_rate = args.lr if args.lr is not None else DEFAULT_WEARNING_RATES[args.variant]
     if args.variant == "dense_bilinear_pairwise":
-        learning_rate /= args.depth
+        learning_rate /= args.width
     return learning_rate
 
 
 @torch.no_grad()
 def fit_additive_histogram(
-    model: AdditiveEnergy,
+    model: ParallelEnergyEnsemble,
     pairs: object,
     smoothing: float,
 ) -> dict[str, float]:
     started = time.perf_counter()
     occupied = []
-    for block in model.blocks:
-        assert isinstance(block, FixedPairwiseEnergy)
-        metadata = fit_histogram(block, pairs, smoothing)
+    for component in model.components:
+        assert isinstance(component, FixedPairwiseEnergy)
+        metadata = fit_histogram(component, pairs, smoothing)
         occupied.append(float(metadata["mean_occupied_row_fraction"]))
     return {
         "fit_seconds": time.perf_counter() - started,
@@ -172,9 +172,9 @@ def run(args: argparse.Namespace) -> None:
     metrics = retrieval_metrics(test_target, test_prediction, args.top_k, args.seed + 601)
     result: dict[str, object] = {
         "variant": args.variant,
-        "depth": args.depth,
+        "width": args.width,
         "parameters": parameter_count(model),
-        "tables_per_layer": args.tables if args.variant.startswith("pc_") else None,
+        "tables_per_component": args.tables if args.variant.startswith("pc_") else None,
         "comparisons": args.comparisons if args.variant.startswith("pc_") else None,
         "fixed_zero_thresholds": args.variant.startswith("pc_"),
         "optimizer": None if args.variant == "pc_histogram_log_ratio" else "AdamW",
@@ -187,7 +187,7 @@ def run(args: argparse.Namespace) -> None:
         **{f"test_{key}": value for key, value in metrics.items()},
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{args.variant}_L{args.depth}"
+    stem = f"{args.variant}_W{args.width}"
     (args.out_dir / f"{stem}.json").write_text(json.dumps(result, indent=2) + "\n")
     with (args.out_dir / f"{stem}_history.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(history[0]))
@@ -198,11 +198,11 @@ def run(args: argparse.Namespace) -> None:
 
 def summarize(args: argparse.Namespace) -> None:
     results = [json.loads(path.read_text()) for path in args.result_dir.glob("*.json")]
-    by_key = {(row["variant"], row["depth"]): row for row in results}
-    missing = [(variant, depth) for variant in VARIANTS for depth in DEPTHS if (variant, depth) not in by_key]
+    by_key = {(row["variant"], row["width"]): row for row in results}
+    missing = [(variant, width) for variant in VARIANTS for width in WIDTHS if (variant, width) not in by_key]
     if missing:
         raise RuntimeError(f"Missing runs: {missing}")
-    rows = [by_key[(variant, depth)] for variant in VARIANTS for depth in DEPTHS]
+    rows = [by_key[(variant, width)] for variant in VARIANTS for width in WIDTHS]
     fieldnames = sorted({key for row in rows for key in row})
     summary_path = args.result_dir / "summary.csv"
     with summary_path.open("w", newline="") as handle:
@@ -211,17 +211,17 @@ def summarize(args: argparse.Namespace) -> None:
         writer.writerows(rows)
 
     lines = [
-        "# Additive Relation-Energy Depth Sweep",
+        "# Additive Relation-Energy Width Sweep",
         "",
-        "Each additive layer introduces an independently seeded fixed route. PC-LUT layers use 16 tables, 5 comparisons, zero thresholds, and 512 scalar payload parameters per layer. Layers do not exchange hidden states: their scalar energies are summed directly.",
+        "Each additive component introduces an independently seeded fixed route. PC-LUT components use 16 tables, 5 comparisons, zero thresholds, and 512 scalar payload parameters per component. Layers do not exchange hidden states: their scalar energies are summed directly.",
         "",
-        "| Variant | L | Params | Train pair | Held-out pair | Hard-neg | Top-16 | Top-1 | Spearman | Steps/s |",
+        "| Variant | W | Params | Train pair | Held-out pair | Hard-neg | Top-16 | Top-1 | Spearman | Steps/s |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         speed = "closed form" if row["steps_per_second"] is None else f"{row['steps_per_second']:.1f}"
         lines.append(
-            f"| {row['variant']} | {row['depth']} | {row['parameters']:,} | "
+            f"| {row['variant']} | {row['width']} | {row['parameters']:,} | "
             f"{row['train_pair_accuracy']:.4f} | {row['test_random_pair_order_accuracy']:.4f} | "
             f"{row['test_hard_negative_preference_accuracy']:.4f} | {row['test_topk_recall']:.4f} | "
             f"{row['test_top1_accuracy']:.4f} | {row['test_spearman']:.4f} | {speed} |"
@@ -232,7 +232,7 @@ def summarize(args: argparse.Namespace) -> None:
         first = by_key[(variant, 1)]
         last = by_key[(variant, 16)]
         lines.append(
-            f"- `{variant}` L1->L16: held-out pair {first['test_random_pair_order_accuracy']:.4f}->{last['test_random_pair_order_accuracy']:.4f}, "
+            f"- `{variant}` W1->W16: held-out pair {first['test_random_pair_order_accuracy']:.4f}->{last['test_random_pair_order_accuracy']:.4f}, "
             f"hard-negative {first['test_hard_negative_preference_accuracy']:.4f}->{last['test_hard_negative_preference_accuracy']:.4f}, "
             f"Top-16 {first['test_topk_recall']:.4f}->{last['test_topk_recall']:.4f}, "
             f"Top-1 {first['test_top1_accuracy']:.4f}->{last['test_top1_accuracy']:.4f}."
@@ -242,19 +242,19 @@ def summarize(args: argparse.Namespace) -> None:
             "",
             "Random baselines are 0.5 for pair ordering and hard-negative preference, 0.03125 for Top-16 recall, and 0.001953 for exact Top-1.",
             "",
-            "This sweep tests accumulation of independent comparison partitions. It does not test recursive geometry because every layer routes the original pair rather than the previous layer's representation.",
+            "This sweep tests accumulation of independent comparison partitions. It does not test recursive geometry because every component routes the original pair rather than the previous component's representation.",
             "",
             "## Findings",
             "",
             "All PC-LUT objectives improve monotonically in the main relation metrics as independent partitions are added. The single-route result was therefore not an upper bound on comparison information: multiple independently anchored quotients recover complementary relation evidence.",
             "",
-            f"MSE is the strongest PC-LUT objective at L16: held-out pair order {by_key[('pc_mse_adamw', 16)]['test_random_pair_order_accuracy']:.4f}, hard-negative {by_key[('pc_mse_adamw', 16)]['test_hard_negative_preference_accuracy']:.4f}, Top-16 {by_key[('pc_mse_adamw', 16)]['test_topk_recall']:.4f}, and Top-1 {by_key[('pc_mse_adamw', 16)]['test_top1_accuracy']:.4f}. Local FF reaches higher training pair accuracy but weaker held-out ordering, indicating that binary positive/negative goodness discards useful within-group score structure and overfits the sampled relation boundary more readily than score regression.",
+            f"MSE is the strongest PC-LUT objective at W16: held-out pair order {by_key[('pc_mse_adamw', 16)]['test_random_pair_order_accuracy']:.4f}, hard-negative {by_key[('pc_mse_adamw', 16)]['test_hard_negative_preference_accuracy']:.4f}, Top-16 {by_key[('pc_mse_adamw', 16)]['test_topk_recall']:.4f}, and Top-1 {by_key[('pc_mse_adamw', 16)]['test_top1_accuracy']:.4f}. Local FF reaches higher training pair accuracy but weaker held-out ordering, indicating that binary positive/negative goodness discards useful within-group score structure and overfits the sampled relation boundary more readily than score regression.",
             "",
             "Histogram log-density ratios track local FF closely without gradient optimization, confirming that AdamW is not the main limitation of the logistic goodness model. Their gap from MSE is primarily an objective-information gap, not an optimizer gap.",
             "",
-            f"At nearly equal L16 parameter counts, PC-MSE uses {by_key[('pc_mse_adamw', 16)]['parameters']:,} parameters versus {by_key[('dense_mlp_pairwise', 16)]['parameters']:,} for the dense MLP, but reaches Top-16 {by_key[('pc_mse_adamw', 16)]['test_topk_recall']:.4f} versus {by_key[('dense_mlp_pairwise', 16)]['test_topk_recall']:.4f}. PC-MSE L16 is instead only roughly competitive with the 529-parameter dense MLP at L1, quantifying a roughly 15.5x parameter-efficiency deficit on this relation task.",
+            f"At nearly equal W16 parameter counts, PC-MSE uses {by_key[('pc_mse_adamw', 16)]['parameters']:,} parameters versus {by_key[('dense_mlp_pairwise', 16)]['parameters']:,} for the dense MLP, but reaches Top-16 {by_key[('pc_mse_adamw', 16)]['test_topk_recall']:.4f} versus {by_key[('dense_mlp_pairwise', 16)]['test_topk_recall']:.4f}. PC-MSE W16 is instead only roughly competitive with the 529-parameter dense MLP at W1, quantifying a roughly 15.5x parameter-efficiency deficit on this relation task.",
             "",
-            "Because all additive layers route the same input, `L layers x T16` is algebraically identical to one layer with `T = 16L`. The positive scaling result is table-width scaling, not recursive depth scaling. A true depth experiment must let the next route depend on the previous LUT output.",
+            "Because all additive components route the same input, `W components x T16` is algebraically identical to one flat model with `T = 16W`. The positive scaling result is table-width scaling, not recursive width scaling. A true width experiment must let the next route depend on the previous LUT output.",
         ]
     )
     args.out_report.parent.mkdir(parents=True, exist_ok=True)
