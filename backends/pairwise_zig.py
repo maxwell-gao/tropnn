@@ -50,7 +50,7 @@ def pairwise_zig_forward(
     thresholds: Tensor,
     lut: Tensor,
     *,
-    lut_dtype: Literal["f32", "f16"] = "f32",
+    lut_dtype: Literal["f32", "f16"] = "f16",
 ) -> Tensor:
     if latent.device.type != "cpu":
         raise ValueError("PairwiseLUT backend='zig' requires CPU input tensors")
@@ -170,7 +170,7 @@ def pairwise_zig_soa_forward(
     thresholds: Tensor,
     lut: Tensor,
     *,
-    lut_dtype: Literal["f32", "f16"] = "f32",
+    lut_dtype: Literal["f32", "f16"] = "f16",
 ) -> Tensor:
     if latent.device.type != "cpu":
         raise ValueError("PairwiseLUT SoA Zig forward requires CPU input tensors")
@@ -244,7 +244,7 @@ def pairwise_zig_paged_forward(
     thresholds: Tensor,
     lut: Tensor,
     *,
-    lut_dtype: Literal["f32", "f16"] = "f32",
+    lut_dtype: Literal["f32", "f16"] = "f16",
     page_size: int = 1024,
 ) -> Tensor:
     if page_size < 1:

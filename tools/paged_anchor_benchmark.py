@@ -183,7 +183,7 @@ def main() -> None:
     parser.add_argument("--tables", type=int, default=64)
     parser.add_argument("--comparisons", type=int, default=6)
     parser.add_argument("--page-size", type=int, default=1024)
-    parser.add_argument("--lut-dtype", choices=("f32", "f16"), default="f32")
+    parser.add_argument("--lut-dtype", choices=("f32", "f16"), default="f16")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)

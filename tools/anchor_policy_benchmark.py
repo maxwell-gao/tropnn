@@ -221,7 +221,7 @@ def main() -> None:
     parser.add_argument("--policies", default="all")
     parser.add_argument("--backend", choices=("torch", "tilelang", "triton", "zig"), default="torch")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"), default="float32")
+    parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--input-dim", type=int, default=256)

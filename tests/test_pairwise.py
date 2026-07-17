@@ -253,7 +253,7 @@ def test_absdiff_lut_min_margin_ste_routes_credit_to_query_key_and_width() -> No
 
 
 def test_pairwise_walsh_materializes_order2_rows() -> None:
-    layer = PairwiseWalshLUT(4, 2, tables=1, comparisons=3, walsh_order=2, seed=1)
+    layer = PairwiseWalshLUT(4, 2, tables=1, comparisons=3, walsh_order=2, seed=1, lut_dtype="fp32")
     assert layer.walsh_term_count == 7
 
     with torch.no_grad():
@@ -290,8 +290,8 @@ def test_pairwise_walsh_materializes_order2_rows() -> None:
 
 def test_pairwise_walsh_forward_matches_flat_lut_rows() -> None:
     torch.manual_seed(0)
-    structured = PairwiseWalshLUT(5, 3, tables=4, comparisons=3, walsh_order=2, seed=3)
-    flat = PairwiseLUT(5, 3, tables=4, comparisons=3, seed=3)
+    structured = PairwiseWalshLUT(5, 3, tables=4, comparisons=3, walsh_order=2, seed=3, lut_dtype="fp32")
+    flat = PairwiseLUT(5, 3, tables=4, comparisons=3, seed=3, lut_dtype="fp32")
     with torch.no_grad():
         flat.anchors.copy_(structured.anchors)
         flat.thresholds.copy_(structured.thresholds)
@@ -304,7 +304,7 @@ def test_pairwise_walsh_forward_matches_flat_lut_rows() -> None:
 
 
 def test_pairwise_walsh_gradient_uses_selected_row_and_neighbor_delta() -> None:
-    layer = PairwiseWalshLUT(4, 1, tables=1, comparisons=2, walsh_order=2, use_output_scaling=False, seed=1)
+    layer = PairwiseWalshLUT(4, 1, tables=1, comparisons=2, walsh_order=2, use_output_scaling=False, seed=1, lut_dtype="fp32")
     with torch.no_grad():
         layer.anchors[0, :, 0] = torch.tensor([0, 2])
         layer.anchors[0, :, 1] = torch.tensor([1, 3])
@@ -333,7 +333,7 @@ def test_pairwise_walsh_gradient_uses_selected_row_and_neighbor_delta() -> None:
 
 
 def test_pairwise_walsh_slope_coeff_materializes_order2_rows() -> None:
-    layer = PairwiseWalshLUT(4, 2, tables=1, comparisons=3, walsh_order=1, slope_order=2, use_output_scaling=False, seed=1)
+    layer = PairwiseWalshLUT(4, 2, tables=1, comparisons=3, walsh_order=1, slope_order=2, use_output_scaling=False, seed=1, lut_dtype="fp32")
     assert layer.walsh_term_count == 4
     assert layer.slope_term_count == 7
     assert layer.slope_constant is not None
@@ -373,7 +373,7 @@ def test_pairwise_walsh_slope_coeff_materializes_order2_rows() -> None:
 
 
 def test_pairwise_walsh_margin_affine_forward_matches_formula() -> None:
-    layer = PairwiseWalshLUT(4, 2, tables=1, comparisons=2, walsh_order=2, slope_order=1, use_output_scaling=False, seed=1)
+    layer = PairwiseWalshLUT(4, 2, tables=1, comparisons=2, walsh_order=2, slope_order=1, use_output_scaling=False, seed=1, lut_dtype="fp32")
     assert layer.slope_constant is not None
     assert layer.slope_linear_coeff is not None
     assert layer.slope_pair_coeff is not None
@@ -402,7 +402,7 @@ def test_pairwise_walsh_margin_affine_forward_matches_formula() -> None:
 
 
 def test_pairwise_walsh_margin_affine_ste_trains_slope_selector() -> None:
-    layer = PairwiseWalshLUT(2, 1, tables=1, comparisons=1, walsh_order=1, slope_order=1, use_output_scaling=False, seed=1)
+    layer = PairwiseWalshLUT(2, 1, tables=1, comparisons=1, walsh_order=1, slope_order=1, use_output_scaling=False, seed=1, lut_dtype="fp32")
     assert layer.slope_constant is not None
     assert layer.slope_linear_coeff is not None
     assert layer.slope_generator is not None

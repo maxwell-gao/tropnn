@@ -53,7 +53,7 @@ class EmnistPairwiseClassifier(nn.Module):
         seed: int = 0,
         backend: str = "auto",
         anchor_policy: str = "random",
-        lut_dtype: str = "fp32",
+        lut_dtype: str = "bf16",
         lut_init_std: float = 0.0,
         **_: object,
     ) -> None:
@@ -129,7 +129,7 @@ class PairwiseWalshImageClassifier(nn.Module):
         coeff_init_std: float,
         anchor_policy: str,
         slope_order: int = 0,
-        lut_dtype: str = "fp32",
+        lut_dtype: str = "bf16",
     ) -> None:
         super().__init__()
         self.layer = PairwiseWalshLUT(
@@ -164,7 +164,7 @@ class EmnistPairwiseWalshClassifier(PairwiseWalshImageClassifier):
         coeff_init_std: float = 0.02,
         anchor_policy: str = "random",
         slope_order: int = 0,
-        lut_dtype: str = "fp32",
+        lut_dtype: str = "bf16",
         **_: object,
     ) -> None:
         super().__init__(
@@ -298,7 +298,7 @@ def main() -> None:
     parser.add_argument("--lut-init-std", type=float, default=0.02)
     parser.add_argument("--anchor-policy", default="random")
     parser.add_argument("--backend", choices=("auto", "torch", "tilelang", "triton"), default="auto")
-    parser.add_argument("--lut-dtype", choices=("fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"), default="fp32")
+    parser.add_argument("--lut-dtype", choices=("fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"), default="bf16")
     parser.add_argument("--max-train", type=int, default=0)
     parser.add_argument("--max-test", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)

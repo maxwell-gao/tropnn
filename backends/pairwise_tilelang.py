@@ -19,18 +19,22 @@ def _float_payload_dtype_name(lut_dtype: str) -> str:
     return "float32"
 
 
+def _route_input_dtype_name(dtype: torch.dtype) -> str:
+    if dtype == torch.bfloat16:
+        return "bfloat16"
+    if dtype == torch.float16:
+        return "float16"
+    if dtype == torch.float32:
+        return "float32"
+    raise TypeError(f"Pairwise TileLang route expects fp32/bf16/fp16 latent, got {dtype}")
+
+
 def has_tilelang() -> bool:
     try:
         import tilelang  # noqa: F401
     except ImportError:
         return False
     return True
-
-
-def _require_float32(*tensors: Tensor) -> None:
-    for tensor in tensors:
-        if tensor.dtype != torch.float32:
-            raise TypeError(f"Pairwise TileLang backend currently expects float32 compute tensors, got {tensor.dtype}")
 
 
 def _enabled_by_env(name: str, *, default: bool = True) -> bool:
@@ -88,6 +92,7 @@ def _pairwise_route_kernel(
     comparisons: int,
     route_block: int,
     table_blocks: int,
+    latent_dtype_name: str,
     target: str,
 ) -> Any:
     try:
@@ -106,7 +111,7 @@ def _pairwise_route_kernel(
 
         @T.prim_func
         def kernel(
-            latent: T.Tensor((item_count, input_dim), "float32"),
+            latent: T.Tensor((item_count, input_dim), latent_dtype_name),
             anchors: T.Tensor((route_count, comp_count, 2), "int64"),
             thresholds: T.Tensor((route_count, comp_count), "float32"),
             indices: T.Tensor((item_count, route_count), "int64"),
@@ -129,7 +134,7 @@ def _pairwise_route_kernel(
                         for comp in T.serial(comp_count):
                             a = anchors[table, comp, 0]
                             b = anchors[table, comp, 1]
-                            margin = latent[row, a] - latent[row, b] - thresholds[table, comp]
+                            margin = T.cast(latent[row, a], "float32") - T.cast(latent[row, b], "float32") - thresholds[table, comp]
                             margins[row, table, comp] = margin
                             abs_margin = T.abs(margin)
                             if abs_margin < best_abs[0]:
@@ -154,6 +159,7 @@ def _pairwise_route_u8_kernel(
     comparisons: int,
     route_block: int,
     table_blocks: int,
+    latent_dtype_name: str,
     target: str,
 ) -> Any:
     try:
@@ -172,7 +178,7 @@ def _pairwise_route_u8_kernel(
 
         @T.prim_func
         def kernel(
-            latent: T.Tensor((item_count, input_dim), "float32"),
+            latent: T.Tensor((item_count, input_dim), latent_dtype_name),
             anchors: T.Tensor((route_count, comp_count, 2), "int64"),
             thresholds: T.Tensor((route_count, comp_count), "float32"),
             indices: T.Tensor((item_count, route_count), "uint8"),
@@ -195,7 +201,7 @@ def _pairwise_route_u8_kernel(
                         for comp in T.serial(comp_count):
                             a = anchors[table, comp, 0]
                             b = anchors[table, comp, 1]
-                            margin = latent[row, a] - latent[row, b] - thresholds[table, comp]
+                            margin = T.cast(latent[row, a], "float32") - T.cast(latent[row, b], "float32") - thresholds[table, comp]
                             margins[row, table, comp] = margin
                             abs_margin = T.abs(margin)
                             if abs_margin < best_abs[0]:
@@ -2219,7 +2225,7 @@ def _run_forward(
     lut: Tensor,
     *,
     target: str,
-    lut_dtype: PackedLutDType = "fp32",
+    lut_dtype: PackedLutDType = "bf16",
     packed_payload: _PackedPayload | None = None,
     route_index_dtype: RouteIndexDType = "int64",
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, _PackedPayload]:
@@ -2229,7 +2235,9 @@ def _run_forward(
         raise ValueError("Pairwise TileLang backend requires CUDA tensors")
     if latent.ndim != 3:
         raise ValueError(f"latent must have shape [batch, steps, in_features], got {tuple(latent.shape)}")
-    _require_float32(latent, thresholds)
+    latent_dtype_name = _route_input_dtype_name(latent.dtype)
+    if thresholds.dtype != torch.float32:
+        raise TypeError(f"Pairwise TileLang route expects fp32 thresholds, got {thresholds.dtype}")
 
     batch, steps, in_features = latent.shape
     tables, comparisons, pair_width = anchors.shape
@@ -2260,7 +2268,7 @@ def _run_forward(
     table_blocks = (tables + route_block - 1) // route_block
     block_d = _select_block_size(out_features)
     out_blocks = (out_features + block_d - 1) // block_d
-    route_kernel = _pairwise_route_u8_kernel(item_count, in_features, tables, comparisons, route_block, table_blocks, target) if route_index_dtype == "uint8" else _pairwise_route_kernel(item_count, in_features, tables, comparisons, route_block, table_blocks, target)
+    route_kernel = _pairwise_route_u8_kernel(item_count, in_features, tables, comparisons, route_block, table_blocks, latent_dtype_name, target) if route_index_dtype == "uint8" else _pairwise_route_kernel(item_count, in_features, tables, comparisons, route_block, table_blocks, latent_dtype_name, target)
     route_kernel(latent_flat, anchors_contig, thresholds_contig, indices, margins, rmins)
     if route_index_dtype == "uint8":
         if lut_dtype not in {"fp32", "bf16", "fp16", "binary01_bf16"}:
@@ -2336,6 +2344,7 @@ class _PairwiseTileLangFunction(torch.autograd.Function):
         ctx.use_min_margin_ste = bool(use_min_margin_ste)
         ctx.use_izhikevich_surrogate = surrogate == "izhikevich"
         ctx.target = target
+        ctx.latent_input_dtype = latent.dtype
         ctx.lut_input_dtype = lut.dtype
         ctx.mark_non_differentiable(indices, margins)
         return output, indices, margins
@@ -2537,7 +2546,7 @@ class _PairwiseTileLangFunction(torch.autograd.Function):
                 )
                 ste_kernel(grad_flat, indices_kernel, margins_flat, anchors_contig, payload_data, payload_scales, payload_codebook, grad_latent, grad_thresholds)
 
-        return grad_latent.view(batch, steps, in_features), None, grad_thresholds, grad_lut.to(dtype=ctx.lut_input_dtype), None, None, None, None, None, None
+        return grad_latent.view(batch, steps, in_features).to(ctx.latent_input_dtype), None, grad_thresholds, grad_lut.to(dtype=ctx.lut_input_dtype), None, None, None, None, None, None
 
 
 def pairwise_tilelang(
@@ -2549,7 +2558,7 @@ def pairwise_tilelang(
     use_min_margin_ste: bool,
     surrogate: str = "fast_sigmoid_odd",
     target: str = "cuda",
-    lut_dtype: PackedLutDType = "fp32",
+    lut_dtype: PackedLutDType = "bf16",
     packed_payload: _PackedPayload | None = None,
     route_index_dtype: RouteIndexDType = "int64",
 ) -> tuple[Tensor, Tensor, Tensor]:

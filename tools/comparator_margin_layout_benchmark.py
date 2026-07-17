@@ -180,7 +180,7 @@ def _benchmark_layout(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark two-sided comparator margin sparse write layouts.")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--input-dim", type=int, default=384)

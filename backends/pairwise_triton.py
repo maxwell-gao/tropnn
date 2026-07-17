@@ -473,8 +473,8 @@ def _run_forward(
         raise RuntimeError("Triton is not installed; install triton or use backend='torch'")
     if not latent.is_cuda:
         raise ValueError("Pairwise Triton backend requires CUDA tensors")
-    if latent.dtype != torch.float32 or thresholds.dtype != torch.float32:
-        raise TypeError("Pairwise Triton backend expects float32 compute tensors")
+    if latent.dtype not in {torch.float32, torch.bfloat16, torch.float16} or thresholds.dtype != torch.float32:
+        raise TypeError("Pairwise Triton backend expects fp32/bf16/fp16 latent and fp32 thresholds")
 
     batch, steps, in_features = latent.shape
     tables, comparisons, pair_width = anchors.shape
@@ -551,6 +551,7 @@ class _PairwiseTritonFunction(torch.autograd.Function):
         ctx.use_min_margin_ste = bool(use_min_margin_ste)
         ctx.use_izhikevich_surrogate = surrogate == "izhikevich"
         ctx.lut_dtype = lut_dtype
+        ctx.latent_input_dtype = latent.dtype
         ctx.lut_input_dtype = lut.dtype
         ctx.mark_non_differentiable(indices, margins)
         return output, indices, margins
@@ -649,7 +650,7 @@ class _PairwiseTritonFunction(torch.autograd.Function):
                 BLOCK_D=block_d,
                 USE_IZHIKEVICH=ctx.use_izhikevich_surrogate,
             )
-        return grad_x.view(batch, steps, in_features), None, grad_thresholds, grad_lut.to(dtype=ctx.lut_input_dtype), None, None, None, None
+        return grad_x.view(batch, steps, in_features).to(ctx.latent_input_dtype), None, grad_thresholds, grad_lut.to(dtype=ctx.lut_input_dtype), None, None, None, None
 
 
 def pairwise_triton(
@@ -660,7 +661,7 @@ def pairwise_triton(
     *,
     use_min_margin_ste: bool,
     surrogate: str = "fast_sigmoid_odd",
-    lut_dtype: PackedLutDType = "fp32",
+    lut_dtype: PackedLutDType = "bf16",
     packed_payload: Any | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     if surrogate not in {"fast_sigmoid_odd", "izhikevich"}:

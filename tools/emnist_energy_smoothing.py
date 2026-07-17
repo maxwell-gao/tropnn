@@ -315,7 +315,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comparisons", type=int, default=6)
     parser.add_argument("--anchor-policy", choices=PAIRWISE_ANCHOR_POLICIES, default="expander")
     parser.add_argument("--backend", choices=["auto", "torch", "tilelang", "triton"], default="torch")
-    parser.add_argument("--lut-dtype", choices=["fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"], default="fp32")
+    parser.add_argument("--lut-dtype", choices=["fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "fp4", "nf4"], default="bf16")
     parser.add_argument("--lut-init-std", type=float, default=0.02)
     parser.add_argument("--fixed-zero-threshold", action="store_true")
     parser.add_argument("--no-output-scaling", action="store_true")
