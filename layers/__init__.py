@@ -1,8 +1,9 @@
 from .base import LUTModuleBase
 from .comparator_margin import ComparatorTwoSidedMargin
 from .coxeter import CoxeterLUT, CoxeterRoute, K4FullLUT
-from .pairwise import AbsDiffLUT, PAIRWISE_ANCHOR_POLICIES, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT
+from .pairwise import PAIRWISE_ANCHOR_POLICIES, AbsDiffLUT, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT
 from .relation import ComparisonRelationLUT, ComparisonRelationSpec, ComparisonRoute
+from .s4_relation import GaugeAlignedS4Relation, circulant_relation_edges, s4_fourier_energy, s4_gauge_maps, s4_tables
 
 PairwiseLinear = PairwiseLUT
 PairwiseWalshLinear = PairwiseWalshLUT
@@ -16,6 +17,7 @@ __all__ = [
     "ComparisonRelationLUT",
     "ComparisonRelationSpec",
     "ComparisonRoute",
+    "GaugeAlignedS4Relation",
     "LUTModuleBase",
     "PAIRWISE_ANCHOR_POLICIES",
     "PairwiseLinear",
@@ -23,4 +25,8 @@ __all__ = [
     "PairwiseRoute",
     "PairwiseWalshLinear",
     "PairwiseWalshLUT",
+    "circulant_relation_edges",
+    "s4_fourier_energy",
+    "s4_gauge_maps",
+    "s4_tables",
 ]
