@@ -38,7 +38,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from tropnn.layers import ComparatorTwoSidedMargin
+from tropnn.layers import ComparatorTwoSidedMargin, CoxeterLUT, K4FullLUT
 from tropnn.layers.pairwise import PAIRWISE_ANCHOR_POLICIES, LutDType, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT, ste_heaviside
 from tropnn.tools.emnist_discrete_payload import (
     AccumulatorMode,
@@ -60,6 +60,8 @@ from tropnn.tools.emnist_payload_dtype_sweep import _build_local_loaders, _loade
 
 PayloadVariant = Literal[
     "full_vector",
+    "k4_full_vector",
+    "coxeter_full_vector",
     "group_k16",
     "group_k8",
     "group_k4",
@@ -101,6 +103,8 @@ OptimizerName = Literal[
 
 VARIANT_PAYLOAD_WIDTH: dict[str, int | None] = {
     "full_vector": None,
+    "k4_full_vector": None,
+    "coxeter_full_vector": None,
     "group_k16": 16,
     "group_k8": 8,
     "group_k4": 4,
@@ -170,7 +174,7 @@ class PayloadSpec:
             return self.variant
         if self.variant.startswith("pairwise_glu_") or self.variant == "binary_count_gated_lut":
             return self.variant
-        if self.variant == "full_vector":
+        if self.variant in {"full_vector", "k4_full_vector", "coxeter_full_vector"}:
             return "full_vector"
         if self.variant.startswith("group_"):
             return f"group_k{self.payload_width}"
@@ -1999,6 +2003,30 @@ class PayloadWidthEmnistClassifier(nn.Module):
     ) -> None:
         super().__init__()
         def make_layer(input_features: int, output_features: int, layer_seed: int, *, is_hidden: bool) -> nn.Module:
+            if variant == "k4_full_vector":
+                return K4FullLUT(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                )
+            if variant == "coxeter_full_vector":
+                return CoxeterLUT(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    lut_init_std=lut_init_std,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                )
             if variant.startswith("full_lut_"):
                 if is_hidden:
                     return FullLutGatedCorrectionLayer(
