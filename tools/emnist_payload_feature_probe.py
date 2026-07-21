@@ -473,7 +473,8 @@ def _spectral_summary(eigenvalues: Tensor) -> dict[str, float | int]:
     cumulative = probabilities.cumsum(0)
 
     def energy_rank(threshold: float) -> int:
-        return int(torch.searchsorted(cumulative, torch.tensor(threshold, dtype=cumulative.dtype)).item()) + 1
+        target = torch.tensor(threshold, dtype=cumulative.dtype, device=cumulative.device)
+        return int(torch.searchsorted(cumulative, target).item()) + 1
 
     return {
         "effective_rank": float(effective_rank.item()),

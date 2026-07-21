@@ -22,6 +22,13 @@ def test_spectral_summary_recovers_rank_one() -> None:
     assert summary["rank99"] == 1
 
 
+def test_spectral_summary_keeps_scalar_threshold_on_cuda() -> None:
+    if not torch.cuda.is_available():
+        return
+    summary = _spectral_summary(torch.tensor([0.0, 1.0], device="cuda"))
+    assert summary["rank90"] == 1
+
+
 def test_weighted_covariance_uses_route_frequency() -> None:
     rows = torch.tensor([[2.0, 0.0], [0.0, 3.0]])
     usage = torch.tensor([[4, 0]])
