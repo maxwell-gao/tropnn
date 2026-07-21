@@ -645,12 +645,50 @@ def summarize(args: argparse.Namespace) -> None:
             aggregate.append(row)
     (args.result_dir / "aggregate.json").write_text(json.dumps(aggregate, indent=2) + "\n")
 
+    indexed = {(str(row["teacher"]), str(row["variant"])): row for row in aggregate}
+    kendall_match = indexed[("intrinsic_kendall", "intrinsic_kendall")]
+    mallows_match = indexed[("intrinsic_mallows", "intrinsic_mallows")]
+    diffusion_match = indexed[("intrinsic_cayley_diffusion", "intrinsic_cayley_diffusion")]
+    mallows_to_diffusion = indexed[("intrinsic_cayley_diffusion", "intrinsic_mallows")]
+    tied_match = indexed[("root_incidence_tied", "root_incidence_tied")]
+    hodge_match = indexed[("root_hodge_spectral", "root_hodge_spectral")]
+    anisotropic_diagonal = indexed[("root_incidence_anisotropic", "root_diagonal")]
+    anisotropic_sparse = indexed[("root_incidence_anisotropic", "root_incidence_sparse")]
+    invariant_variants = VARIANTS[:6]
+    anisotropic_invariant_max = max(
+        float(indexed[("root_incidence_anisotropic", variant)]["score_r2"])
+        for variant in invariant_variants
+    )
+    seed_rows = [run for run in runs if run["teacher"] == "root_incidence_anisotropic"]
+    root_edges = [int(run["unique_root_edges"]) for run in seed_rows]
+    incidence_entries = [int(run["incidence_operator_entries"]) for run in seed_rows]
+
     lines = [
         "# Tiered intrinsic and structured-root kernel test",
         "",
         "This experiment removes raw and rank-bilinear teachers. Tier 1 uses only shared intrinsic S4 "
         "relations. Tier 2 generates scores only from globally labeled comparison roots and structured "
         "root-space operators.",
+        "",
+        "## Main result",
+        "",
+        "The intrinsic kernels are healthy when the teacher has the same S4 symmetry: matched Kendall, "
+        f"Mallows, and Cayley diffusion each reach held R2 {kendall_match['score_r2']:.4f}, "
+        f"{mallows_match['score_r2']:.4f}, and {diffusion_match['score_r2']:.4f}. They are related but not "
+        f"interchangeable. Mallows predicts Cayley diffusion with R2 {mallows_to_diffusion['score_r2']:.4f} "
+        f"but only {mallows_to_diffusion['topk_recall']:.4f} Top-16 recall, so the exact heat kernel contains "
+        "ranking geometry not removed by affine calibration.",
+        "",
+        f"The two-scalar incidence operator and two-eigenspace Hodge operator recover their matched teachers "
+        f"with held R2 {tied_match['score_r2']:.4f} and {hodge_match['score_r2']:.4f}. Thus a very small "
+        "representation-defined operator is sufficient when its symmetry matches the relation.",
+        "",
+        "The decisive test is the query/key-asymmetric incidence teacher. All invariant two- or three-parameter "
+        f"kernels remain below held R2 {anisotropic_invariant_max:.4f}. A diagonal root operator reaches "
+        f"{anisotropic_diagonal['score_r2']:.4f} R2 and {anisotropic_diagonal['topk_recall']:.4f} Top-16; the "
+        f"incidence-support operator reaches {anisotropic_sparse['score_r2']:.4f} R2 and "
+        f"{anisotropic_sparse['topk_recall']:.4f} Top-16. This relation geometry is learned entirely inside "
+        "comparison-root space, without a raw-coordinate matrix or an imposed rank.",
         "",
         "## Protocol",
         "",
@@ -683,12 +721,29 @@ def summarize(args: argparse.Namespace) -> None:
         lines.append("")
     lines.extend(
         [
+            "## Capacity and execution boundary",
+            "",
+            f"The three seeds expose {min(root_edges)}-{max(root_edges)} unique global roots. The diagonal "
+            f"operator therefore needs only {min(root_edges)}-{max(root_edges)} learned relation weights. "
+            f"The directed incidence support contains {min(incidence_entries)}-{max(incidence_entries)} entries, "
+            "versus roughly 7,000 entries for a dense root matrix at this width. Its pair score can be evaluated "
+            "as sign-product selection plus accumulation, or by caching the sparse transform M c per object. "
+            "It is comparison-native and separable, but it is not yet as cheap as a width-12 dot.",
+            "",
+            "The diagonal result is the important intermediate point: it retains about three quarters of the "
+            "asymmetric teacher score variance using one coefficient per observed root. The remaining gain comes "
+            "specifically from interactions between roots that share a coordinate.",
+            "",
             "## Structural boundary",
             "",
             "The incidence-sparse operator is not a random matrix on raw coordinates. Its domain and "
             "codomain are comparison roots, and a coefficient exists only when two roots are identical "
             "or share a coordinate. The anisotropic teacher uses this same support but different query/key "
             "root weights, so it is a native asymmetric relation stress test.",
+            "",
+            "This is a matched structural positive control, not evidence that language-model attention uses the "
+            "same synthetic operator. The next external-validity test is to project real learned QK scores onto "
+            "this exact ladder and measure held-layer or held-task transfer.",
             "",
             "## Artifacts",
             "",
