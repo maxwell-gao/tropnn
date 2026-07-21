@@ -633,8 +633,8 @@ def relation_execution_metadata(
 ) -> dict[str, float | int | str]:
     model.eval()
     generator = torch.Generator(device="cpu").manual_seed(model.config.seed + 8093)
-    query = torch.randn(pairs, model.config.relation_dim, generator=generator, device=device)
-    key = torch.randn(pairs, model.config.relation_dim, generator=generator, device=device)
+    query = torch.randn(pairs, model.config.relation_dim, generator=generator).to(device)
+    key = torch.randn(pairs, model.config.relation_dim, generator=generator).to(device)
 
     def time_call(function) -> float:
         for _ in range(warmups):
