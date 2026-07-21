@@ -4,6 +4,7 @@ import torch
 from tropnn.tools.s4_superposition_scaling_probe import (
     ChamberSuperpositionModel,
     apply_superposition_regularizer,
+    fit_affine_width,
     fit_loss_floor,
     make_ordinal_data,
     payload_metrics,
@@ -85,3 +86,14 @@ def test_loss_floor_fit_recovers_synthetic_curve() -> None:
     assert abs(fit["loss_floor"] - 0.03) < 0.01
     assert abs(fit["alpha"] - 0.8) < 0.08
     assert fit["r2"] > 0.999
+
+
+def test_affine_width_fit_recovers_rank_law() -> None:
+    rows = [
+        {"message_width": width, "feature_count": 384, "held_loss": 0.95 - 1.2 * width / 384}
+        for width in (4, 8, 16, 32, 64, 128)
+    ]
+    fit = fit_affine_width(rows)
+    assert abs(fit["intercept"] - 0.95) < 1e-8
+    assert abs(fit["slope"] + 1.2) < 1e-8
+    assert fit["r2"] > 1.0 - 1e-12

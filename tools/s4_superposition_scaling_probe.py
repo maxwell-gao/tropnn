@@ -454,6 +454,22 @@ def fit_loss_floor(rows: list[dict[str, object]]) -> dict[str, float]:
     }
 
 
+def fit_affine_width(rows: list[dict[str, object]]) -> dict[str, float]:
+    feature_count = float(rows[0]["feature_count"])
+    x = torch.tensor([float(row["message_width"]) / feature_count for row in rows], dtype=torch.float64)
+    y = torch.tensor([float(row["held_loss"]) for row in rows], dtype=torch.float64)
+    design = torch.stack((torch.ones_like(x), x), dim=1)
+    coefficient = torch.linalg.lstsq(design, y).solution
+    prediction = design @ coefficient
+    ss_res = (y - prediction).square().sum()
+    ss_tot = (y - y.mean()).square().sum()
+    return {
+        "intercept": float(coefficient[0].item()),
+        "slope": float(coefficient[1].item()),
+        "r2": float((1.0 - ss_res / ss_tot).item()) if ss_tot > 0 else float("nan"),
+    }
+
+
 def summarize(args: argparse.Namespace) -> None:
     runs = [json.loads(path.read_text()) for path in sorted(args.result_dir.glob("**/*-seed*.json"))]
     if not runs:
@@ -550,9 +566,15 @@ def summarize(args: argparse.Namespace) -> None:
                 "readout": readout,
                 "weight_decay": weight_decay,
                 "loss_floor_fit": fit_loss_floor(members),
+                "affine_width_fit": fit_affine_width(members),
                 "overlap_power_fit": fit_power(members, "mean_squared_overlap"),
                 "represented_overlap_power_fit": fit_power(members, "represented_mean_squared_overlap"),
+                "within_table_overlap_power_fit": fit_power(members, "within_table_mean_squared_overlap"),
+                "cross_table_overlap_power_fit": fit_power(members, "cross_table_mean_squared_overlap"),
                 "overlap_times_width_mean": statistics.mean(float(row["overlap_times_width"]) for row in members),
+                "cross_overlap_times_width_mean": statistics.mean(
+                    float(row["cross_table_mean_squared_overlap"]) * int(row["message_width"]) for row in members
+                ),
                 "represented_fraction_mean": statistics.mean(float(row["represented_fraction"]) for row in members),
             }
         )
@@ -563,6 +585,21 @@ def summarize(args: argparse.Namespace) -> None:
     weight_decays = sorted({float(row["weight_decay"]) for row in aggregate})
     seeds = sorted({int(row["seed"]) for row in flat})
     indexed = {(str(row["readout"]), float(row["weight_decay"]), int(row["message_width"])): row for row in aggregate}
+    fit_indexed = {(str(row["readout"]), float(row["weight_decay"])): row for row in fits}
+    cleanup_gains = []
+    for weight_decay in weight_decays:
+        for width in widths:
+            linear = indexed[("linear", weight_decay, width)]
+            cleanup = indexed[("pclut_cleanup", weight_decay, width)]
+            cleanup_gains.append(
+                (float(linear["held_loss"]) - float(cleanup["held_loss"])) / float(linear["held_loss"])
+            )
+    loss_power_r2 = [float(row["loss_floor_fit"]["r2"]) for row in fits]
+    affine_r2 = [float(row["affine_width_fit"]["r2"]) for row in fits]
+    neutral_linear = fit_indexed[("linear", 0.0)]
+    neutral_cleanup = fit_indexed[("pclut_cleanup", 0.0)]
+    strong_linear = fit_indexed[("linear", -16.0)]
+    strong_cleanup = fit_indexed[("pclut_cleanup", -16.0)]
     lines = [
         "# S4 chamber superposition scaling",
         "",
@@ -582,19 +619,55 @@ def summarize(args: argparse.Namespace) -> None:
         "The weak-superposition reference fraction is m/N; strong superposition instead keeps nearly all rows nonzero. "
         "Normalized mean squared overlap is computed off-diagonal after normalizing every nonzero payload row.",
         "",
+        "## Main result",
+        "",
+        "There is a real one-over-width overlap regime, but it is not the paper's complete superposition scaling law. "
+        f"At gamma=0, global/cross-table overlap exponents are {neutral_linear['overlap_power_fit']['exponent']:.3f}/"
+        f"{neutral_linear['cross_table_overlap_power_fit']['exponent']:.3f} for the linear readout and "
+        f"{neutral_cleanup['overlap_power_fit']['exponent']:.3f}/"
+        f"{neutral_cleanup['cross_table_overlap_power_fit']['exponent']:.3f} with cleanup. Thus ordinary learned "
+        "chamber rows have the expected random-geometry scale. Under activation-count-matched growth gamma=-16, "
+        f"all rows have norm about one, but global/cross exponents fall to "
+        f"{strong_linear['overlap_power_fit']['exponent']:.3f}/"
+        f"{strong_linear['cross_table_overlap_power_fit']['exponent']:.3f} (linear) and "
+        f"{strong_cleanup['overlap_power_fit']['exponent']:.3f}/"
+        f"{strong_cleanup['cross_table_overlap_power_fit']['exponent']:.3f} (cleanup). Strong row representation "
+        "therefore does not imply isotropic 1/m overlap in this structured ordinal ensemble.",
+        "",
+        f"The held losses do not support L_inf+C/m^alpha on this range: every fitted floor hits zero, alpha lies "
+        f"between {min(float(row['loss_floor_fit']['alpha']) for row in fits):.3f} and "
+        f"{max(float(row['loss_floor_fit']['alpha']) for row in fits):.3f}, and R2 is only "
+        f"{min(loss_power_r2):.3f}-{max(loss_power_r2):.3f}. A simple affine rank law in m/N fits much better "
+        f"(R2 {min(affine_r2):.3f}-{max(affine_r2):.3f}). Width is helping mainly by resolving more of the "
+        "fixed 384-state categorical system, not by removing isotropic interference with a 1/m loss tail.",
+        "",
+        "Every trained chamber row remains nonzero. Growth gamma=-16 forces phi_1/2=1 at every width, while "
+        "gamma=0, 0.1, and 1 are nearly indistinguishable and do not approach the canonical weak reference phi=m/N. "
+        "They form a diffuse, width-dependent norm solution instead. Hence regularization produces a norm-regime "
+        "change, but not the clean weak/strong phase transition of the exchangeable Bernoulli toy model.",
+        "",
+        f"The PC-LUT residual changes held loss by {statistics.mean(cleanup_gains):.1%} on average "
+        f"({min(cleanup_gains):.1%} to {max(cleanup_gains):.1%}) and does not change the loss law. It adds a fixed "
+        "24,576 parameters: 12.8x the m=4 linear model's parameter count, falling to 0.50x extra at m=128. "
+        "This is a small nonlinear cleanup effect, not a capacity-efficient escape from the ordinal bottleneck.",
+        "",
         "## Scaling fits",
         "",
-        "| Readout | decay/growth gamma | represented fraction | overlap exponent beta | mean m*overlap | "
-        "loss floor | loss alpha | loss-fit R2 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Readout | decay/growth gamma | represented fraction | global overlap beta | cross-table beta | "
+        "mean m*cross-overlap | loss floor | loss alpha | loss-fit R2 | affine m/N R2 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for fit in fits:
         overlap_fit = fit["overlap_power_fit"]
+        cross_overlap_fit = fit["cross_table_overlap_power_fit"]
         loss_fit = fit["loss_floor_fit"]
+        affine_fit = fit["affine_width_fit"]
         lines.append(
             f"| {fit['readout']} | {float(fit['weight_decay']):g} | {float(fit['represented_fraction_mean']):.3f} | "
-            f"{float(overlap_fit['exponent']):.3f} | {float(fit['overlap_times_width_mean']):.3f} | "
-            f"{float(loss_fit['loss_floor']):.5f} | {float(loss_fit['alpha']):.3f} | {float(loss_fit['r2']):.3f} |"
+            f"{float(overlap_fit['exponent']):.3f} | {float(cross_overlap_fit['exponent']):.3f} | "
+            f"{float(fit['cross_overlap_times_width_mean']):.3f} | "
+            f"{float(loss_fit['loss_floor']):.5f} | {float(loss_fit['alpha']):.3f} | {float(loss_fit['r2']):.3f} | "
+            f"{float(affine_fit['r2']):.3f} |"
         )
 
     for weight_decay in weight_decays:
@@ -604,8 +677,8 @@ def summarize(args: argparse.Namespace) -> None:
                 f"## gamma = {weight_decay:g}",
                 "",
                 "| m | linear loss | cleanup loss | cleanup gain | linear represented | cleanup represented | "
-                "linear m*overlap | cleanup m*overlap | linear accuracy | cleanup accuracy |",
-                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "linear row norm | cleanup row norm | linear m*overlap | cleanup m*overlap | linear accuracy | cleanup accuracy |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for width in widths:
@@ -617,7 +690,8 @@ def summarize(args: argparse.Namespace) -> None:
             lines.append(
                 f"| {width} | {float(linear['held_loss']):.5f} | {float(cleanup['held_loss']):.5f} | "
                 f"{gain:.1%} | {float(linear['represented_fraction']):.3f} | "
-                f"{float(cleanup['represented_fraction']):.3f} | {float(linear['overlap_times_width']):.3f} | "
+                f"{float(cleanup['represented_fraction']):.3f} | {float(linear['row_norm_mean']):.3f} | "
+                f"{float(cleanup['row_norm_mean']):.3f} | {float(linear['overlap_times_width']):.3f} | "
                 f"{float(cleanup['overlap_times_width']):.3f} | {float(linear['held_chamber_accuracy']):.3f} | "
                 f"{float(cleanup['held_chamber_accuracy']):.3f} |"
             )
