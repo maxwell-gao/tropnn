@@ -17,7 +17,9 @@ from tropnn.tools.emnist_pair_relation_kernel import (
     build_retrieval_set,
     check_frontier_gate,
     digit_relation_metrics,
+    improvement_retention,
     pair_metrics,
+    paired_metric_gate,
     retrieval_metrics,
     sample_pair_indices,
     select_learning_rates,
@@ -218,3 +220,16 @@ def test_frontier_gate_requires_three_seeds_and_accepts_one_dense_control(tmp_pa
     output = tmp_path / "gate.json"
     decision = check_frontier_gate(SimpleNamespace(result_dir=tmp_path, output=output))
     assert decision["passed"]
+
+
+def test_paired_gate_and_random_adjusted_retention_use_all_three_seeds() -> None:
+    left = ("same_class", "class", "float", "relation_only", "left")
+    right = ("same_class", "class", "float", "relation_only", "right")
+    indexed = {
+        left: {seed: {"random_recall_at_16": 0.55 + 0.01 * seed} for seed in range(3)},
+        right: {seed: {"random_recall_at_16": 0.45 + 0.01 * seed} for seed in range(3)},
+    }
+    gate = paired_metric_gate(indexed, left, right, "random_recall_at_16")
+    assert gate["complete"] and gate["passed"] and gate["all_seed_same_sign"]
+    retention = improvement_retention(indexed, right, left, "random_recall_at_16", 16.0 / 512.0, 0.7)
+    assert retention["complete"] and retention["passed"]

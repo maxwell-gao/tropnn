@@ -966,6 +966,76 @@ def mean_sem(values: list[float]) -> tuple[float, float]:
     return statistics.mean(values), statistics.stdev(values) / math.sqrt(len(values)) if len(values) > 1 else 0.0
 
 
+def paired_metric_gate(
+    indexed: dict[tuple[str, str, str, str, str], dict[int, dict[str, object]]],
+    left: tuple[str, str, str, str, str],
+    right: tuple[str, str, str, str, str],
+    metric: str,
+) -> dict[str, object]:
+    if left not in indexed or right not in indexed:
+        return {"complete": False, "passed": False, "reason": "missing group"}
+    seeds = sorted(set(indexed[left]) & set(indexed[right]))
+    if seeds != [0, 1, 2]:
+        return {"complete": False, "passed": False, "reason": f"expected seeds 0,1,2; found {seeds}"}
+    deltas = [float(indexed[left][seed][metric]) - float(indexed[right][seed][metric]) for seed in seeds]
+    mean, sem = mean_sem(deltas)
+    threshold = max(0.02, 2.0 * sem)
+    return {
+        "complete": True,
+        "passed": mean > threshold and all(delta > 0.0 for delta in deltas),
+        "left": left[-1],
+        "right": right[-1],
+        "metric": metric,
+        "paired_deltas": deltas,
+        "mean_delta": mean,
+        "sem": sem,
+        "threshold": threshold,
+        "all_seed_same_sign": all(delta > 0.0 for delta in deltas),
+    }
+
+
+def improvement_retention(
+    indexed: dict[tuple[str, str, str, str, str], dict[int, dict[str, object]]],
+    numerator: tuple[str, str, str, str, str],
+    denominator: tuple[str, str, str, str, str],
+    metric: str,
+    random_value: float,
+    threshold: float,
+) -> dict[str, object]:
+    if numerator not in indexed or denominator not in indexed:
+        return {"complete": False, "passed": False, "reason": "missing group"}
+    seeds = sorted(set(indexed[numerator]) & set(indexed[denominator]))
+    if seeds != [0, 1, 2]:
+        return {"complete": False, "passed": False, "reason": f"expected seeds 0,1,2; found {seeds}"}
+    numerator_mean = statistics.mean(float(indexed[numerator][seed][metric]) for seed in seeds)
+    denominator_mean = statistics.mean(float(indexed[denominator][seed][metric]) for seed in seeds)
+    retention = (numerator_mean - random_value) / max(denominator_mean - random_value, 1e-12)
+    return {
+        "complete": True,
+        "passed": retention >= threshold,
+        "retention": retention,
+        "threshold": threshold,
+        "numerator_mean": numerator_mean,
+        "denominator_mean": denominator_mean,
+        "random_value": random_value,
+    }
+
+
+def absolute_group_gate(
+    indexed: dict[tuple[str, str, str, str, str], dict[int, dict[str, object]]],
+    key: tuple[str, str, str, str, str],
+    metric: str,
+    threshold: float,
+    direction: str = "above",
+) -> dict[str, object]:
+    if key not in indexed or sorted(indexed[key]) != [0, 1, 2]:
+        return {"complete": False, "passed": False, "reason": "missing three-seed group"}
+    values = [float(indexed[key][seed][metric]) for seed in (0, 1, 2)]
+    mean, sem = mean_sem(values)
+    passed = mean >= threshold if direction == "above" else mean <= threshold
+    return {"complete": True, "passed": passed, "mean": mean, "sem": sem, "threshold": threshold, "direction": direction}
+
+
 def architecture_svg() -> str:
     boxes = (
         (20, 65, 140, 54, "EMNIST image", "784 pixels"),
@@ -1019,6 +1089,9 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
                 **config,
                 "relation_parameters": result["relation_parameters"],
                 "best_epoch": result["best_epoch"],
+                "train_pairs_per_second": result.get("train_pairs_per_second", math.nan),
+                "relation_execution_class": result.get("relation_execution", {}).get("execution_class", "unrecorded"),
+                "torch_direct_pairs_per_second": result.get("relation_execution", {}).get("torch_direct_pairs_per_second", math.nan),
                 **{f"test_{key}": value for key, value in result["test"].items()},
             }
         )
@@ -1034,16 +1107,85 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
     aggregate: list[dict[str, object]] = []
     for key, group in sorted(groups.items()):
         record: dict[str, object] = dict(zip(("task", "split_mode", "payload_mode", "objective", "decoder"), key))
-        for metric in ("test_pair_roc_auc", "test_pair_pr_auc", "test_pair_accuracy", "test_random_recall_at_16", "test_random_hit_at_1"):
+        for metric in (
+            "test_pair_roc_auc",
+            "test_pair_macro_roc_auc",
+            "test_pair_adjacent_accuracy",
+            "test_pair_pr_auc",
+            "test_pair_accuracy",
+            "test_random_recall_at_16",
+            "test_random_hit_at_1",
+            "train_pairs_per_second",
+            "torch_direct_pairs_per_second",
+        ):
             values = [float(row[metric]) for row in group if metric in row]
             if values:
                 record[f"{metric}_mean"], record[f"{metric}_sem"] = mean_sem(values)
         aggregate.append(record)
+    indexed: dict[tuple[str, str, str, str, str], dict[int, dict[str, object]]] = {}
+    for result in results:
+        config = result["config"]
+        key = (
+            str(config["task"]),
+            str(config["split_mode"]),
+            str(config["payload_mode"]),
+            str(config["objective"]),
+            str(config["decoder"]),
+        )
+        indexed.setdefault(key, {})[int(config["seed"])] = result["test"]
+    class_root = ("same_class", "class", "float", "relation_only", "root_incidence")
+    class_same = ("same_class", "class", "float", "relation_only", "same_table_full")
+    class_joint = ("same_class", "class", "float", "relation_only", "jointpair_t16")
+    class_coxeter = ("same_class", "class", "float", "relation_only", "global_coxeter_r12")
+    class_free = ("same_class", "class", "float", "relation_only", "global_free_r12")
+    object_root = ("same_class", "object", "float", "relation_only", "root_incidence")
+    class_binary_root = ("same_class", "class", "binary01", "relation_only", "root_incidence")
+    class_aux_root = ("same_class", "class", "float", "relation_aux", "root_incidence")
+    digit_root = ("digit_greater", "object", "float", "relation_only", "root_incidence")
+    digit_dense = ("digit_greater", "object", "float", "relation_only", "dense_qk_r16")
+    digit_same = ("digit_greater", "object", "float", "relation_only", "same_table_full")
+    gates = {
+        "root_vs_same_table": paired_metric_gate(indexed, class_root, class_same, "random_recall_at_16"),
+        "root_vs_budget_matched_jointpair": paired_metric_gate(indexed, class_root, class_joint, "random_recall_at_16"),
+        "coxeter_sharing_vs_free_rank12": paired_metric_gate(indexed, class_coxeter, class_free, "random_recall_at_16"),
+        "root_class_transfer": improvement_retention(indexed, class_root, object_root, "random_recall_at_16", 16.0 / 512.0, 0.70),
+        "root_binary_retention": improvement_retention(indexed, class_binary_root, class_root, "random_recall_at_16", 16.0 / 512.0, 0.90),
+        "root_relation_only_vs_aux": improvement_retention(indexed, class_root, class_aux_root, "random_recall_at_16", 16.0 / 512.0, 0.80),
+        "digit_root_auc": absolute_group_gate(indexed, digit_root, "macro_roc_auc", 0.85),
+        "digit_root_vs_same_table": paired_metric_gate(indexed, digit_root, digit_same, "macro_roc_auc"),
+    }
+    digit_dense_gap = {"complete": False, "passed": False, "reason": "missing groups"}
+    if digit_root in indexed and digit_dense in indexed and sorted(indexed[digit_root]) == sorted(indexed[digit_dense]) == [0, 1, 2]:
+        root_mean = statistics.mean(float(indexed[digit_root][seed]["macro_roc_auc"]) for seed in (0, 1, 2))
+        dense_mean = statistics.mean(float(indexed[digit_dense][seed]["macro_roc_auc"]) for seed in (0, 1, 2))
+        digit_dense_gap = {
+            "complete": True,
+            "passed": root_mean >= dense_mean - 0.02,
+            "root_mean": root_mean,
+            "dense_mean": dense_mean,
+            "allowed_gap": 0.02,
+        }
+    gates["digit_root_within_dense"] = digit_dense_gap
+    complete_gates = all(bool(gate.get("complete")) for gate in gates.values())
+    native_kernel_pass = bool(gates["root_vs_same_table"].get("passed")) and bool(
+        gates["root_vs_budget_matched_jointpair"].get("passed")
+    )
+    coxeter_sharing_pass = bool(gates["coxeter_sharing_vs_free_rank12"].get("passed"))
+    digit_pass = all(
+        bool(gates[name].get("passed"))
+        for name in ("digit_root_auc", "digit_root_vs_same_table", "digit_root_within_dense")
+    )
+    semantic_pass = complete_gates and (native_kernel_pass or coxeter_sharing_pass or digit_pass)
     decision = {
         "complete_runs": len(results),
         "groups": len(aggregate),
-        "random_recall_at_16": 16.0 / 512.0,
-        "note": "Scientific gates are evaluated only when every preregistered three-seed group is complete.",
+        "all_preregistered_gates_complete": complete_gates,
+        "native_root_kernel_passed": native_kernel_pass,
+        "coxeter_sharing_passed": coxeter_sharing_pass,
+        "digit_anisotropic_kernel_passed": digit_pass,
+        "semantic_gate_passed": semantic_pass,
+        "next_stage": "relation_quantization" if semantic_pass else "stop",
+        "gates": gates,
     }
     (args.result_dir / "decision.json").write_text(json.dumps(decision, indent=2) + "\n")
     figure = args.out_report.parent / "figures" / "emnist_pair_global_coxeter_kernel.svg"
@@ -1069,6 +1211,13 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
             f"{float(auc):.4f} | {float(recall):.4f} |"
         )
     lines += [
+        "",
+        "## Preregistered decision",
+        "",
+        f"- Native root kernel gate: `{'PASS' if native_kernel_pass else 'FAIL'}`.",
+        f"- Coxeter sharing gate: `{'PASS' if coxeter_sharing_pass else 'FAIL'}`.",
+        f"- Digit anisotropic gate: `{'PASS' if digit_pass else 'FAIL'}`.",
+        f"- Next stage: `{decision['next_stage']}`.",
         "",
         "## Interpretation boundary",
         "",
