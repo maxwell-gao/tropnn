@@ -1195,14 +1195,26 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
     rows: list[dict[str, object]] = []
     for result in results:
         config = result["config"]
+        execution = result.get("relation_execution", {})
         rows.append(
             {
                 **config,
                 "relation_parameters": result["relation_parameters"],
                 "best_epoch": result["best_epoch"],
                 "train_pairs_per_second": result.get("train_pairs_per_second", math.nan),
-                "relation_execution_class": result.get("relation_execution", {}).get("execution_class", "unrecorded"),
-                "torch_direct_pairs_per_second": result.get("relation_execution", {}).get("torch_direct_pairs_per_second", math.nan),
+                "relation_execution_class": execution.get("execution_class", "unrecorded"),
+                "torch_direct_pairs_per_second": execution.get("torch_direct_pairs_per_second", math.nan),
+                "torch_cached_pairs_per_second": execution.get("torch_cached_pairs_per_second", math.nan),
+                "direct_peak_increment_bytes": execution.get("direct_peak_increment_bytes", math.nan),
+                "cached_peak_increment_bytes": execution.get("torch_cached_peak_increment_bytes", math.nan),
+                "direct_sparse_relation_reads_per_pair": execution.get(
+                    "direct_sparse_relation_reads_per_pair", math.nan
+                ),
+                "cache_relation_reads_per_object": execution.get("cache_relation_reads_per_object", math.nan),
+                "cached_pair_value_reads": execution.get("cached_pair_value_reads", math.nan),
+                "active_pair_reads": execution.get("active_pair_reads", math.nan),
+                "active_pair_products": execution.get("active_pair_products", math.nan),
+                "object_factor_reads": execution.get("object_factor_reads", math.nan),
                 **{f"test_{key}": value for key, value in result["test"].items()},
             }
         )
@@ -1218,6 +1230,8 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
     aggregate: list[dict[str, object]] = []
     for key, group in sorted(groups.items()):
         record: dict[str, object] = dict(zip(("task", "split_mode", "payload_mode", "objective", "decoder"), key))
+        record["relation_parameters"] = int(group[0]["relation_parameters"])
+        record["relation_execution_class"] = str(group[0]["relation_execution_class"])
         for metric in (
             "test_pair_roc_auc",
             "test_pair_macro_roc_auc",
@@ -1228,8 +1242,15 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
             "test_random_hit_at_1",
             "train_pairs_per_second",
             "torch_direct_pairs_per_second",
+            "torch_cached_pairs_per_second",
+            "direct_peak_increment_bytes",
+            "cached_peak_increment_bytes",
         ):
-            values = [float(row[metric]) for row in group if metric in row]
+            values = [
+                float(row[metric])
+                for row in group
+                if metric in row and math.isfinite(float(row[metric]))
+            ]
             if values:
                 record[f"{metric}_mean"], record[f"{metric}_sem"] = mean_sem(values)
         aggregate.append(record)
@@ -1305,26 +1326,63 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
     lines = [
         "# Global Coxeter and Root-Incidence Kernels on Real EMNIST Pairs",
         "",
+        "## Protocol and evidence",
+        "",
+        f"This report aggregates {len(results)} complete, from-scratch end-to-end runs. Formal comparisons require the fixed "
+        "three-seed protocol. Raw checkpoints and logs remain in the result directory and are not committed; exact split, pair, "
+        "and retrieval-set fingerprints are stored in each formal result JSON.",
+        "",
+        "Reproduction entry point: `scripts/run_tropnn_emnist_pair_relation_kernel_3gpu.sh`. The launcher records GPU, PID, "
+        "configuration, output, and log paths in its manifest and locks learning rates before the capacity and formal stages.",
+        "",
         "## Architecture",
         "",
         f"![architecture]({figure.relative_to(args.out_report.parent)})",
         "",
         "## Aggregate results",
         "",
-        "| Task | Split | Payload | Objective | Decoder | ROC-AUC | Recall@16 |",
-        "|---|---|---|---|---|---:|---:|",
+        "| Task | Split | Payload | Objective | Decoder | Params | ROC-AUC | Recall@16 | Direct Mpairs/s | Cached Mpairs/s |",
+        "|---|---|---|---|---|---:|---:|---:|---:|---:|",
     ]
     for row in aggregate:
         auc = row.get("test_pair_roc_auc_mean", math.nan)
         recall = row.get("test_random_recall_at_16_mean", math.nan)
+        direct = float(row.get("torch_direct_pairs_per_second_mean", math.nan)) / 1e6
+        cached = float(row.get("torch_cached_pairs_per_second_mean", math.nan)) / 1e6
+        direct_text = f"{direct:.3f}" if math.isfinite(direct) else "—"
+        cached_text = f"{cached:.3f}" if math.isfinite(cached) else "—"
         lines.append(
             f"| {row['task']} | {row['split_mode']} | {row['payload_mode']} | {row['objective']} | {row['decoder']} | "
-            f"{float(auc):.4f} | {float(recall):.4f} |"
+            f"{int(row['relation_parameters']):,} | {float(auc):.4f} | {float(recall):.4f} | {direct_text} | {cached_text} |"
+        )
+    frontier_rows = [
+        row
+        for row in aggregate
+        if row["task"] == "same_class"
+        and row["split_mode"] == "object"
+        and row["payload_mode"] == "float"
+        and row["objective"] == "relation_only"
+    ]
+    lines += [
+        "",
+        "## Capacity frontier",
+        "",
+        "Rank is an experimental capacity coordinate, not an intrinsic dimension of the ordinal space.",
+        "",
+        "| Decoder | Relation parameters | Recall@16 | ROC-AUC |",
+        "|---|---:|---:|---:|",
+    ]
+    for row in frontier_rows:
+        lines.append(
+            f"| {row['decoder']} | {int(row['relation_parameters']):,} | "
+            f"{float(row.get('test_random_recall_at_16_mean', math.nan)):.4f} | "
+            f"{float(row.get('test_pair_roc_auc_mean', math.nan)):.4f} |"
         )
     lines += [
         "",
         "## Preregistered decision",
         "",
+        f"- All preregistered gates complete: `{'YES' if complete_gates else 'NO'}`.",
         f"- Native root kernel gate: `{'PASS' if native_kernel_pass else 'FAIL'}`.",
         f"- Coxeter sharing gate: `{'PASS' if coxeter_sharing_pass else 'FAIL'}`.",
         f"- Digit anisotropic gate: `{'PASS' if digit_pass else 'FAIL'}`.",
