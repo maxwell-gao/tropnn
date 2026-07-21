@@ -303,6 +303,26 @@ class RootIncidenceKernel(PairKernelBase):
         operator[self.rows, self.columns] = self.weight
         return operator
 
+    def transform_roots(self, roots: Tensor, *, transpose: bool = False) -> Tensor:
+        """Cache ``M c`` using only supported entries and scatter-adds."""
+
+        source = self.rows if transpose else self.columns
+        destination = self.columns if transpose else self.rows
+        result = torch.zeros_like(roots)
+        result.scatter_add_(1, destination.view(1, -1).expand(roots.shape[0], -1), roots[:, source] * self.weight)
+        return result
+
+    def cached_score(self, query_roots: Tensor, key_roots: Tensor, *, symmetry: str = "none") -> Tensor:
+        forward = (query_roots * self.transform_roots(key_roots)).sum(dim=-1) + self.bias
+        if symmetry == "none":
+            return forward
+        reverse = (key_roots * self.transform_roots(query_roots)).sum(dim=-1) + self.bias
+        if symmetry == "symmetric":
+            return 0.5 * (forward + reverse)
+        if symmetry == "antisymmetric":
+            return 0.5 * (forward - reverse)
+        raise ValueError("symmetry must be none, symmetric, or antisymmetric")
+
 
 class CoxeterPairScorer(nn.Module):
     """Apply a hard S4 pair kernel with an exact-forward adjacent-wall STE."""

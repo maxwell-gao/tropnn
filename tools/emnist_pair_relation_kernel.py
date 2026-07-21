@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -60,6 +61,14 @@ class PairExperimentConfig:
     encoder_tables: int
     encoder_comparisons: int
     train_pairs_per_epoch: int
+    eval_pairs: int
+    retrieval_queries: int
+    retrieval_candidates: int
+    retrieval_positives: int
+    hard_reservoir: int
+    data_split_seed: int
+    max_train_examples: int
+    max_eval_examples: int
 
 
 @dataclass(frozen=True)
@@ -138,6 +147,17 @@ def load_task_splits(data_root: Path, task: TaskName, split_mode: SplitMode, see
     validation, test = stratified_half_split(test_images, test_labels, seed)
     classes = tuple(int(value) for value in torch.unique(train_labels, sorted=True).tolist())
     return TaskSplits(TensorSplit(train_images, train_labels), validation, test, classes)
+
+
+def split_fingerprint(split: TensorSplit) -> str:
+    """Stable lightweight identity for labels and selected image contents."""
+
+    digest = hashlib.sha256()
+    digest.update(str(tuple(split.images.shape)).encode())
+    digest.update(split.labels.contiguous().numpy().tobytes())
+    pixel_sum = ((split.images + 1.0) * 127.5).round().to(torch.int64).sum(dim=1)
+    digest.update(pixel_sum.contiguous().numpy().tobytes())
+    return digest.hexdigest()
 
 
 def remap_auxiliary_labels(labels: Tensor, classes: tuple[int, ...]) -> Tensor:
@@ -494,6 +514,24 @@ def pair_metrics(target: Tensor, prediction: Tensor) -> dict[str, float]:
     }
 
 
+def digit_relation_metrics(labels: Tensor, pairs: PairIndices, prediction: Tensor) -> dict[str, float]:
+    query_label = labels[pairs.query].cpu()
+    key_label = labels[pairs.key].cpu()
+    target = pairs.target.cpu()
+    prediction = prediction.cpu()
+    per_query_auc: list[float] = []
+    for label in torch.unique(query_label, sorted=True):
+        mask = query_label == label
+        values = target[mask]
+        if bool((values == 0).any()) and bool((values == 1).any()):
+            per_query_auc.append(roc_auc(values, prediction[mask]))
+    adjacent = (query_label - key_label).abs() == 1
+    return {
+        "macro_roc_auc": statistics.mean(per_query_auc) if per_query_auc else math.nan,
+        "adjacent_accuracy": float(((prediction[adjacent] > 0) == (target[adjacent] > 0.5)).float().mean().item()),
+    }
+
+
 def retrieval_metrics(relevant: Tensor, prediction: Tensor, top_k: int = 16) -> dict[str, float]:
     relevant = relevant.bool().cpu()
     prediction = prediction.float().cpu()
@@ -558,6 +596,8 @@ def evaluate_model(
     pairs = sample_pair_indices(split.labels, task, eval_pairs, seed)
     prediction = score_coordinate_pairs(model, coordinates[pairs.query], coordinates[pairs.key], device, batch_size)
     metrics = {f"pair_{key}": value for key, value in pair_metrics(pairs.target, prediction).items()}
+    if task == "digit_greater":
+        metrics.update({f"pair_{key}": value for key, value in digit_relation_metrics(split.labels, pairs, prediction).items()})
     if task == "same_class":
         retrieval_modes = (("random", False), ("hard", True)) if include_hard else (("random", False),)
         for name, hard in retrieval_modes:
@@ -575,6 +615,108 @@ def evaluate_model(
             scores = score_coordinate_pairs(model, query, key, device, batch_size).view(retrieval.candidates.shape)
             metrics.update({f"{name}_{key}": value for key, value in retrieval_metrics(retrieval.relevant, scores).items()})
     return metrics
+
+
+def _sync(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+@torch.no_grad()
+def relation_execution_metadata(
+    model: PairRelationModel,
+    device: torch.device,
+    *,
+    pairs: int = 8192,
+    warmups: int = 3,
+    iterations: int = 10,
+) -> dict[str, float | int | str]:
+    model.eval()
+    generator = torch.Generator(device="cpu").manual_seed(model.config.seed + 8093)
+    query = torch.randn(pairs, model.config.relation_dim, generator=generator, device=device)
+    key = torch.randn(pairs, model.config.relation_dim, generator=generator, device=device)
+
+    def time_call(function) -> float:
+        for _ in range(warmups):
+            function()
+        _sync(device)
+        started = time.perf_counter()
+        for _ in range(iterations):
+            function()
+        _sync(device)
+        return (time.perf_counter() - started) / (iterations * pairs)
+
+    seconds_per_pair = time_call(lambda: model.score(query, key))
+    result: dict[str, float | int | str] = {
+        "torch_direct_pairs_per_second": 1.0 / max(seconds_per_pair, 1e-30),
+        "benchmark_pairs": pairs,
+        "benchmark_warmups": warmups,
+        "benchmark_iterations": iterations,
+    }
+    kind, value = parse_decoder_name(model.config.decoder)
+    if kind in {"kendall", "mallows", "same_table_full"}:
+        result.update({"execution_class": "same-chart relation LUT", "active_pair_reads": model.config.relation_tables})
+    elif kind == "global_free":
+        assert value is not None
+        result.update(
+            {
+                "execution_class": "separable free chamber tower",
+                "object_factor_reads": model.config.relation_tables * value,
+                "active_pair_products": value,
+            }
+        )
+    elif kind == "global_coxeter":
+        assert value is not None
+        result.update(
+            {
+                "execution_class": "separable shared Coxeter tower",
+                "object_factor_reads": model.config.relation_tables * 12 * value,
+                "active_pair_products": value,
+            }
+        )
+    elif kind == "jointpair_t":
+        assert value is not None
+        result.update({"execution_class": "nonseparable pair LUT", "active_pair_reads": value})
+    elif kind == "dense_qk":
+        assert value is not None
+        result.update({"execution_class": "dense QK diagnostic", "dense_projection_products_per_object": 2 * model.config.relation_dim * value})
+    elif kind == "concat_mlp":
+        result.update({"execution_class": "dense concat-MLP diagnostic", "dense_pair_products": 2 * model.config.relation_dim * 128 + 128})
+
+    if isinstance(model.relation, CoxeterPairScorer) and isinstance(model.relation.kernel, RootIncidenceKernel):
+        router = model.relation.router
+        kernel = model.relation.kernel
+        query_features = router.route(query)
+        key_features = router.route(key)
+        direct_seconds = time_call(lambda: model.relation._score_features(query_features, key_features))
+        cached_seconds = time_call(
+            lambda: kernel.cached_score(query_features.roots, key_features.roots, symmetry=model.relation.symmetry)
+        )
+        transform_seconds = time_call(lambda: kernel.transform_roots(key_features.roots))
+        torch.testing.assert_close(
+            model.relation._score_features(query_features, key_features),
+            kernel.cached_score(query_features.roots, key_features.roots, symmetry=model.relation.symmetry),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        result.update(
+            {
+                "execution_class": "comparison-root sparse operator",
+                "direct_sparse_relation_reads_per_pair": int(kernel.weight.numel()),
+                "cache_relation_reads_per_object": int(kernel.weight.numel()),
+                "cached_pair_reads": router.roots,
+                "cached_pair_add_sub": router.roots,
+                "torch_precomputed_root_direct_pairs_per_second": 1.0 / max(direct_seconds, 1e-30),
+                "torch_cached_pairs_per_second": 1.0 / max(cached_seconds, 1e-30),
+                "torch_cache_transforms_per_second": 1.0 / max(transform_seconds, 1e-30),
+            }
+        )
+    return result
+
+
+def validate_completed_config(existing: dict[str, object], config: PairExperimentConfig, path: Path) -> None:
+    if existing.get("config") != asdict(config):
+        raise ValueError(f"completed result config mismatch at {path}")
 
 
 def _atomic_torch_save(value: object, path: Path) -> None:
@@ -612,19 +754,26 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
         encoder_tables=args.encoder_tables,
         encoder_comparisons=args.encoder_comparisons,
         train_pairs_per_epoch=args.train_pairs_per_epoch,
+        eval_pairs=args.eval_pairs,
+        retrieval_queries=args.retrieval_queries,
+        retrieval_candidates=args.retrieval_candidates,
+        retrieval_positives=args.retrieval_positives,
+        hard_reservoir=args.hard_reservoir,
+        data_split_seed=args.data_split_seed,
+        max_train_examples=args.max_train_examples,
+        max_eval_examples=args.max_eval_examples,
     )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     result_path = args.out_dir / "result.json"
     if result_path.exists():
         existing = json.loads(result_path.read_text())
         if existing.get("complete"):
-            if existing.get("config") != asdict(config):
-                raise ValueError(f"completed result config mismatch at {result_path}")
+            validate_completed_config(existing, config, result_path)
             print(json.dumps({"status": "skipped_complete", "result": str(result_path)}), flush=True)
             return existing
 
     seed_everything(config.seed)
-    splits = load_task_splits(args.data_root, config.task, config.split_mode)
+    splits = load_task_splits(args.data_root, config.task, config.split_mode, config.data_split_seed)
     if args.max_train_examples > 0:
         splits = TaskSplits(
             TensorSplit(splits.train.images[: args.max_train_examples], splits.train.labels[: args.max_train_examples]),
@@ -654,7 +803,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
     best_metric = float("-inf")
     best_epoch = 0
     checkpoint_path = args.out_dir / "best.pt"
+    for incomplete in (args.out_dir / "history.csv", checkpoint_path):
+        if incomplete.exists():
+            incomplete.rename(incomplete.with_name(f"{incomplete.stem}.incomplete-{int(time.time())}{incomplete.suffix}"))
     started = time.perf_counter()
+    training_seconds = 0.0
+    optimizer_steps = 0
     for epoch in range(1, config.epochs + 1):
         model.train()
         pairs = sample_pair_indices(splits.train.labels, config.task, pair_count, config.seed + 1009 * epoch)
@@ -662,6 +816,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
         relation_loss_sum = 0.0
         auxiliary_loss_sum = 0.0
         seen = 0
+        training_started = time.perf_counter()
         for start in range(0, pairs.target.numel(), config.batch_size):
             stop = min(start + config.batch_size, pairs.target.numel())
             query, key, query_aux, key_aux, _ = encode_unique_pair_batch(model, splits.train.images, pairs, start, stop, device)
@@ -678,11 +833,14 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            optimizer_steps += 1
             batch = stop - start
             loss_sum += float(loss.item()) * batch
             relation_loss_sum += float(relation_loss.item()) * batch
             auxiliary_loss_sum += float(auxiliary_loss.item()) * batch
             seen += batch
+        _sync(device)
+        training_seconds += time.perf_counter() - training_started
         validation = evaluate_model(
             model,
             splits.validation,
@@ -697,7 +855,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
             hard_reservoir=args.hard_reservoir,
             include_hard=False,
         )
-        selection = validation["random_recall_at_16"] if config.task == "same_class" else validation["pair_roc_auc"]
+        selection = validation["random_recall_at_16"] if config.task == "same_class" else validation["pair_macro_roc_auc"]
         row: dict[str, object] = {
             "epoch": epoch,
             "train_loss": loss_sum / seen,
@@ -770,12 +928,31 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
         "train_examples": splits.train.labels.numel(),
         "validation_examples": splits.validation.labels.numel(),
         "test_examples": splits.test.labels.numel(),
+        "split_fingerprints": {
+            "train": split_fingerprint(splits.train),
+            "validation": split_fingerprint(splits.validation),
+            "test": split_fingerprint(splits.test),
+        },
         "class_train": list(CLASS_TRAIN) if config.split_mode == "class" else None,
         "class_validation": list(CLASS_VALID) if config.split_mode == "class" else None,
         "class_test": list(CLASS_TEST) if config.split_mode == "class" else None,
         "validation": validation,
         "test": test,
         "router": router_metadata,
+        "evaluation_protocol": {
+            "pair_seed_validation": config.seed + 3001,
+            "pair_seed_test": config.seed + 4001,
+            "hard_seed_offset": 101,
+            "eval_pairs": config.eval_pairs,
+            "retrieval_queries": config.retrieval_queries,
+            "retrieval_candidates": config.retrieval_candidates,
+            "retrieval_positives": config.retrieval_positives,
+            "hard_reservoir": config.hard_reservoir,
+        },
+        "optimizer_steps": optimizer_steps,
+        "training_seconds": training_seconds,
+        "train_pairs_per_second": config.epochs * pair_count / max(training_seconds, 1e-30),
+        "relation_execution": relation_execution_metadata(model, device),
         "elapsed_seconds": time.perf_counter() - started,
     }
     temporary = result_path.with_suffix(".json.tmp")
@@ -1001,6 +1178,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--retrieval-candidates", type=int, default=512)
     run.add_argument("--retrieval-positives", type=int, default=16)
     run.add_argument("--hard-reservoir", type=int, default=4096)
+    run.add_argument("--data-split-seed", type=int, default=1729)
     run.add_argument("--max-train-examples", type=int, default=0)
     run.add_argument("--max-eval-examples", type=int, default=0)
     run.add_argument("--data-root", type=Path, default=Path("data"))

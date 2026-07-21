@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from types import SimpleNamespace
 
+import pytest
 import torch
 from tropnn.tools.emnist_pair_relation_kernel import (
     CLASS_TEST,
@@ -14,11 +16,13 @@ from tropnn.tools.emnist_pair_relation_kernel import (
     binary_payload_is_valid,
     build_retrieval_set,
     check_frontier_gate,
+    digit_relation_metrics,
     pair_metrics,
     retrieval_metrics,
     sample_pair_indices,
     select_learning_rates,
     stratified_half_split,
+    validate_completed_config,
 )
 
 
@@ -96,6 +100,14 @@ def _config(payload_mode: str = "float", decoder: str = "root_incidence") -> Pai
         encoder_tables=2,
         encoder_comparisons=2,
         train_pairs_per_epoch=16,
+        eval_pairs=32,
+        retrieval_queries=4,
+        retrieval_candidates=16,
+        retrieval_positives=2,
+        hard_reservoir=32,
+        data_split_seed=1729,
+        max_train_examples=0,
+        max_eval_examples=0,
     )
 
 
@@ -110,9 +122,53 @@ def test_small_model_is_end_to_end_trainable() -> None:
     assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in model.relation.parameters())
 
 
+def test_small_end_to_end_model_reduces_a_fixed_pair_loss() -> None:
+    torch.manual_seed(61)
+    model = PairRelationModel(_config(decoder="dense_qk_r4"), auxiliary_classes=4)
+    images = torch.randn(16, 784, generator=torch.Generator().manual_seed(67))
+    query_index = torch.arange(8)
+    key_index = torch.arange(8, 16)
+    target = torch.arange(8).remainder(2).float()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
+
+    def loss_value() -> torch.Tensor:
+        coordinates, _ = model.encoder(images)
+        return torch.nn.functional.binary_cross_entropy_with_logits(
+            model.score(coordinates[query_index], coordinates[key_index]),
+            target,
+        )
+
+    initial = float(loss_value().item())
+    for _ in range(30):
+        loss = loss_value()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+    final = float(loss_value().item())
+    assert final < 0.9 * initial
+
+
 def test_binary_encoder_materializes_only_binary_payloads() -> None:
     model = PairRelationModel(_config("binary01", "dense_qk_r4"), auxiliary_classes=4)
     assert binary_payload_is_valid(model)
+
+
+def test_digit_metrics_report_macro_query_auc_and_adjacent_accuracy() -> None:
+    labels = torch.arange(5).repeat_interleave(8)
+    pairs = sample_pair_indices(labels, "digit_greater", 2000, 31)
+    prediction = (labels[pairs.query] - labels[pairs.key]).float()
+    metrics = digit_relation_metrics(labels, pairs, prediction)
+    assert metrics["macro_roc_auc"] == 1.0
+    assert metrics["adjacent_accuracy"] == 1.0
+
+
+def test_completed_result_config_mismatch_is_rejected(tmp_path) -> None:
+    config = _config()
+    validate_completed_config({"config": asdict(config)}, config, tmp_path / "result.json")
+    changed = asdict(config)
+    changed["eval_pairs"] = 999
+    with pytest.raises(ValueError, match="config mismatch"):
+        validate_completed_config({"config": changed}, config, tmp_path / "result.json")
 
 
 def _fake_result(decoder: str, payload: str, encoder_lr: float, relation_lr: float, score: float, seed: int = 0) -> dict[str, object]:

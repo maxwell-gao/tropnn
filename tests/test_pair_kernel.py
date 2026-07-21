@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from tropnn.layers.pair_kernel import (
     BalancedS4Router,
@@ -36,6 +38,19 @@ def test_root_sparse_score_matches_explicit_dense_operator() -> None:
     key = router.route(torch.randn(17, 32, generator=torch.Generator().manual_seed(19)))
     expected = ((query.roots @ kernel.dense_operator(router.roots)) * key.roots).sum(dim=-1) + kernel.bias
     torch.testing.assert_close(kernel.hard_score(query, key), expected)
+    torch.testing.assert_close(kernel.cached_score(query.roots, key.roots), expected)
+    symmetric = 0.5 * (expected + ((key.roots @ kernel.dense_operator(router.roots)) * query.roots).sum(dim=-1) + kernel.bias)
+    torch.testing.assert_close(kernel.cached_score(query.roots, key.roots, symmetry="symmetric"), symmetric)
+
+
+def test_root_signs_decode_the_globally_labelled_coordinate_comparisons() -> None:
+    router = BalancedS4Router(seed=21)
+    coordinates = torch.randn(13, 32, generator=torch.Generator().manual_seed(22))
+    features = router.route(coordinates)
+    edges = router.root_edges
+    expected = torch.where(coordinates[:, edges[:, 0]] > coordinates[:, edges[:, 1]], 1.0, -1.0)
+    expected /= math.sqrt(router.roots)
+    torch.testing.assert_close(features.roots, expected)
 
 
 def test_global_rank_twelve_and_same_table_match_payload_budget() -> None:
