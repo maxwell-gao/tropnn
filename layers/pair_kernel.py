@@ -358,4 +358,3 @@ class CoxeterPairScorer(nn.Module):
         if self.training and (query_coordinates.requires_grad or key_coordinates.requires_grad):
             hard_score = hard_score + self._ste_correction(query, key, hard_score)
         return hard_score
-
