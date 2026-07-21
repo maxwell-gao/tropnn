@@ -170,6 +170,11 @@ def test_binary_encoder_materializes_only_binary_payloads() -> None:
     assert binary_payload_is_valid(model)
 
 
+def test_joint_pair_controls_match_preregistered_relation_budgets() -> None:
+    assert PairRelationModel(_config(decoder="jointpair_t16"), auxiliary_classes=4).relation_parameters == 1025
+    assert PairRelationModel(_config(decoder="jointpair_t144"), auxiliary_classes=4).relation_parameters == 9217
+
+
 def test_digit_metrics_report_macro_query_auc_and_adjacent_accuracy() -> None:
     labels = torch.arange(5).repeat_interleave(8)
     pairs = sample_pair_indices(labels, "digit_greater", 2000, 31)

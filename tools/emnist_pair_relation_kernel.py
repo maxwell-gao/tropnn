@@ -403,10 +403,12 @@ class JointPairLUT(nn.Module):
             seed=seed + 701,
             lut_init_std=0.02,
             lut_dtype="fp32",
+            fixed_zero_threshold=True,
         )
+        self.bias = nn.Parameter(torch.zeros(()))
 
     def forward(self, query: Tensor, key: Tensor) -> Tensor:
-        return self.layer(torch.cat((query, key), dim=-1)).squeeze(1).squeeze(-1)
+        return self.layer(torch.cat((query, key), dim=-1)).squeeze(1).squeeze(-1) + self.bias
 
 
 def parse_decoder_name(name: str) -> tuple[str, int | None]:
