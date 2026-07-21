@@ -91,3 +91,4 @@ def test_pair_scorer_ste_preserves_forward_and_supplies_coordinate_gradients() -
     train_score.sum().backward()
     assert query.grad is not None and torch.isfinite(query.grad).all() and query.grad.abs().sum() > 0
     assert key.grad is not None and torch.isfinite(key.grad).all() and key.grad.abs().sum() > 0
+    assert kernel.weight.grad is not None and torch.isfinite(kernel.weight.grad).all() and kernel.weight.grad.abs().sum() > 0

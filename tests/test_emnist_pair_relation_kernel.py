@@ -13,6 +13,7 @@ from tropnn.tools.emnist_pair_relation_kernel import (
     PairExperimentConfig,
     PairRelationModel,
     TensorSplit,
+    _atomic_torch_save,
     binary_payload_is_valid,
     build_retrieval_set,
     check_frontier_gate,
@@ -95,6 +96,14 @@ def test_metrics_have_known_perfect_values() -> None:
     assert retrieval["recall_at_16"] == 1.0
     assert retrieval["hit_at_1"] == 1.0
     assert retrieval["mrr"] == 1.0
+    assert retrieval["ndcg_at_16"] == 1.0
+
+
+def test_checkpoint_write_is_atomic(tmp_path) -> None:
+    checkpoint = tmp_path / "best.pt"
+    _atomic_torch_save({"value": torch.tensor([1, 2, 3])}, checkpoint)
+    assert torch.equal(torch.load(checkpoint, weights_only=True)["value"], torch.tensor([1, 2, 3]))
+    assert not checkpoint.with_suffix(".pt.tmp").exists()
 
 
 def _config(payload_mode: str = "float", decoder: str = "root_incidence") -> PairExperimentConfig:
