@@ -22,6 +22,7 @@ from tropnn.tools.emnist_pair_relation_kernel import (
     paired_metric_gate,
     retrieval_metrics,
     sample_pair_indices,
+    sample_training_pair_indices,
     select_learning_rates,
     stratified_half_split,
     validate_completed_config,
@@ -53,9 +54,23 @@ def test_same_class_pairs_are_balanced_and_never_self_pairs() -> None:
     assert torch.equal(labels[pairs.query] == labels[pairs.key], pairs.target.bool())
 
 
+def test_default_training_epoch_uses_every_object_once_per_pair_polarity() -> None:
+    labels = torch.arange(5).repeat_interleave(20)
+    pairs = sample_training_pair_indices(labels, "same_class", 12)
+    assert pairs.target.numel() == 2 * labels.numel()
+    assert torch.equal(torch.bincount(pairs.query), torch.full((labels.numel(),), 2))
+    positive_queries = torch.bincount(pairs.query[pairs.target.bool()], minlength=labels.numel())
+    negative_queries = torch.bincount(pairs.query[~pairs.target.bool()], minlength=labels.numel())
+    assert torch.equal(positive_queries, torch.ones(labels.numel(), dtype=torch.long))
+    assert torch.equal(negative_queries, torch.ones(labels.numel(), dtype=torch.long))
+    assert bool((pairs.query != pairs.key).all())
+    assert torch.equal(labels[pairs.query] == labels[pairs.key], pairs.target.bool())
+
+
 def test_digit_relation_pairs_match_label_order() -> None:
     labels = torch.arange(10).repeat_interleave(20)
     pairs = sample_pair_indices(labels, "digit_greater", 1000, 13)
+    assert pairs.target.sum() == 500
     assert bool((labels[pairs.query] != labels[pairs.key]).all())
     assert torch.equal(labels[pairs.query] > labels[pairs.key], pairs.target.bool())
 

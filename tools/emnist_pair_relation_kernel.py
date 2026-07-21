@@ -160,6 +160,15 @@ def split_fingerprint(split: TensorSplit) -> str:
     return digest.hexdigest()
 
 
+def index_fingerprint(*tensors: Tensor) -> str:
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        value = tensor.detach().cpu().contiguous()
+        digest.update(str((str(value.dtype), tuple(value.shape))).encode())
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
 def remap_auxiliary_labels(labels: Tensor, classes: tuple[int, ...]) -> Tensor:
     result = torch.full_like(labels, -1)
     for index, label in enumerate(classes):
@@ -192,7 +201,7 @@ def sample_pair_indices(labels: Tensor, task: TaskName, count: int, seed: int) -
     if count < 2:
         raise ValueError("pair count must be at least two")
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    classes, groups = _class_indices(labels)
+    _classes, groups = _class_indices(labels)
     query_parts: list[Tensor] = []
     key_parts: list[Tensor] = []
     target_parts: list[Tensor] = []
@@ -217,15 +226,50 @@ def sample_pair_indices(labels: Tensor, task: TaskName, count: int, seed: int) -
         key_parts.append(_sample_group_members(groups, right_class, generator))
         target_parts.append(torch.zeros(negative_count))
     else:
-        left_class = torch.randint(len(groups), (count,), generator=generator)
-        right_offset = torch.randint(1, len(groups), (count,), generator=generator)
-        right_class = (left_class + right_offset) % len(groups)
-        query_parts.append(_sample_group_members(groups, left_class, generator))
-        key_parts.append(_sample_group_members(groups, right_class, generator))
-        target_parts.append((classes[left_class] > classes[right_class]).to(torch.float32))
+        first_class = torch.randint(len(groups), (count,), generator=generator)
+        second_offset = torch.randint(1, len(groups), (count,), generator=generator)
+        second_class = (first_class + second_offset) % len(groups)
+        lower_class = torch.minimum(first_class, second_class)
+        upper_class = torch.maximum(first_class, second_class)
+        target = torch.cat((torch.ones(count // 2), torch.zeros(count - count // 2)))
+        target = target[torch.randperm(count, generator=generator)]
+        query_class = torch.where(target.bool(), upper_class, lower_class)
+        key_class = torch.where(target.bool(), lower_class, upper_class)
+        query_parts.append(_sample_group_members(groups, query_class, generator))
+        key_parts.append(_sample_group_members(groups, key_class, generator))
+        target_parts.append(target)
     query = torch.cat(query_parts)
     key = torch.cat(key_parts)
     target = torch.cat(target_parts)
+    order = torch.randperm(query.numel(), generator=generator)
+    return PairIndices(query[order], key[order], target[order])
+
+
+def sample_training_pair_indices(labels: Tensor, task: TaskName, seed: int) -> PairIndices:
+    """Build the preregistered default epoch: two query roles per object.
+
+    For ``same_class`` every training object is used exactly once as the query
+    of a positive pair and once as the query of a negative pair.  The digit
+    task has no per-object query requirement, so it draws the same total
+    number of uniformly sampled, distinct-class pairs.
+    """
+
+    if task == "digit_greater":
+        return sample_pair_indices(labels, task, 2 * labels.numel(), seed)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    classes, groups = _class_indices(labels)
+    query = torch.arange(labels.numel())
+    class_codes = torch.searchsorted(classes, labels)
+    positive_key = torch.empty_like(query)
+    for group in groups:
+        offsets = torch.randint(1, group.numel(), (group.numel(),), generator=generator)
+        positive_key[group] = group[(torch.arange(group.numel()) + offsets) % group.numel()]
+    negative_offset = torch.randint(1, len(groups), (labels.numel(),), generator=generator)
+    negative_class = (class_codes + negative_offset) % len(groups)
+    negative_key = _sample_group_members(groups, negative_class, generator)
+    query = torch.cat((query, query))
+    key = torch.cat((positive_key, negative_key))
+    target = torch.cat((torch.ones(labels.numel()), torch.zeros(labels.numel())))
     order = torch.randperm(query.numel(), generator=generator)
     return PairIndices(query[order], key[order], target[order])
 
@@ -591,9 +635,17 @@ def evaluate_model(
     retrieval_positives: int,
     hard_reservoir: int,
     include_hard: bool = True,
+    fingerprint_sink: dict[str, str] | None = None,
+    fingerprint_prefix: str = "",
 ) -> dict[str, float]:
     coordinates, _ = encode_split(model, split, device, batch_size)
     pairs = sample_pair_indices(split.labels, task, eval_pairs, seed)
+    if fingerprint_sink is not None:
+        fingerprint_sink[f"{fingerprint_prefix}pairs"] = index_fingerprint(
+            pairs.query,
+            pairs.key,
+            pairs.target,
+        )
     prediction = score_coordinate_pairs(model, coordinates[pairs.query], coordinates[pairs.key], device, batch_size)
     metrics = {f"pair_{key}": value for key, value in pair_metrics(pairs.target, prediction).items()}
     if task == "digit_greater":
@@ -610,6 +662,12 @@ def evaluate_model(
                 hard=hard,
                 hard_reservoir=hard_reservoir,
             )
+            if fingerprint_sink is not None:
+                fingerprint_sink[f"{fingerprint_prefix}{name}_retrieval"] = index_fingerprint(
+                    retrieval.query,
+                    retrieval.candidates,
+                    retrieval.relevant,
+                )
             query = coordinates[retrieval.query][:, None, :].expand(-1, retrieval.candidates.shape[1], -1).reshape(-1, coordinates.shape[1])
             key = coordinates[retrieval.candidates.reshape(-1)]
             scores = score_coordinate_pairs(model, query, key, device, batch_size).view(retrieval.candidates.shape)
@@ -811,7 +869,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
     optimizer_steps = 0
     for epoch in range(1, config.epochs + 1):
         model.train()
-        pairs = sample_pair_indices(splits.train.labels, config.task, pair_count, config.seed + 1009 * epoch)
+        if config.train_pairs_per_epoch:
+            pairs = sample_pair_indices(splits.train.labels, config.task, pair_count, config.seed + 1009 * epoch)
+        else:
+            pairs = sample_training_pair_indices(splits.train.labels, config.task, config.seed + 1009 * epoch)
         loss_sum = 0.0
         relation_loss_sum = 0.0
         auxiliary_loss_sum = 0.0
@@ -883,6 +944,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device).eval()
+    evaluation_set_fingerprints: dict[str, str] = {}
     validation = evaluate_model(
         model,
         splits.validation,
@@ -895,6 +957,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
         retrieval_candidates=args.retrieval_candidates,
         retrieval_positives=args.retrieval_positives,
         hard_reservoir=args.hard_reservoir,
+        fingerprint_sink=evaluation_set_fingerprints,
+        fingerprint_prefix="validation_",
     )
     test = evaluate_model(
         model,
@@ -908,6 +972,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
         retrieval_candidates=args.retrieval_candidates,
         retrieval_positives=args.retrieval_positives,
         hard_reservoir=args.hard_reservoir,
+        fingerprint_sink=evaluation_set_fingerprints,
+        fingerprint_prefix="test_",
     )
     router_metadata = {}
     if model.router is not None:
@@ -940,6 +1006,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
         "test": test,
         "router": router_metadata,
         "evaluation_protocol": {
+            "training_pairs": "one positive and one negative query role per object per epoch"
+            if not config.train_pairs_per_epoch and config.task == "same_class"
+            else "uniform distinct-class sampling",
             "pair_seed_validation": config.seed + 3001,
             "pair_seed_test": config.seed + 4001,
             "hard_seed_offset": 101,
@@ -948,6 +1017,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
             "retrieval_candidates": config.retrieval_candidates,
             "retrieval_positives": config.retrieval_positives,
             "hard_reservoir": config.hard_reservoir,
+            "set_fingerprints": evaluation_set_fingerprints,
         },
         "optimizer_steps": optimizer_steps,
         "training_seconds": training_seconds,
@@ -1044,8 +1114,8 @@ def architecture_svg() -> str:
         (605, 20, 170, 54, "16 balanced K4 charts", "p_t in S4"),
         (605, 110, 170, 54, "Global roots", "c(h), E about 96"),
         (820, 20, 190, 54, "Global chamber kernel", "free / Coxeter shared"),
-        (820, 110, 190, 54, "Root-incidence kernel", "c(q)^T M c(k)"),
-        (1055, 65, 120, 54, "Pair logit", "BCE / retrieval"),
+        (820, 110, 190, 54, "Root-incidence kernel", "per-object cache: M c(h)"),
+        (1055, 65, 120, 54, "Pair logit", "per-pair root +/- reads"),
     )
     parts = [
         '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="190" viewBox="0 0 1200 190">',
