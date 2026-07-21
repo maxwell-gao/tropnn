@@ -1363,11 +1363,28 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
         and row["payload_mode"] == "float"
         and row["objective"] == "relation_only"
     ]
+    root_frontier = next((row for row in frontier_rows if row["decoder"] == "root_incidence"), None)
+    nearest_rank_notes: list[str] = []
+    if root_frontier is not None:
+        root_parameters = int(root_frontier["relation_parameters"])
+        for label, prefix in (("Free Global", "global_free_r"), ("Shared Coxeter", "global_coxeter_r")):
+            candidates = [row for row in frontier_rows if str(row["decoder"]).startswith(prefix)]
+            if candidates:
+                nearest = min(
+                    candidates,
+                    key=lambda row: (abs(int(row["relation_parameters"]) - root_parameters), str(row["decoder"])),
+                )
+                nearest_rank_notes.append(
+                    f"The closest tested {label} point to root-incidence ({root_parameters:,} parameters) is "
+                    f"`{nearest['decoder']}` ({int(nearest['relation_parameters']):,} parameters)."
+                )
     lines += [
         "",
         "## Capacity frontier",
         "",
         "Rank is an experimental capacity coordinate, not an intrinsic dimension of the ordinal space.",
+        "",
+        *nearest_rank_notes,
         "",
         "| Decoder | Relation parameters | Recall@16 | ROC-AUC |",
         "|---|---:|---:|---:|",
