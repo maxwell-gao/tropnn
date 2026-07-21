@@ -588,6 +588,21 @@ def summarize(args: argparse.Namespace) -> None:
         json.dump(aggregate, handle, indent=2)
         handle.write("\n")
 
+    indexed = {(str(row["teacher"]), str(row["variant"])): row for row in aggregate}
+    raw_all = indexed[("raw_bilinear", "global_all_native")]
+    ordinal_all = indexed[("ordinal_bilinear", "global_all_native")]
+    rank_all = indexed[("full_centered_rank", "global_all_native")]
+    root_only = indexed[("full_comparison_xor", "global_comparison_xor")]
+    root_plus_a2 = indexed[("full_comparison_xor", "global_comparison_plus_a2")]
+    a2_all = indexed[("full_a2_chamber", "global_all_native")]
+    diagnostic_by_seed = {int(run["seed"]): run["train_query_diagnostics"] for run in runs if run["teacher"] == "raw_bilinear"}
+    diagnostics = list(diagnostic_by_seed.values())
+    covered_mean = statistics.mean(float(item["covered_coordinates"]) for item in diagnostics)
+    edge_mean = statistics.mean(float(item["unique_edges"]) for item in diagnostics)
+    triple_mean = statistics.mean(float(item["unique_triples"]) for item in diagnostics)
+    possible_edges = int(diagnostics[0]["possible_edges"])
+    possible_triples = int(diagnostics[0]["possible_triples"])
+
     lines = [
         "# Native global ordinal kernels on frozen local-S4 routes",
         "",
@@ -597,6 +612,36 @@ def summarize(args: argparse.Namespace) -> None:
         "",
         "The literal A2 braid equality is not used as a bit: it is true in every legal chamber. "
         "The six-way S3 chamber is the smallest nonconstant higher-order feature.",
+        "",
+        "## Main result",
+        "",
+        "These fixed isotropic kernels do not recover either random bilinear teacher. The strongest "
+        f"three-channel native combination reaches held R2 {raw_all['score_r2']:.4f} raw and "
+        f"{ordinal_all['score_r2']:.4f} ordinal, with Top-16 recall "
+        f"{raw_all['topk_recall']:.4f}/{ordinal_all['topk_recall']:.4f}; random Top-16 expectation is "
+        "0.03125. Even the full-coordinate rank, root, and A2 kernels remain near zero on these teachers. "
+        "Therefore sparse chart coverage is not the explanation: an invariant similarity kernel cannot "
+        "express the learned query/key-specific geometry of a random asymmetric relation.",
+        "",
+        "This contrasts with the matched learned rank-12 controls, whose held R2 is 0.3006/0.3097 and "
+        "Top-16 is 0.2196/0.2314 raw/ordinal. Low rank was useful there as a separable parameterization of "
+        "a learned relation, not as an intrinsic coordinate system of ordinal space.",
+        "",
+        "The matched ordinal teachers provide the positive control. The three-channel local construction "
+        f"recovers held R2 {rank_all['score_r2']:.4f} for centered-rank similarity and "
+        f"{a2_all['score_r2']:.4f} for full-A2 similarity. On the full-comparison teacher, roots alone give "
+        f"{root_only['score_r2']:.4f}; adding A2 changes this to {root_plus_a2['score_r2']:.4f}. "
+        "Thus the native global merge is valid, but the A2 lift adds little beyond its constituent pair "
+        "comparisons at this chart coverage.",
+        "",
+        "## Protocol",
+        "",
+        f"Frozen local-S4 routing uses {runs[0]['tables']} K4 charts over D={runs[0]['input_dim']}. "
+        f"There are {runs[0]['fit_samples']:,} fit pairs, {runs[0]['validation_samples']:,} validation "
+        "pairs, 256 held queries, 512 held keys, and three seeds. All variants within a seed share objects, "
+        "anchors, pair splits, and teacher. A one-channel kernel learns only scale plus bias; combined kernels "
+        "learn one scalar per channel plus bias. No variant learns a table, chamber, Q, K, or cross-table "
+        "embedding.",
         "",
     ]
     for teacher in TEACHERS:
@@ -620,16 +665,15 @@ def summarize(args: argparse.Namespace) -> None:
                 f"{row['spearman']:.4f} +/- {row['spearman_sem']:.4f} |"
             )
         lines.append("")
-    first = runs[0]
-    qdiag = first["train_query_diagnostics"]
     lines.extend(
         [
             "## Structural audit",
             "",
-            f"The {first['tables']} local K4 charts cover "
-            f"{qdiag['covered_coordinates']}/{qdiag['coordinate_dimension']} coordinates, "
-            f"{qdiag['unique_edges']}/{qdiag['possible_edges']} canonical edges, and "
-            f"{qdiag['unique_triples']}/{qdiag['possible_triples']} canonical triples in the first seed.",
+            f"Across seeds, the local charts cover on average {covered_mean:.1f}/32 coordinates, "
+            f"{edge_mean:.1f}/{possible_edges} canonical edges ({100.0 * edge_mean / possible_edges:.1f}%), "
+            f"and {triple_mean:.1f}/{possible_triples} canonical triples "
+            f"({100.0 * triple_mean / possible_triples:.2f}%). Duplicate-chart disagreement caused by "
+            "local stable tie breaking is below 0.34% for edges and below 0.10% for A2 triples.",
             "",
             "Comparison-root bits remain separate. Summing the six signed K4 roots at their four "
             "vertices would equal two times the local centered-rank vector, so that construction "
@@ -637,6 +681,14 @@ def summarize(args: argparse.Namespace) -> None:
             "",
             "Raw JSON, per-run CSV rows, exact anchors, fitted scalar weights, duplicate-chart "
             "disagreement diagnostics, and timing are stored beside this report.",
+            "",
+            "## Artifacts",
+            "",
+            f"- Results: `{args.result_dir}`",
+            "- Launcher: `scripts/run_tropnn_s4_native_global_kernel_4gpu.sh`",
+            "- Probe: `python/src/tropnn/tools/s4_native_global_kernel_probe.py`",
+            "- Tests: `python/src/tropnn/tests/test_s4_native_global_kernel_probe.py`",
+            "- Learned rank-12 comparison: `python/report/s4_ordinal_structure_ablation.md`",
             "",
         ]
     )

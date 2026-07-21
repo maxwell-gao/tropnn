@@ -71,7 +71,7 @@ def test_a2_centered_chamber_kernel_is_one_or_minus_one_fifth() -> None:
     different_score = pair_channels(representation, representation, different_everywhere, batch_size=1)[0, 2]
     torch.testing.assert_close(same_score, torch.tensor(1.0))
     # Reversing the first three coordinates changes every one of the four local triples here.
-    assert different_score < 1.0
+    torch.testing.assert_close(different_score, torch.tensor(-0.2))
 
 
 def test_duplicate_charts_merge_to_identical_native_features_without_ties() -> None:
