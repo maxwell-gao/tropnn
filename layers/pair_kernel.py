@@ -313,10 +313,29 @@ class RootIncidenceKernel(PairKernelBase):
         return result
 
     def cached_score(self, query_roots: Tensor, key_roots: Tensor, *, symmetry: str = "none") -> Tensor:
-        forward = (query_roots * self.transform_roots(key_roots)).sum(dim=-1) + self.bias
+        return self.score_from_cache(
+            query_roots,
+            key_roots,
+            self.transform_roots(query_roots),
+            self.transform_roots(key_roots),
+            symmetry=symmetry,
+        )
+
+    def score_from_cache(
+        self,
+        query_roots: Tensor,
+        key_roots: Tensor,
+        transformed_query_roots: Tensor,
+        transformed_key_roots: Tensor,
+        *,
+        symmetry: str = "none",
+    ) -> Tensor:
+        """Score pairs after each object's sparse ``M c`` transform is cached."""
+
+        forward = (query_roots * transformed_key_roots).sum(dim=-1) + self.bias
         if symmetry == "none":
             return forward
-        reverse = (key_roots * self.transform_roots(query_roots)).sum(dim=-1) + self.bias
+        reverse = (key_roots * transformed_query_roots).sum(dim=-1) + self.bias
         if symmetry == "symmetric":
             return 0.5 * (forward + reverse)
         if symmetry == "antisymmetric":

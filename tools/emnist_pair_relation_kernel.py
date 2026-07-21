@@ -706,12 +706,27 @@ def relation_execution_metadata(
         _sync(device)
         return (time.perf_counter() - started) / (iterations * pairs)
 
+    def peak_increment_bytes(function) -> int:
+        if device.type != "cuda":
+            return 0
+        _sync(device)
+        baseline = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        function()
+        _sync(device)
+        return max(0, torch.cuda.max_memory_allocated(device) - baseline)
+
     seconds_per_pair = time_call(lambda: model.score(query, key))
     result: dict[str, float | int | str] = {
         "torch_direct_pairs_per_second": 1.0 / max(seconds_per_pair, 1e-30),
         "benchmark_pairs": pairs,
         "benchmark_warmups": warmups,
         "benchmark_iterations": iterations,
+        "benchmark_mode": "forward_only_warm",
+        "input_dtype": str(query.dtype),
+        "device": torch.cuda.get_device_name(device) if device.type == "cuda" else str(device),
+        "direct_peak_increment_bytes": peak_increment_bytes(lambda: model.score(query, key)),
+        "packed_payload_cache": "not applicable to relation scorer",
     }
     kind, value = parse_decoder_name(model.config.decoder)
     if kind in {"kendall", "mallows", "same_table_full"}:
@@ -748,14 +763,28 @@ def relation_execution_metadata(
         kernel = model.relation.kernel
         query_features = router.route(query)
         key_features = router.route(key)
+        transformed_query_roots = kernel.transform_roots(query_features.roots)
+        transformed_key_roots = kernel.transform_roots(key_features.roots)
         direct_seconds = time_call(lambda: model.relation._score_features(query_features, key_features))
         cached_seconds = time_call(
-            lambda: kernel.cached_score(query_features.roots, key_features.roots, symmetry=model.relation.symmetry)
+            lambda: kernel.score_from_cache(
+                query_features.roots,
+                key_features.roots,
+                transformed_query_roots,
+                transformed_key_roots,
+                symmetry=model.relation.symmetry,
+            )
         )
         transform_seconds = time_call(lambda: kernel.transform_roots(key_features.roots))
         torch.testing.assert_close(
             model.relation._score_features(query_features, key_features),
-            kernel.cached_score(query_features.roots, key_features.roots, symmetry=model.relation.symmetry),
+            kernel.score_from_cache(
+                query_features.roots,
+                key_features.roots,
+                transformed_query_roots,
+                transformed_key_roots,
+                symmetry=model.relation.symmetry,
+            ),
             rtol=1e-5,
             atol=1e-5,
         )
@@ -764,11 +793,21 @@ def relation_execution_metadata(
                 "execution_class": "comparison-root sparse operator",
                 "direct_sparse_relation_reads_per_pair": int(kernel.weight.numel()),
                 "cache_relation_reads_per_object": int(kernel.weight.numel()),
-                "cached_pair_reads": router.roots,
+                "cached_pair_value_reads": router.roots,
+                "cached_pair_sign_reads": router.roots,
                 "cached_pair_add_sub": router.roots,
                 "torch_precomputed_root_direct_pairs_per_second": 1.0 / max(direct_seconds, 1e-30),
                 "torch_cached_pairs_per_second": 1.0 / max(cached_seconds, 1e-30),
                 "torch_cache_transforms_per_second": 1.0 / max(transform_seconds, 1e-30),
+                "torch_cached_peak_increment_bytes": peak_increment_bytes(
+                    lambda: kernel.score_from_cache(
+                        query_features.roots,
+                        key_features.roots,
+                        transformed_query_roots,
+                        transformed_key_roots,
+                        symmetry=model.relation.symmetry,
+                    )
+                ),
             }
         )
     return result

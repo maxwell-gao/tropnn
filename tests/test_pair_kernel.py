@@ -39,6 +39,15 @@ def test_root_sparse_score_matches_explicit_dense_operator() -> None:
     expected = ((query.roots @ kernel.dense_operator(router.roots)) * key.roots).sum(dim=-1) + kernel.bias
     torch.testing.assert_close(kernel.hard_score(query, key), expected)
     torch.testing.assert_close(kernel.cached_score(query.roots, key.roots), expected)
+    torch.testing.assert_close(
+        kernel.score_from_cache(
+            query.roots,
+            key.roots,
+            kernel.transform_roots(query.roots),
+            kernel.transform_roots(key.roots),
+        ),
+        expected,
+    )
     symmetric = 0.5 * (expected + ((key.roots @ kernel.dense_operator(router.roots)) * query.roots).sum(dim=-1) + kernel.bias)
     torch.testing.assert_close(kernel.cached_score(query.roots, key.roots, symmetry="symmetric"), symmetric)
 
