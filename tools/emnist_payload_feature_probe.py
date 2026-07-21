@@ -618,11 +618,17 @@ def _projector_overlap(left: Tensor, right: Tensor) -> float:
 
 
 @contextmanager
-def _project_hidden_payloads(model: FeatureProbeEmnistClassifier, bases: Sequence[Tensor] | None) -> Iterator[None]:
+def _project_hidden_payloads(
+    model: FeatureProbeEmnistClassifier,
+    bases: Sequence[Tensor] | None,
+    *,
+    force_continuous: bool = False,
+) -> Iterator[None]:
     if bases is None:
         yield
         return
     originals = [block.lut.detach().clone() for block in model.blocks]
+    original_modes = [block.payload_mode for block in model.blocks]
     try:
         with torch.no_grad():
             for block, basis in zip(model.blocks, bases, strict=True):
@@ -630,11 +636,14 @@ def _project_hidden_payloads(model: FeatureProbeEmnistClassifier, bases: Sequenc
                 rows = block.materialized_lut().detach().reshape(-1, block.output_dim)
                 basis = basis.to(device=rows.device, dtype=rows.dtype)
                 block.lut.copy_((rows @ basis @ basis.T).reshape_as(block.lut))
+                if force_continuous:
+                    block.payload_mode = "float"
         yield
     finally:
         with torch.no_grad():
-            for block, original in zip(model.blocks, originals, strict=True):
+            for block, original, payload_mode in zip(model.blocks, originals, original_modes, strict=True):
                 block.lut.copy_(original)
+                block.payload_mode = payload_mode
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -819,24 +828,34 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
         for rank in transfer_ranks:
             if rank == dimension:
                 continue
-            for name, full_bases in (("target_own", own_full), ("other_seed_shared", shared_full), ("random", random_full)):
-                rank_bases = [basis[:, :rank] for basis in full_bases]
-                with _project_hidden_payloads(model, rank_bases):
-                    loss, acc, seen = _evaluate(model, valid_loader, device=device, limit=args.transfer_valid_examples)
-                transfer_rows.append(
-                    {
-                        "target_seed": target_seed,
-                        "payload_mode": payload_mode,
-                        "post_projection_mode": "binary_rethreshold" if payload_mode == "binary01" else "continuous",
-                        "basis": name,
-                        "rank": rank,
-                        "valid_loss": loss,
-                        "valid_acc": acc,
-                        "accuracy_retention": acc / max(baseline_acc, 1e-30),
-                        "loss_delta": loss - baseline_loss,
-                        "valid_examples": seen,
-                    }
-                )
+            projection_modes = ("continuous", "binary_rethreshold") if payload_mode == "binary01" else ("continuous",)
+            for projection_mode in projection_modes:
+                for name, full_bases in (
+                    ("target_own", own_full),
+                    ("other_seed_shared", shared_full),
+                    ("random", random_full),
+                ):
+                    rank_bases = [basis[:, :rank] for basis in full_bases]
+                    with _project_hidden_payloads(
+                        model,
+                        rank_bases,
+                        force_continuous=projection_mode == "continuous" and payload_mode == "binary01",
+                    ):
+                        loss, acc, seen = _evaluate(model, valid_loader, device=device, limit=args.transfer_valid_examples)
+                    transfer_rows.append(
+                        {
+                            "target_seed": target_seed,
+                            "payload_mode": payload_mode,
+                            "post_projection_mode": projection_mode,
+                            "basis": name,
+                            "rank": rank,
+                            "valid_loss": loss,
+                            "valid_acc": acc,
+                            "accuracy_retention": acc / max(baseline_acc, 1e-30),
+                            "loss_delta": loss - baseline_loss,
+                            "valid_examples": seen,
+                        }
+                    )
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()

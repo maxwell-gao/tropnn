@@ -108,3 +108,26 @@ def test_binary_projection_rethresholds_and_restores_master() -> None:
         torch.testing.assert_close(block.materialized_lut()[..., 2:], torch.zeros_like(block.lut[..., 2:]))
 
     torch.testing.assert_close(block.lut, original)
+
+
+def test_binary_projection_can_expose_continuous_diagnostic_and_restore_mode() -> None:
+    model = _build_model(
+        ModelConfig(depth=1, tables=2, comparisons=2, payload_mode="binary01"),
+        classes=3,
+        seed=0,
+    )
+    block = model.blocks[0]
+    with torch.no_grad():
+        block.lut.zero_()
+        block.lut[..., 0] = 1.0
+    original = block.lut.detach().clone()
+    basis = torch.zeros(28 * 28, 1)
+    basis[0, 0] = 2**-0.5
+    basis[1, 0] = 2**-0.5
+
+    with _project_hidden_payloads(model, [basis], force_continuous=True):
+        assert block.payload_mode == "float"
+        torch.testing.assert_close(block.materialized_lut()[..., :2], torch.full_like(block.lut[..., :2], 0.5))
+
+    assert block.payload_mode == "binary01"
+    torch.testing.assert_close(block.lut, original)
