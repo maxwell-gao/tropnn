@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator, Sequence
+from typing import Iterator, Literal, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -31,7 +31,9 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from tropnn.tools.emnist_payload_dtype_sweep import _build_local_loaders
-from tropnn.tools.emnist_payload_width import PayloadWidthEmnistClassifier, PayloadWidthLUTLayer
+from tropnn.tools.emnist_payload_width import PayloadWidthLUTLayer
+
+PayloadMode = Literal["float", "binary01"]
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class ModelConfig:
     anchor_policy: str = "permuted"
     residual_scale: float = 1.0
     lut_init_std: float = 0.0
+    payload_mode: PayloadMode = "float"
 
 
 @dataclass
@@ -103,38 +106,71 @@ def _seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _build_model(config: ModelConfig, *, classes: int, seed: int) -> PayloadWidthEmnistClassifier:
-    return PayloadWidthEmnistClassifier(
-        input_dim=28 * 28,
-        classes=classes,
-        depth=config.depth,
-        tables=config.tables,
-        comparisons=config.comparisons,
-        variant="full_vector",
-        anchor_policy=config.anchor_policy,
-        seed=seed,
-        lut_init_std=config.lut_init_std,
-        write_degree=16,
-        walsh_lut_dtype="int2",
-        walsh_order=2,
-        walsh_coeff_init_std=0.02,
-        walsh_slope_order=2,
-        walsh_slope_coeff_init_std=0.02,
-        walsh_slope_generator_init_std=0.02,
-        residual_scale=config.residual_scale,
-        use_output_scaling=True,
-        use_min_margin_ste=True,
-        comparator_kc=4,
-        comparator_write_policy="endpoint",
-        comparator_reduction_layout="scatter",
-        comparator_output_tile_size=32,
-        compare_swap_alpha_init=0.0,
-        compare_swap_pair_count=0,
-        correction_gate_init=0.0,
-        correction_kc=48,
-        correction_init_std=0.02,
-        route_affine_pair_count=0,
-    )
+class FeatureProbeLUTLayer(PayloadWidthLUTLayer):
+    """Full-vector layer with either float or binary-{0,1} lookup semantics."""
+
+    def __init__(self, input_dim: int, output_dim: int, *, payload_mode: PayloadMode, **kwargs: object) -> None:
+        super().__init__(
+            input_dim,
+            output_dim,
+            variant="full_vector",
+            write_degree=output_dim,
+            **kwargs,
+        )
+        self.payload_mode = payload_mode
+
+    def materialized_lut(self) -> Tensor:
+        if self.payload_mode == "float":
+            return self.lut
+        quantized = torch.round(self.lut).clamp(0.0, 1.0)
+        return self.lut + (quantized - self.lut).detach()
+
+    def _lookup(self, indices: Tensor) -> Tensor:
+        table_offsets = torch.arange(self.tables, device=indices.device, dtype=torch.long).view(1, self.tables) * self.table_size
+        flat_indices = (indices + table_offsets).reshape(-1)
+        rows = self.materialized_lut().reshape(self.tables * self.table_size, self.payload_width).index_select(0, flat_indices)
+        return rows.view(indices.shape[0], self.tables, self.payload_width)
+
+
+class FeatureProbeEmnistClassifier(nn.Module):
+    """Residual classifier kept state-dict compatible with the earlier probe."""
+
+    def __init__(self, config: ModelConfig, *, classes: int, seed: int) -> None:
+        super().__init__()
+
+        def layer(output_dim: int, layer_seed: int) -> FeatureProbeLUTLayer:
+            return FeatureProbeLUTLayer(
+                28 * 28,
+                output_dim,
+                tables=config.tables,
+                comparisons=config.comparisons,
+                payload_mode=config.payload_mode,
+                anchor_policy=config.anchor_policy,
+                seed=layer_seed,
+                lut_init_std=config.lut_init_std,
+                use_output_scaling=True,
+                use_min_margin_ste=True,
+            )
+
+        self.blocks = nn.ModuleList(layer(28 * 28, seed + 101 * index) for index in range(config.depth))
+        self.readout = layer(classes, seed + 10007)
+        self.residual_scale = float(config.residual_scale)
+        self.last_routes: list[Tensor] = []
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = x.flatten(start_dim=1).float()
+        routes: list[Tensor] = []
+        for block in self.blocks:
+            write, indices = block.compute(y)
+            y = y + self.residual_scale * write
+            routes.append(indices.detach())
+        logits, _indices = self.readout.compute(y)
+        self.last_routes = routes
+        return logits
+
+
+def _build_model(config: ModelConfig, *, classes: int, seed: int) -> FeatureProbeEmnistClassifier:
+    return FeatureProbeEmnistClassifier(config, classes=classes, seed=seed)
 
 
 def _data_args(args: argparse.Namespace, *, seed: int, shuffle_batch_size: int | None = None) -> SimpleNamespace:
@@ -208,14 +244,22 @@ def train_checkpoint(args: argparse.Namespace) -> None:
         anchor_policy=args.anchor_policy,
         residual_scale=args.residual_scale,
         lut_init_std=args.lut_init_std,
+        payload_mode=args.payload_mode,
     )
     if checkpoint.exists():
         existing = torch.load(checkpoint, map_location="cpu", weights_only=True)
         if bool(existing.get("complete", False)):
             expected = (args.seed, args.epochs, asdict(config))
-            found = (int(existing["seed"]), int(existing["epochs"]), existing["model_config"])
+            found_config = asdict(ModelConfig(**existing["model_config"]))
+            found = (int(existing["seed"]), int(existing["epochs"]), found_config)
             if found != expected:
                 raise ValueError(f"completed checkpoint config mismatch: expected {expected}, found {found}")
+            optimizer_config = existing.get("optimizer_config")
+            if optimizer_config is not None and (
+                float(optimizer_config["lr"]) != args.lr
+                or float(optimizer_config["weight_decay"]) != args.weight_decay
+            ):
+                raise ValueError(f"completed checkpoint optimizer mismatch: found {optimizer_config}")
             print(json.dumps({"status": "skipped_complete", "checkpoint": str(checkpoint)}), flush=True)
             return
 
@@ -270,6 +314,7 @@ def train_checkpoint(args: argparse.Namespace) -> None:
             "seed": args.seed,
             "classes": classes,
             "model_config": asdict(config),
+            "optimizer_config": {"name": "AdamW", "lr": args.lr, "weight_decay": args.weight_decay},
             "epochs": args.epochs,
             "train_examples": len(train_loader.dataset),
             "valid_examples": valid_seen,
@@ -282,7 +327,7 @@ def train_checkpoint(args: argparse.Namespace) -> None:
     print(json.dumps({"status": "complete", "checkpoint": str(checkpoint), "valid_loss": final_loss, "valid_acc": final_acc}), flush=True)
 
 
-def _load_checkpoint(path: Path, *, device: torch.device) -> tuple[PayloadWidthEmnistClassifier, dict[str, object]]:
+def _load_checkpoint(path: Path, *, device: torch.device) -> tuple[FeatureProbeEmnistClassifier, dict[str, object]]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if not checkpoint.get("complete", False):
         raise ValueError(f"checkpoint is incomplete: {path}")
@@ -293,17 +338,17 @@ def _load_checkpoint(path: Path, *, device: torch.device) -> tuple[PayloadWidthE
     return model, checkpoint
 
 
-def _make_shuffle_permutations(model: PayloadWidthEmnistClassifier, *, seed: int) -> list[Tensor]:
+def _make_shuffle_permutations(model: FeatureProbeEmnistClassifier, *, seed: int) -> list[Tensor]:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     result: list[Tensor] = []
     for block in model.blocks:
-        assert isinstance(block, PayloadWidthLUTLayer)
+        assert isinstance(block, FeatureProbeLUTLayer)
         result.append(torch.stack([torch.randperm(block.table_size, generator=generator) for _ in range(block.tables)]))
     return result
 
 
-def _shuffled_write(block: PayloadWidthLUTLayer, indices: Tensor, permutation: Tensor) -> Tensor:
+def _shuffled_write(block: FeatureProbeLUTLayer, indices: Tensor, permutation: Tensor) -> Tensor:
     tables = torch.arange(block.tables, device=indices.device).view(1, -1)
     mapped = permutation.to(indices.device)[tables, indices]
     return block._payload_to_output(block._lookup(mapped))
@@ -311,7 +356,7 @@ def _shuffled_write(block: PayloadWidthLUTLayer, indices: Tensor, permutation: T
 
 @torch.no_grad()
 def _collect_train_probe(
-    model: PayloadWidthEmnistClassifier,
+    model: FeatureProbeEmnistClassifier,
     loader: DataLoader,
     *,
     classes: int,
@@ -326,7 +371,7 @@ def _collect_train_probe(
     learned = []
     shuffled = []
     for block in model.blocks:
-        assert isinstance(block, PayloadWidthLUTLayer)
+        assert isinstance(block, FeatureProbeLUTLayer)
         usage.append(torch.zeros(block.tables, block.table_size, dtype=torch.long))
         route_class_counts.append(torch.zeros(block.tables, block.table_size, classes, dtype=torch.long))
         learned.append(FeatureMoments.zeros(classes, block.output_dim))
@@ -342,7 +387,7 @@ def _collect_train_probe(
         y = images.to(device, non_blocking=True).flatten(1).float()
         labels = labels.to(device, non_blocking=True)
         for layer_index, block in enumerate(model.blocks):
-            assert isinstance(block, PayloadWidthLUTLayer)
+            assert isinstance(block, FeatureProbeLUTLayer)
             write, indices = block.compute(y)
             shuffled_write = _shuffled_write(block, indices, permutations[layer_index])
             learned[layer_index].update(write, labels)
@@ -376,7 +421,7 @@ def _centroid_predictions(values: Tensor, centroids: Tensor, *, cosine: bool) ->
 
 @torch.no_grad()
 def _evaluate_selectivity(
-    model: PayloadWidthEmnistClassifier,
+    model: FeatureProbeEmnistClassifier,
     loader: DataLoader,
     train_state: TrainProbeState,
     *,
@@ -418,7 +463,7 @@ def _evaluate_selectivity(
         labels = labels.to(device, non_blocking=True)
         all_route_scores = class_prior.view(1, -1).expand(labels.shape[0], -1).clone()
         for layer_index, block in enumerate(model.blocks):
-            assert isinstance(block, PayloadWidthLUTLayer)
+            assert isinstance(block, FeatureProbeLUTLayer)
             write, indices = block.compute(y)
             shuffled_write = _shuffled_write(block, indices, train_state.shuffle_permutations[layer_index])
             valid_learned[layer_index].update(write, labels)
@@ -522,18 +567,22 @@ def _isotropic_rows(rows: Tensor, *, seed: int) -> Tensor:
 
 
 def _covariance_and_spectrum(
-    block: PayloadWidthLUTLayer,
+    block: FeatureProbeLUTLayer,
     usage: Tensor,
     *,
     seed: int,
-) -> tuple[Tensor, list[dict[str, object]]]:
-    rows = block.lut.detach().reshape(-1, block.output_dim).float()
+) -> tuple[dict[str, Tensor], list[dict[str, object]]]:
+    rows = block.materialized_lut().detach().reshape(-1, block.output_dim).float()
     active = int((usage > 0).sum().item())
     total_rows = int(usage.numel())
     records: list[dict[str, object]] = []
     uncentered_covariance = _weighted_covariance(rows, usage, centered=False)
+    centered_covariance = _weighted_covariance(rows, usage, centered=True)
+    payload_nonzero_fraction = float((rows != 0).float().mean().item())
+    payload_mean = float(rows.mean().item())
+    payload_std = float(rows.std().item())
     for centered in (False, True):
-        covariance = uncentered_covariance if not centered else _weighted_covariance(rows, usage, centered=True)
+        covariance = centered_covariance if centered else uncentered_covariance
         control = _weighted_covariance(_isotropic_rows(rows, seed=seed + int(centered)), usage, centered=centered)
         for kind, matrix in (("learned", covariance), ("norm_matched_isotropic", control)):
             eigenvalues, _vectors = _symmetric_eigh(matrix, eigenvectors=False)
@@ -544,10 +593,16 @@ def _covariance_and_spectrum(
                     "active_rows": active,
                     "total_rows": total_rows,
                     "active_fraction": active / max(1, total_rows),
+                    "payload_nonzero_fraction": payload_nonzero_fraction,
+                    "payload_mean": payload_mean,
+                    "payload_std": payload_std,
                     **_spectral_summary(eigenvalues),
                 }
             )
-    return uncentered_covariance.detach().cpu(), records
+    return {
+        "uncentered": uncentered_covariance.detach().cpu(),
+        "centered": centered_covariance.detach().cpu(),
+    }, records
 
 
 def _top_basis(covariance: Tensor, rank: int, *, device: torch.device) -> Tensor:
@@ -563,7 +618,7 @@ def _projector_overlap(left: Tensor, right: Tensor) -> float:
 
 
 @contextmanager
-def _project_hidden_payloads(model: PayloadWidthEmnistClassifier, bases: Sequence[Tensor] | None) -> Iterator[None]:
+def _project_hidden_payloads(model: FeatureProbeEmnistClassifier, bases: Sequence[Tensor] | None) -> Iterator[None]:
     if bases is None:
         yield
         return
@@ -571,8 +626,8 @@ def _project_hidden_payloads(model: PayloadWidthEmnistClassifier, bases: Sequenc
     try:
         with torch.no_grad():
             for block, basis in zip(model.blocks, bases, strict=True):
-                assert isinstance(block, PayloadWidthLUTLayer)
-                rows = block.lut.reshape(-1, block.output_dim)
+                assert isinstance(block, FeatureProbeLUTLayer)
+                rows = block.materialized_lut().detach().reshape(-1, block.output_dim)
                 basis = basis.to(device=rows.device, dtype=rows.dtype)
                 block.lut.copy_((rows @ basis @ basis.T).reshape_as(block.lut))
         yield
@@ -610,9 +665,14 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
     seeds = [int(item["seed"]) for item in metadata]
     if len(set(seeds)) != len(seeds):
         raise ValueError(f"checkpoint seeds must be distinct, got {seeds}")
-    configs = [item["model_config"] for item in metadata]
+    configs = [asdict(ModelConfig(**item["model_config"])) for item in metadata]
     if any(config != configs[0] for config in configs[1:]):
         raise ValueError("all checkpoints must use the same model configuration")
+    payload_mode = str(configs[0]["payload_mode"])
+    optimizer_configs = [item.get("optimizer_config", {}) for item in metadata]
+    if any(config != optimizer_configs[0] for config in optimizer_configs[1:]):
+        raise ValueError("all checkpoints must use the same optimizer configuration")
+    train_lr = optimizer_configs[0].get("lr", math.nan)
     classes = int(metadata[0]["classes"])
     args.max_train_examples = 0
     args.max_test_examples = 0
@@ -624,7 +684,7 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    covariances: dict[int, list[Tensor]] = {}
+    covariances: dict[int, list[dict[str, Tensor]]] = {}
     low_rank_rows: list[dict[str, object]] = []
     selectivity_rows: list[dict[str, object]] = []
     route_rows: list[dict[str, object]] = []
@@ -634,7 +694,15 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
         model, checkpoint = _load_checkpoint(path, device=device)
         baseline_loss, baseline_acc, baseline_seen = _evaluate(model, valid_loader, device=device)
         baseline_rows.append(
-            {"seed": seed, "valid_loss": baseline_loss, "valid_acc": baseline_acc, "valid_examples": baseline_seen, "checkpoint": str(path)}
+            {
+                "seed": seed,
+                "payload_mode": payload_mode,
+                "train_lr": train_lr,
+                "valid_loss": baseline_loss,
+                "valid_acc": baseline_acc,
+                "valid_examples": baseline_seen,
+                "checkpoint": str(path),
+            }
         )
         train_state = _collect_train_probe(
             model,
@@ -652,14 +720,14 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
             device=device,
             limit=args.probe_valid_examples,
         )
-        selectivity_rows.extend({"seed": seed, **record} for record in feature_records)
-        route_rows.extend({"seed": seed, **record} for record in route_records)
-        seed_covariances: list[Tensor] = []
+        selectivity_rows.extend({"seed": seed, "payload_mode": payload_mode, **record} for record in feature_records)
+        route_rows.extend({"seed": seed, "payload_mode": payload_mode, **record} for record in route_records)
+        seed_covariances: list[dict[str, Tensor]] = []
         for layer, (block, usage) in enumerate(zip(model.blocks, train_state.usage, strict=True)):
-            assert isinstance(block, PayloadWidthLUTLayer)
+            assert isinstance(block, FeatureProbeLUTLayer)
             covariance, records = _covariance_and_spectrum(block, usage, seed=args.control_seed + seed * 1009 + layer * 17)
             seed_covariances.append(covariance)
-            low_rank_rows.extend({"seed": seed, "layer": layer, **record} for record in records)
+            low_rank_rows.extend({"seed": seed, "payload_mode": payload_mode, "layer": layer, **record} for record in records)
         covariances[seed] = seed_covariances
         del model
         if device.type == "cuda":
@@ -668,29 +736,46 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
     dimension = int(configs[0].get("input_dim", 28 * 28)) if "input_dim" in configs[0] else 28 * 28
     alignment_ranks = _parse_ranks(args.alignment_ranks, dimension=dimension)
     alignment_rows: list[dict[str, object]] = []
-    bases: dict[tuple[int, int, int], Tensor] = {}
+    bases: dict[tuple[int, int, int, bool], Tensor] = {}
     for seed in seeds:
-        for layer, covariance in enumerate(covariances[seed]):
-            full_basis = _top_basis(covariance, max(alignment_ranks), device=device).cpu()
-            for rank in alignment_ranks:
-                bases[(seed, layer, rank)] = full_basis[:, :rank]
+        for layer, covariance_by_centering in enumerate(covariances[seed]):
+            for centered, covariance in ((False, covariance_by_centering["uncentered"]), (True, covariance_by_centering["centered"])):
+                full_basis = _top_basis(covariance, max(alignment_ranks), device=device).cpu()
+                for rank in alignment_ranks:
+                    bases[(seed, layer, rank, centered)] = full_basis[:, :rank]
     for left_index, left_seed in enumerate(seeds):
         for right_seed in seeds[left_index + 1 :]:
             for layer in range(len(covariances[left_seed])):
-                for rank in alignment_ranks:
-                    overlap = _projector_overlap(bases[(left_seed, layer, rank)], bases[(right_seed, layer, rank)])
-                    random_expected = rank / dimension
-                    alignment_rows.append(
-                        {
-                            "seed_a": left_seed,
-                            "seed_b": right_seed,
-                            "layer": layer,
-                            "rank": rank,
-                            "projector_overlap": overlap,
-                            "random_expected": random_expected,
-                            "excess_over_random": overlap - random_expected,
-                        }
-                    )
+                for centered in (False, True):
+                    for rank in alignment_ranks:
+                        covariance_key = "centered" if centered else "uncentered"
+                        left_energy = float(torch.trace(covariances[left_seed][layer][covariance_key]).item())
+                        right_energy = float(torch.trace(covariances[right_seed][layer][covariance_key]).item())
+                        subspace_valid = left_energy > 1e-12 and right_energy > 1e-12
+                        overlap = (
+                            _projector_overlap(
+                                bases[(left_seed, layer, rank, centered)], bases[(right_seed, layer, rank, centered)]
+                            )
+                            if subspace_valid
+                            else math.nan
+                        )
+                        random_expected = rank / dimension
+                        alignment_rows.append(
+                            {
+                                "seed_a": left_seed,
+                                "seed_b": right_seed,
+                                "payload_mode": payload_mode,
+                                "layer": layer,
+                                "centered": centered,
+                                "subspace_valid": subspace_valid,
+                                "seed_a_energy": left_energy,
+                                "seed_b_energy": right_energy,
+                                "rank": rank,
+                                "projector_overlap": overlap,
+                                "random_expected": random_expected,
+                                "excess_over_random": overlap - random_expected if subspace_valid else math.nan,
+                            }
+                        )
 
     transfer_ranks = _parse_ranks(args.transfer_ranks, dimension=dimension)
     transfer_rows: list[dict[str, object]] = []
@@ -700,6 +785,8 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
         transfer_rows.append(
             {
                 "target_seed": target_seed,
+                "payload_mode": payload_mode,
+                "post_projection_mode": "none",
                 "basis": "unprojected",
                 "rank": dimension,
                 "valid_loss": baseline_loss,
@@ -710,12 +797,17 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
             }
         )
         shared_covariances = [
-            sum((covariances[seed][layer] for seed in seeds if seed != target_seed), torch.zeros_like(covariances[target_seed][layer]))
+            sum(
+                (covariances[seed][layer]["uncentered"] for seed in seeds if seed != target_seed),
+                torch.zeros_like(covariances[target_seed][layer]["uncentered"]),
+            )
             / (len(seeds) - 1)
             for layer in range(len(model.blocks))
         ]
         max_rank = max(rank for rank in transfer_ranks if rank < dimension) if any(rank < dimension for rank in transfer_ranks) else 0
-        own_full = [_top_basis(covariance, max_rank, device=device) for covariance in covariances[target_seed]] if max_rank else []
+        own_full = [
+            _top_basis(covariance["uncentered"], max_rank, device=device) for covariance in covariances[target_seed]
+        ] if max_rank else []
         shared_full = [_top_basis(covariance, max_rank, device=device) for covariance in shared_covariances] if max_rank else []
         random_full: list[Tensor] = []
         if max_rank:
@@ -734,6 +826,8 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
                 transfer_rows.append(
                     {
                         "target_seed": target_seed,
+                        "payload_mode": payload_mode,
+                        "post_projection_mode": "binary_rethreshold" if payload_mode == "binary01" else "continuous",
                         "basis": name,
                         "rank": rank,
                         "valid_loss": loss,
@@ -758,6 +852,8 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
         "seeds": seeds,
         "model_config": configs[0],
         "classes": classes,
+        "payload_mode": payload_mode,
+        "optimizer_config": optimizer_configs[0],
         "probe_train_examples": args.probe_train_examples or len(train_loader.dataset),
         "probe_valid_examples": args.probe_valid_examples or len(valid_loader.dataset),
         "transfer_valid_examples": args.transfer_valid_examples or len(valid_loader.dataset),
@@ -766,6 +862,7 @@ def analyze_checkpoints(args: argparse.Namespace) -> None:
             "class_selectivity": "held-out nearest training-class centroid of each hidden write",
             "alignment": "mean squared cosine between top-k payload subspaces",
             "transfer": "target payload rows projected onto directions learned from other seeds, without fine-tuning",
+            "binary_transfer": "binary01 payloads are rethresholded to {0,1} after projection",
         },
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -799,6 +896,7 @@ def main() -> None:
     train.add_argument("--anchor-policy", default="permuted")
     train.add_argument("--residual-scale", type=float, default=1.0)
     train.add_argument("--lut-init-std", type=float, default=0.0)
+    train.add_argument("--payload-mode", choices=("float", "binary01"), default="float")
     train.add_argument("--max-train-examples", type=int, default=0)
     train.add_argument("--max-test-examples", type=int, default=0)
 

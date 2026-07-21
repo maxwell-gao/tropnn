@@ -73,3 +73,38 @@ def test_hidden_projection_is_effective_and_restored() -> None:
         torch.testing.assert_close(block.lut[..., 2:], torch.zeros_like(block.lut[..., 2:]))
 
     torch.testing.assert_close(block.lut, original)
+
+
+def test_binary_payload_materializes_zero_one_with_ste_gradient() -> None:
+    model = _build_model(
+        ModelConfig(depth=1, tables=2, comparisons=2, payload_mode="binary01"),
+        classes=3,
+        seed=0,
+    )
+    block = model.blocks[0]
+    with torch.no_grad():
+        block.lut.flatten()[:4].copy_(torch.tensor([-0.2, 0.49, 0.51, 1.2]))
+
+    values = block.materialized_lut().flatten()[:4]
+    torch.testing.assert_close(values, torch.tensor([0.0, 0.0, 1.0, 1.0]))
+    values.sum().backward()
+    torch.testing.assert_close(block.lut.grad.flatten()[:4], torch.ones(4))
+
+
+def test_binary_projection_rethresholds_and_restores_master() -> None:
+    model = _build_model(
+        ModelConfig(depth=1, tables=2, comparisons=2, payload_mode="binary01"),
+        classes=3,
+        seed=0,
+    )
+    block = model.blocks[0]
+    with torch.no_grad():
+        block.lut.bernoulli_(0.5)
+    original = block.lut.detach().clone()
+    basis = torch.eye(28 * 28)[:, :2]
+
+    with _project_hidden_payloads(model, [basis]):
+        assert set(block.materialized_lut().unique().tolist()) <= {0.0, 1.0}
+        torch.testing.assert_close(block.materialized_lut()[..., 2:], torch.zeros_like(block.lut[..., 2:]))
+
+    torch.testing.assert_close(block.lut, original)
