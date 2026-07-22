@@ -1153,10 +1153,10 @@ def architecture_svg() -> str:
         (205, 65, 180, 54, "Shared unary PC-LUT", "L4, T64/C6"),
         (430, 65, 130, 54, "Coordinates", "h in R^32"),
         (605, 20, 170, 54, "16 balanced K4 charts", "p_t in S4"),
-        (605, 110, 170, 54, "Global roots", "c(h), E about 96"),
+        (605, 110, 170, 54, "Global roots", "89-94 roots in tested seeds"),
         (820, 20, 190, 54, "Global chamber kernel", "free / Coxeter shared"),
         (820, 110, 190, 54, "Root-incidence kernel", "per-object cache: M c(h)"),
-        (1055, 65, 120, 54, "Pair logit", "per-pair root +/- reads"),
+        (1055, 65, 120, 54, "Pair logit", "89-94 signed reads"),
     )
     parts = [
         '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="190" viewBox="0 0 1200 190">',
@@ -1167,8 +1167,7 @@ def architecture_svg() -> str:
     for x, y, width, height, title, subtitle in boxes:
         parts.append(f'<rect x="{x}" y="{y}" width="{width}" height="{height}" rx="8" fill="#eef2ff" stroke="#4f46e5"/>')
         parts.append(
-            f'<text x="{x + width / 2}" y="{y + 22}" text-anchor="middle" font-family="sans-serif" '
-            f'font-size="13" font-weight="bold">{title}</text>'
+            f'<text x="{x + width / 2}" y="{y + 22}" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold">{title}</text>'
         )
         parts.append(f'<text x="{x + width / 2}" y="{y + 41}" text-anchor="middle" font-family="sans-serif" font-size="11">{subtitle}</text>')
     lines = (
@@ -1207,9 +1206,7 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
                 "torch_cached_pairs_per_second": execution.get("torch_cached_pairs_per_second", math.nan),
                 "direct_peak_increment_bytes": execution.get("direct_peak_increment_bytes", math.nan),
                 "cached_peak_increment_bytes": execution.get("torch_cached_peak_increment_bytes", math.nan),
-                "direct_sparse_relation_reads_per_pair": execution.get(
-                    "direct_sparse_relation_reads_per_pair", math.nan
-                ),
+                "direct_sparse_relation_reads_per_pair": execution.get("direct_sparse_relation_reads_per_pair", math.nan),
                 "cache_relation_reads_per_object": execution.get("cache_relation_reads_per_object", math.nan),
                 "cached_pair_value_reads": execution.get("cached_pair_value_reads", math.nan),
                 "active_pair_reads": execution.get("active_pair_reads", math.nan),
@@ -1230,7 +1227,10 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
     aggregate: list[dict[str, object]] = []
     for key, group in sorted(groups.items()):
         record: dict[str, object] = dict(zip(("task", "split_mode", "payload_mode", "objective", "decoder"), key))
-        record["relation_parameters"] = int(group[0]["relation_parameters"])
+        relation_parameters = [int(row["relation_parameters"]) for row in group]
+        record["relation_parameters"] = round(statistics.mean(relation_parameters))
+        record["relation_parameters_min"] = min(relation_parameters)
+        record["relation_parameters_max"] = max(relation_parameters)
         record["relation_execution_class"] = str(group[0]["relation_execution_class"])
         for metric in (
             "test_pair_roc_auc",
@@ -1246,11 +1246,7 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
             "direct_peak_increment_bytes",
             "cached_peak_increment_bytes",
         ):
-            values = [
-                float(row[metric])
-                for row in group
-                if metric in row and math.isfinite(float(row[metric]))
-            ]
+            values = [float(row[metric]) for row in group if metric in row and math.isfinite(float(row[metric]))]
             if values:
                 record[f"{metric}_mean"], record[f"{metric}_sem"] = mean_sem(values)
         aggregate.append(record)
@@ -1299,14 +1295,9 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
         }
     gates["digit_root_within_dense"] = digit_dense_gap
     complete_gates = all(bool(gate.get("complete")) for gate in gates.values())
-    native_kernel_pass = bool(gates["root_vs_same_table"].get("passed")) and bool(
-        gates["root_vs_budget_matched_jointpair"].get("passed")
-    )
+    native_kernel_pass = bool(gates["root_vs_same_table"].get("passed")) and bool(gates["root_vs_budget_matched_jointpair"].get("passed"))
     coxeter_sharing_pass = bool(gates["coxeter_sharing_vs_free_rank12"].get("passed"))
-    digit_pass = all(
-        bool(gates[name].get("passed"))
-        for name in ("digit_root_auc", "digit_root_vs_same_table", "digit_root_within_dense")
-    )
+    digit_pass = all(bool(gates[name].get("passed")) for name in ("digit_root_auc", "digit_root_vs_same_table", "digit_root_within_dense"))
     semantic_pass = complete_gates and (native_kernel_pass or coxeter_sharing_pass or digit_pass)
     decision = {
         "complete_runs": len(results),
@@ -1351,22 +1342,27 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
         cached = float(row.get("torch_cached_pairs_per_second_mean", math.nan)) / 1e6
         direct_text = f"{direct:.3f}" if math.isfinite(direct) else "—"
         cached_text = f"{cached:.3f}" if math.isfinite(cached) else "—"
+        parameter_min = int(row["relation_parameters_min"])
+        parameter_max = int(row["relation_parameters_max"])
+        parameter_text = f"{parameter_min:,}" if parameter_min == parameter_max else f"{parameter_min:,}-{parameter_max:,}"
         lines.append(
             f"| {row['task']} | {row['split_mode']} | {row['payload_mode']} | {row['objective']} | {row['decoder']} | "
-            f"{int(row['relation_parameters']):,} | {float(auc):.4f} | {float(recall):.4f} | {direct_text} | {cached_text} |"
+            f"{parameter_text} | {float(auc):.4f} | {float(recall):.4f} | {direct_text} | {cached_text} |"
         )
     frontier_rows = [
         row
         for row in aggregate
-        if row["task"] == "same_class"
-        and row["split_mode"] == "object"
-        and row["payload_mode"] == "float"
-        and row["objective"] == "relation_only"
+        if row["task"] == "same_class" and row["split_mode"] == "object" and row["payload_mode"] == "float" and row["objective"] == "relation_only"
     ]
     root_frontier = next((row for row in frontier_rows if row["decoder"] == "root_incidence"), None)
     nearest_rank_notes: list[str] = []
     if root_frontier is not None:
         root_parameters = int(root_frontier["relation_parameters"])
+        root_parameter_min = int(root_frontier["relation_parameters_min"])
+        root_parameter_max = int(root_frontier["relation_parameters_max"])
+        root_parameter_text = (
+            f"{root_parameter_min:,}" if root_parameter_min == root_parameter_max else f"{root_parameter_min:,}-{root_parameter_max:,}"
+        )
         for label, prefix in (("Free Global", "global_free_r"), ("Shared Coxeter", "global_coxeter_r")):
             candidates = [row for row in frontier_rows if str(row["decoder"]).startswith(prefix)]
             if candidates:
@@ -1375,7 +1371,8 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
                     key=lambda row: (abs(int(row["relation_parameters"]) - root_parameters), str(row["decoder"])),
                 )
                 nearest_rank_notes.append(
-                    f"The closest tested {label} point to root-incidence ({root_parameters:,} parameters) is "
+                    f"The closest tested {label} point to root-incidence ({root_parameter_text} parameters; "
+                    f"mean {root_parameters:,}) is "
                     f"`{nearest['decoder']}` ({int(nearest['relation_parameters']):,} parameters)."
                 )
     lines += [
@@ -1390,8 +1387,11 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
         "|---|---:|---:|---:|",
     ]
     for row in frontier_rows:
+        parameter_min = int(row["relation_parameters_min"])
+        parameter_max = int(row["relation_parameters_max"])
+        parameter_text = f"{parameter_min:,}" if parameter_min == parameter_max else f"{parameter_min:,}-{parameter_max:,}"
         lines.append(
-            f"| {row['decoder']} | {int(row['relation_parameters']):,} | "
+            f"| {row['decoder']} | {parameter_text} | "
             f"{float(row.get('test_random_recall_at_16_mean', math.nan)):.4f} | "
             f"{float(row.get('test_pair_roc_auc_mean', math.nan)):.4f} |"
         )
@@ -1405,11 +1405,26 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
         f"- Digit anisotropic gate: `{'PASS' if digit_pass else 'FAIL'}`.",
         f"- Next stage: `{decision['next_stage']}`.",
         "",
+        f"Root-incidence exceeds same-table full by `{float(gates['root_vs_same_table']['mean_delta']):.4f}` Recall@16 "
+        f"against a `{float(gates['root_vs_same_table']['threshold']):.4f}` paired threshold, and exceeds the "
+        f"budget-matched JointPair control by `{float(gates['root_vs_budget_matched_jointpair']['mean_delta']):.4f}` "
+        f"against `{float(gates['root_vs_budget_matched_jointpair']['threshold']):.4f}`. Shared Coxeter rank-12 exceeds "
+        f"free rank-12 by `{float(gates['coxeter_sharing_vs_free_rank12']['mean_delta']):.4f}` against "
+        f"`{float(gates['coxeter_sharing_vs_free_rank12']['threshold']):.4f}`.",
+        "",
+        f"The class-holdout gain retains only `{float(gates['root_class_transfer']['retention']):.1%}` of the object-holdout "
+        f"gain, below the preregistered 70% requirement. Binary unary payload retention is "
+        f"`{float(gates['root_binary_retention']['retention']):.1%}`, and relation-only training retains "
+        f"`{float(gates['root_relation_only_vs_aux']['retention']):.1%}` of the auxiliary-trained result. On digit order, "
+        f"Root-incidence macro AUC is `{float(gates['digit_root_auc']['mean']):.4f}` and remains within 0.02 of dense QK, "
+        "but it does not significantly exceed same-table full.",
+        "",
         "## Interpretation boundary",
         "",
         "This report is generated from complete result JSON files without rewriting raw logs. Dense QK and concat MLP are diagnostics; "
-        "their presence does not make the comparison-native kernels GEMM-free. Root-incidence execution is a Torch reference until a "
-        "separate matched systems gate is passed.",
+        "their presence does not make the comparison-native kernels GEMM-free. Root-incidence execution remains a Torch reference. "
+        "Post-gate binary, ternary, int2, and int4 coefficient retention plus an isolated cached-integer systems benchmark are "
+        "reported separately in `emnist_pair_relation_quantization.md`.",
         "",
     ]
     args.out_report.parent.mkdir(parents=True, exist_ok=True)
@@ -1465,9 +1480,7 @@ def check_frontier_gate(args: argparse.Namespace) -> dict[str, object]:
             and config.get("payload_mode") == "float"
             and config.get("objective") == "relation_only"
         ):
-            metrics[str(decoder)].append(
-                (float(result["validation"]["pair_roc_auc"]), float(result["validation"]["random_recall_at_16"]))
-            )
+            metrics[str(decoder)].append((float(result["validation"]["pair_roc_auc"]), float(result["validation"]["random_recall_at_16"])))
     decoder_rows: dict[str, object] = {}
     passed = False
     for decoder, values in metrics.items():

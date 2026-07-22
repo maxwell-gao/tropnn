@@ -460,7 +460,10 @@ def summarize_quantization(args: argparse.Namespace) -> dict[str, object]:
         record["seeds"] = len(members)
         record["primary_metric"] = members[0]["primary_metric"]
         record["storage_bits"] = members[0]["storage_bits"]
-        record["integer_cache_bytes_per_object"] = members[0]["integer_cache_bytes_per_object"]
+        cache_bytes = [int(member["integer_cache_bytes_per_object"]) for member in members]
+        record["integer_cache_bytes_per_object"] = statistics.mean(cache_bytes)
+        record["integer_cache_bytes_per_object_min"] = min(cache_bytes)
+        record["integer_cache_bytes_per_object_max"] = max(cache_bytes)
         for metric in (
             "full_primary",
             "quantized_primary",
@@ -483,6 +486,39 @@ def summarize_quantization(args: argparse.Namespace) -> dict[str, object]:
 
     expected = 3 * 2 * 2 * 3
     complete = len(runs) == expected and len(flat) == expected * len(QUANTIZATION_MODES)
+    systems_dir = getattr(args, "systems_result_dir", None)
+    systems_runs = [json.loads(path.read_text()) for path in sorted(systems_dir.glob("**/result.json"))] if systems_dir is not None else []
+    systems_runs = [run for run in systems_runs if run.get("complete")]
+    systems_aggregate: list[dict[str, object]] = []
+    for mode in QUANTIZATION_MODES:
+        variants = [variant for run in systems_runs for variant in run["variants"] if variant["mode"] == mode]
+        if not variants:
+            continue
+        record: dict[str, object] = {
+            "mode": mode,
+            "seeds": len(variants),
+            "storage_bits": int(variants[0]["storage_bits"]),
+        }
+        packed_bytes = [int(variant["packed_coefficient_bytes"]) for variant in variants]
+        cache_bytes = [int(variant["execution"]["integer_cache_bytes_per_object"]) for variant in variants]
+        record["packed_coefficient_bytes_min"] = min(packed_bytes)
+        record["packed_coefficient_bytes_max"] = max(packed_bytes)
+        record["integer_cache_bytes_per_object_min"] = min(cache_bytes)
+        record["integer_cache_bytes_per_object_max"] = max(cache_bytes)
+        for metric in (
+            "direct_integer_pairs_per_second",
+            "cached_integer_pairs_per_second",
+            "float_cached_pairs_per_second",
+            "integer_cache_objects_per_second",
+        ):
+            values = [float(variant["execution"][metric]) for variant in variants]
+            record[metric], record[f"{metric}_sem"] = mean_sem(values)
+        speedups = [
+            float(variant["execution"]["cached_integer_pairs_per_second"]) / float(variant["execution"]["float_cached_pairs_per_second"])
+            for variant in variants
+        ]
+        record["cached_vs_float_speedup"], record["cached_vs_float_speedup_sem"] = mean_sem(speedups)
+        systems_aggregate.append(record)
     decision = {
         "complete": complete,
         "checkpoint_runs": len(runs),
@@ -492,6 +528,8 @@ def summarize_quantization(args: argparse.Namespace) -> dict[str, object]:
         "all_cached_integer_paths_exact": all(
             bool(variant["execution"]["direct_cached_integer_exact"]) for run in runs for variant in run["variants"]
         ),
+        "isolated_systems_runs": len(systems_runs),
+        "isolated_systems_complete": len(systems_runs) == 3 if systems_dir is not None else None,
     }
     (args.result_dir / "decision.json").write_text(json.dumps(decision, indent=2) + "\n")
 
@@ -507,8 +545,8 @@ def summarize_quantization(args: argparse.Namespace) -> dict[str, object]:
         "",
         "## Three-seed retention",
         "",
-        "| Task | Split | Payload | Objective | Mode | Full | Quantized | Chance-adjusted retention | Full Top-16 overlap | Cached Mpair/s |",
-        "|---|---|---|---|---|---:|---:|---:|---:|---:|",
+        "| Task | Split | Payload | Objective | Mode | Full | Quantized | Chance-adjusted retention | Full Top-16 overlap |",
+        "|---|---|---|---|---|---:|---:|---:|---:|",
     ]
     for row in aggregate:
         overlap = float(row.get("random_full_top16_overlap", math.nan))
@@ -516,11 +554,76 @@ def summarize_quantization(args: argparse.Namespace) -> dict[str, object]:
         lines.append(
             f"| {row['task']} | {row['split_mode']} | {row['payload_mode']} | {row['objective']} | {row['mode']} | "
             f"{float(row['full_primary']):.4f} | {float(row['quantized_primary']):.4f} | "
-            f"{float(row['chance_adjusted_retention']):.4f} | {overlap_text} | "
-            f"{float(row['cached_integer_pairs_per_second']) / 1e6:.3f} |"
+            f"{float(row['chance_adjusted_retention']):.4f} | {overlap_text} |"
+        )
+    mode_summary: list[dict[str, object]] = []
+    for mode in QUANTIZATION_MODES:
+        members = [row for row in aggregate if row["mode"] == mode]
+        retentions = [float(row["chance_adjusted_retention"]) for row in members]
+        overlaps = [
+            float(row["random_full_top16_overlap"]) for row in members if math.isfinite(float(row.get("random_full_top16_overlap", math.nan)))
+        ]
+        mode_summary.append(
+            {
+                "mode": mode,
+                "mean_retention": statistics.mean(retentions),
+                "minimum_retention": min(retentions),
+                "mean_overlap": statistics.mean(overlaps),
+            }
         )
     lines += [
         "",
+        "## Retention result",
+        "",
+        "Each row below summarizes the 12 task/split/payload/objective groups after three-seed aggregation. Retention slightly "
+        "above one is ordinary quantization/tie variation and is not interpreted as an improvement.",
+        "",
+        "| Mode | Mean chance-adjusted retention | Worst group | Mean full Top-16 overlap |",
+        "|---|---:|---:|---:|",
+    ]
+    for row in mode_summary:
+        lines.append(
+            f"| {row['mode']} | {float(row['mean_retention']):.4f} | {float(row['minimum_retention']):.4f} | {float(row['mean_overlap']):.4f} |"
+        )
+    lines += [
+        "",
+        "Even binary relation coefficients preserve at least 99% of the chance-adjusted primary metric in every tested group. "
+        "The stricter full-model Top-16 overlap rises from binary through int4, showing that near-identical task recall can "
+        "still conceal changes in which candidates are selected.",
+        "",
+        "## Isolated systems benchmark",
+        "",
+    ]
+    if systems_aggregate:
+        lines += [
+            "The systems numbers below use the three class-holdout, float, relation-only seeds sequentially on one isolated "
+            "GPU, with 8,192 pairs, 10 warmups, and 100 timed iterations. Concurrent sweep timings remain machine-readable "
+            "diagnostics but are not used here.",
+            "",
+            "| Mode | Packed coefficients | Cache/object | Direct Mpair/s | Cached Mpair/s | Float cached Mpair/s | Cache Mobject/s | Cached/float |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for row in systems_aggregate:
+            packed_min = int(row["packed_coefficient_bytes_min"])
+            packed_max = int(row["packed_coefficient_bytes_max"])
+            cache_min = int(row["integer_cache_bytes_per_object_min"])
+            cache_max = int(row["integer_cache_bytes_per_object_max"])
+            packed_text = f"{packed_min}" if packed_min == packed_max else f"{packed_min}-{packed_max}"
+            cache_text = f"{cache_min}" if cache_min == cache_max else f"{cache_min}-{cache_max}"
+            lines.append(
+                f"| {row['mode']} | {packed_text} B | {cache_text} B | "
+                f"{float(row['direct_integer_pairs_per_second']) / 1e6:.3f} | "
+                f"{float(row['cached_integer_pairs_per_second']) / 1e6:.3f} | "
+                f"{float(row['float_cached_pairs_per_second']) / 1e6:.3f} | "
+                f"{float(row['integer_cache_objects_per_second']) / 1e6:.3f} | "
+                f"{float(row['cached_vs_float_speedup']):.3f}x |"
+            )
+        lines += [
+            "",
+        ]
+    else:
+        lines += ["No isolated systems result directory was supplied to the summarizer.", ""]
+    lines += [
         "## Systems boundary",
         "",
         "The measured path is a Torch reference, not a fused production kernel. Each object caches one int8 sign and one int32 "
@@ -549,6 +652,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--benchmark-iterations", type=int, default=10)
     summarize = commands.add_parser("summarize")
     summarize.add_argument("--result-dir", type=Path, required=True)
+    summarize.add_argument("--systems-result-dir", type=Path)
     summarize.add_argument("--out-report", type=Path, required=True)
     return parser
 
