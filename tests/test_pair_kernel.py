@@ -4,12 +4,14 @@ import math
 
 import torch
 from tropnn.layers.pair_kernel import (
+    RELATION_QUANTIZATION_SPECS,
     BalancedS4Router,
     CoxeterPairScorer,
     GlobalChamberKernel,
     RootIncidenceKernel,
     SameTableFullKernel,
     coxeter_representation_features,
+    quantize_relation_coefficients,
 )
 
 
@@ -60,6 +62,54 @@ def test_root_signs_decode_the_globally_labelled_coordinate_comparisons() -> Non
     expected = torch.where(coordinates[:, edges[:, 0]] > coordinates[:, edges[:, 1]], 1.0, -1.0)
     expected /= math.sqrt(router.roots)
     torch.testing.assert_close(features.roots, expected)
+
+
+def test_relation_quantization_uses_only_preregistered_integer_alphabets() -> None:
+    weight = torch.randn(257, generator=torch.Generator().manual_seed(101))
+    for mode, spec in RELATION_QUANTIZATION_SPECS.items():
+        codes, scale = quantize_relation_coefficients(weight, mode)
+        allowed = torch.tensor(spec.levels, dtype=codes.dtype)
+        assert codes.dtype == torch.int8
+        assert bool((codes[:, None] == allowed[None, :]).any(dim=1).all())
+        assert torch.isfinite(scale) and scale > 0
+        assert torch.isfinite((weight - codes.float() * scale).square().mean())
+
+
+def test_quantized_root_cache_matches_direct_integer_relation_score() -> None:
+    router = BalancedS4Router(seed=103)
+    kernel = RootIncidenceKernel(router, seed=107)
+    with torch.no_grad():
+        kernel.bias.fill_(0.17)
+    query = router.route(torch.randn(19, 32, generator=torch.Generator().manual_seed(109)))
+    key = router.route(torch.randn(19, 32, generator=torch.Generator().manual_seed(113)))
+    for mode in RELATION_QUANTIZATION_SPECS:
+        quantized = kernel.quantized(router.roots, mode)
+        reconstructed = quantized.reconstructed_coefficients()
+        expected = (query.roots[:, quantized.rows] * key.roots[:, quantized.columns] * reconstructed).sum(dim=-1) + kernel.bias
+        direct = quantized.hard_score(query, key)
+        torch.testing.assert_close(direct, expected, rtol=1e-6, atol=1e-6)
+
+        query_cache = quantized.build_cache(query.roots)
+        key_cache = quantized.build_cache(key.roots)
+        assert query_cache.signs.dtype == torch.int8
+        assert query_cache.transformed.dtype == torch.int32
+        integer, divisor = quantized.integer_score_from_cache(query_cache, key_cache)
+        assert integer.dtype == torch.int32 and divisor == 1
+        torch.testing.assert_close(quantized.score_from_cache(query_cache, key_cache), direct, rtol=1e-6, atol=1e-6)
+
+        reverse = quantized.hard_score(key, query)
+        torch.testing.assert_close(
+            quantized.score_from_cache(query_cache, key_cache, symmetry="symmetric"),
+            0.5 * (direct + reverse),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            quantized.score_from_cache(query_cache, key_cache, symmetry="antisymmetric"),
+            0.5 * (direct - reverse),
+            rtol=1e-6,
+            atol=1e-6,
+        )
 
 
 def test_global_rank_twelve_and_same_table_match_payload_budget() -> None:

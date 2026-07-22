@@ -1283,13 +1283,13 @@ def summarize_results(args: argparse.Namespace) -> dict[str, object]:
         "root_class_transfer": improvement_retention(indexed, class_root, object_root, "random_recall_at_16", 16.0 / 512.0, 0.70),
         "root_binary_retention": improvement_retention(indexed, class_binary_root, class_root, "random_recall_at_16", 16.0 / 512.0, 0.90),
         "root_relation_only_vs_aux": improvement_retention(indexed, class_root, class_aux_root, "random_recall_at_16", 16.0 / 512.0, 0.80),
-        "digit_root_auc": absolute_group_gate(indexed, digit_root, "macro_roc_auc", 0.85),
-        "digit_root_vs_same_table": paired_metric_gate(indexed, digit_root, digit_same, "macro_roc_auc"),
+        "digit_root_auc": absolute_group_gate(indexed, digit_root, "pair_macro_roc_auc", 0.85),
+        "digit_root_vs_same_table": paired_metric_gate(indexed, digit_root, digit_same, "pair_macro_roc_auc"),
     }
     digit_dense_gap = {"complete": False, "passed": False, "reason": "missing groups"}
     if digit_root in indexed and digit_dense in indexed and sorted(indexed[digit_root]) == sorted(indexed[digit_dense]) == [0, 1, 2]:
-        root_mean = statistics.mean(float(indexed[digit_root][seed]["macro_roc_auc"]) for seed in (0, 1, 2))
-        dense_mean = statistics.mean(float(indexed[digit_dense][seed]["macro_roc_auc"]) for seed in (0, 1, 2))
+        root_mean = statistics.mean(float(indexed[digit_root][seed]["pair_macro_roc_auc"]) for seed in (0, 1, 2))
+        dense_mean = statistics.mean(float(indexed[digit_dense][seed]["pair_macro_roc_auc"]) for seed in (0, 1, 2))
         digit_dense_gap = {
             "complete": True,
             "passed": root_mean >= dense_mean - 0.02,

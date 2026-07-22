@@ -14,11 +14,16 @@ __all__ = [
     "BalancedS4Router",
     "CoxeterPairScorer",
     "GlobalChamberKernel",
+    "IntegerRootCache",
     "IntrinsicS4Kernel",
+    "QuantizedRootIncidenceKernel",
+    "RELATION_QUANTIZATION_SPECS",
+    "RelationQuantizationSpec",
     "RootIncidenceKernel",
     "S4ObjectFeatures",
     "SameTableFullKernel",
     "coxeter_representation_features",
+    "quantize_relation_coefficients",
 ]
 
 
@@ -84,6 +89,77 @@ class S4ObjectFeatures:
     roots: Tensor
 
 
+@dataclass(frozen=True)
+class RelationQuantizationSpec:
+    name: str
+    levels: tuple[int, ...]
+    storage_bits: int
+
+
+RELATION_QUANTIZATION_SPECS = {
+    spec.name: spec
+    for spec in (
+        RelationQuantizationSpec("binary", (-1, 1), 1),
+        RelationQuantizationSpec("ternary", (-1, 0, 1), 2),
+        RelationQuantizationSpec("int2", (-3, -1, 1, 3), 2),
+        RelationQuantizationSpec("int4", tuple(range(-15, 16, 2)), 4),
+    )
+}
+
+
+@dataclass(frozen=True)
+class IntegerRootCache:
+    signs: Tensor
+    transformed: Tensor
+
+
+def quantize_relation_coefficients(weight: Tensor, mode: str, *, iterations: int = 24) -> tuple[Tensor, Tensor]:
+    """Quantize one relation tensor with a deployable per-tensor scale.
+
+    The returned codes are exact integer members of the preregistered alphabet.
+    The scalar scale is fitted without task labels by Lloyd updates that minimize
+    coefficient reconstruction MSE.
+    """
+
+    if mode not in RELATION_QUANTIZATION_SPECS:
+        raise ValueError(f"unsupported relation quantization mode {mode!r}")
+    if weight.numel() == 0:
+        raise ValueError("cannot quantize an empty relation tensor")
+    values = weight.detach().float().reshape(-1)
+    levels = torch.tensor(RELATION_QUANTIZATION_SPECS[mode].levels, device=values.device, dtype=values.dtype)
+    absolute = values.abs()
+    max_level = levels.abs().max().clamp_min(1.0)
+    quantiles = torch.tensor((0.75, 0.85, 0.9, 0.95, 0.99, 0.999, 1.0), device=values.device)
+    starts = torch.quantile(absolute, quantiles).div(max_level).clamp_min(1e-8)
+    starts = torch.cat(
+        (
+            starts,
+            values.square().mean().sqrt().view(1).div(max_level).clamp_min(1e-8),
+            absolute.mean().view(1).div(levels.abs().mean().clamp_min(1e-6)).clamp_min(1e-8),
+        )
+    )
+    best_scale = starts[0]
+    best_codes = levels[(values[:, None] / best_scale - levels[None, :]).abs().argmin(dim=-1)]
+    best_mse = torch.tensor(float("inf"), device=values.device)
+    for initial in starts:
+        scale = initial
+        for _ in range(iterations):
+            codes = levels[(values[:, None] / scale.clamp_min(1e-12) - levels[None, :]).abs().argmin(dim=-1)]
+            next_scale = (values * codes).sum() / codes.square().sum().clamp_min(1e-12)
+            next_scale = next_scale.clamp_min(1e-8)
+            if torch.isclose(scale, next_scale, rtol=1e-7, atol=1e-9):
+                scale = next_scale
+                break
+            scale = next_scale
+        codes = levels[(values[:, None] / scale - levels[None, :]).abs().argmin(dim=-1)]
+        mse = (values - codes * scale).square().mean()
+        if mse < best_mse:
+            best_mse = mse
+            best_scale = scale
+            best_codes = codes
+    return best_codes.to(torch.int8).view_as(weight), best_scale
+
+
 class BalancedS4Router(nn.Module):
     """Balanced overlapping K4 charts over a compact ordinal coordinate vector.
 
@@ -116,13 +192,7 @@ class BalancedS4Router(nn.Module):
                 )
                 neighbours[state, generator_index] = lookup[tuple(neighbour)]
 
-        edge_keys = sorted(
-            {
-                tuple(sorted((int(row[left]), int(row[right]))))
-                for row in anchors
-                for left, right in _K4_EDGES
-            }
-        )
+        edge_keys = sorted({tuple(sorted((int(row[left]), int(row[right])))) for row in anchors for left, right in _K4_EDGES})
         edge_lookup = {edge: index for index, edge in enumerate(edge_keys)}
         adjacent_root_edge = torch.empty(tables, S4_ORDER, 3, dtype=torch.long)
         for table in range(tables):
@@ -342,6 +412,115 @@ class RootIncidenceKernel(PairKernelBase):
             return 0.5 * (forward - reverse)
         raise ValueError("symmetry must be none, symmetric, or antisymmetric")
 
+    def quantized(self, roots: int, mode: str) -> "QuantizedRootIncidenceKernel":
+        return QuantizedRootIncidenceKernel.from_float(self, roots=roots, mode=mode)
+
+
+class QuantizedRootIncidenceKernel(PairKernelBase):
+    """Frozen integer-coefficient Root-incidence scorer with object caches.
+
+    Root signs are represented as exact ``{-1, +1}`` integers.  Object-side
+    preprocessing computes the integer sparse transform ``M_q c(x)`` once.
+    Pair ranking then needs only signed integer accumulation; the common scale
+    and optional bias are applied after accumulation for calibrated logits.
+    """
+
+    def __init__(
+        self,
+        rows: Tensor,
+        columns: Tensor,
+        codes: Tensor,
+        scale: Tensor,
+        bias: Tensor,
+        *,
+        roots: int,
+        mode: str,
+    ) -> None:
+        super().__init__()
+        if mode not in RELATION_QUANTIZATION_SPECS:
+            raise ValueError(f"unsupported relation quantization mode {mode!r}")
+        if rows.shape != columns.shape or rows.shape != codes.shape:
+            raise ValueError("rows, columns, and codes must have identical shapes")
+        if roots < 1:
+            raise ValueError("roots must be positive")
+        allowed = torch.tensor(RELATION_QUANTIZATION_SPECS[mode].levels, device=codes.device, dtype=codes.dtype)
+        if not bool((codes.reshape(-1, 1) == allowed.reshape(1, -1)).any(dim=1).all()):
+            raise ValueError(f"codes contain values outside the {mode} alphabet")
+        self.roots = int(roots)
+        self.mode = mode
+        self.register_buffer("rows", rows.detach().clone().to(torch.long))
+        self.register_buffer("columns", columns.detach().clone().to(torch.long))
+        self.register_buffer("codes", codes.detach().clone().to(torch.int8))
+        self.register_buffer("scale", scale.detach().clone().float().reshape(()))
+        self.register_buffer("bias", bias.detach().clone().float().reshape(()))
+
+    @classmethod
+    def from_float(cls, kernel: RootIncidenceKernel, *, roots: int, mode: str) -> "QuantizedRootIncidenceKernel":
+        codes, scale = quantize_relation_coefficients(kernel.weight, mode)
+        return cls(kernel.rows, kernel.columns, codes, scale, kernel.bias, roots=roots, mode=mode)
+
+    @property
+    def spec(self) -> RelationQuantizationSpec:
+        return RELATION_QUANTIZATION_SPECS[self.mode]
+
+    def reconstructed_coefficients(self) -> Tensor:
+        return self.codes.to(self.scale.dtype) * self.scale
+
+    @staticmethod
+    def integer_signs(roots: Tensor) -> Tensor:
+        if roots.ndim != 2:
+            raise ValueError("roots must have shape [objects, roots]")
+        return torch.where(roots >= 0, 1, -1).to(torch.int8)
+
+    def hard_integer_score(self, query_roots: Tensor, key_roots: Tensor) -> Tensor:
+        query_signs = self.integer_signs(query_roots)
+        key_signs = self.integer_signs(key_roots)
+        products = query_signs[:, self.rows].to(torch.int32) * key_signs[:, self.columns].to(torch.int32)
+        return (products * self.codes.to(torch.int32)).sum(dim=-1, dtype=torch.int32)
+
+    def hard_score(self, query: S4ObjectFeatures, key: S4ObjectFeatures) -> Tensor:
+        integer = self.hard_integer_score(query.roots, key.roots)
+        return integer.to(self.scale.dtype) * (self.scale / self.roots) + self.bias
+
+    def build_cache(self, roots: Tensor) -> IntegerRootCache:
+        signs = self.integer_signs(roots)
+        transformed = torch.zeros(signs.shape, device=signs.device, dtype=torch.int32)
+        contribution = signs[:, self.columns].to(torch.int32) * self.codes.to(torch.int32)
+        transformed.scatter_add_(
+            1,
+            self.rows.view(1, -1).expand(signs.shape[0], -1),
+            contribution,
+        )
+        return IntegerRootCache(signs=signs, transformed=transformed)
+
+    def integer_score_from_cache(
+        self,
+        query: IntegerRootCache,
+        key: IntegerRootCache,
+        *,
+        symmetry: str = "none",
+    ) -> tuple[Tensor, int]:
+        forward = (query.signs.to(torch.int32) * key.transformed).sum(dim=-1, dtype=torch.int32)
+        if symmetry == "none":
+            return forward, 1
+        reverse = (key.signs.to(torch.int32) * query.transformed).sum(dim=-1, dtype=torch.int32)
+        if symmetry == "symmetric":
+            return forward + reverse, 2
+        if symmetry == "antisymmetric":
+            return forward - reverse, 2
+        raise ValueError("symmetry must be none, symmetric, or antisymmetric")
+
+    def score_from_cache(
+        self,
+        query: IntegerRootCache,
+        key: IntegerRootCache,
+        *,
+        symmetry: str = "none",
+    ) -> Tensor:
+        integer, divisor = self.integer_score_from_cache(query, key, symmetry=symmetry)
+        score = integer.to(self.scale.dtype) * (self.scale / (self.roots * divisor))
+        return score if symmetry == "antisymmetric" else score + self.bias
+
 
 class CoxeterPairScorer(nn.Module):
     """Apply a hard S4 pair kernel with an exact-forward adjacent-wall STE."""
@@ -372,18 +551,14 @@ class CoxeterPairScorer(nn.Module):
         correction = torch.zeros_like(hard_score)
         for table in range(self.router.tables):
             query_generator = query.adjacent_gaps[:, table].argmin(dim=-1)
-            query_gap = query.adjacent_gaps[
-                torch.arange(query.routes.shape[0], device=query.routes.device), table, query_generator
-            ]
+            query_gap = query.adjacent_gaps[torch.arange(query.routes.shape[0], device=query.routes.device), table, query_generator]
             query_neighbour = self.router.neighbour(query, table, query_generator)
             query_delta = self._score_features(query_neighbour, key) - hard_score
             query_gate = ste_heaviside(query_gap) - (query_gap > 0).to(query_gap.dtype)
             correction = correction + query_gate * query_delta
 
             key_generator = key.adjacent_gaps[:, table].argmin(dim=-1)
-            key_gap = key.adjacent_gaps[
-                torch.arange(key.routes.shape[0], device=key.routes.device), table, key_generator
-            ]
+            key_gap = key.adjacent_gaps[torch.arange(key.routes.shape[0], device=key.routes.device), table, key_generator]
             key_neighbour = self.router.neighbour(key, table, key_generator)
             key_delta = self._score_features(query, key_neighbour) - hard_score
             key_gate = ste_heaviside(key_gap) - (key_gap > 0).to(key_gap.dtype)

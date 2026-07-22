@@ -1,17 +1,22 @@
 from .base import LUTModuleBase
 from .comparator_margin import ComparatorTwoSidedMargin
 from .coxeter import CoxeterLUT, CoxeterRoute, K4FullLUT
-from .pairwise import PAIRWISE_ANCHOR_POLICIES, AbsDiffLUT, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT
 from .pair_kernel import (
+    RELATION_QUANTIZATION_SPECS,
     BalancedS4Router,
     CoxeterPairScorer,
     GlobalChamberKernel,
+    IntegerRootCache,
     IntrinsicS4Kernel,
+    QuantizedRootIncidenceKernel,
+    RelationQuantizationSpec,
     RootIncidenceKernel,
     S4ObjectFeatures,
     SameTableFullKernel,
     coxeter_representation_features,
+    quantize_relation_coefficients,
 )
+from .pairwise import PAIRWISE_ANCHOR_POLICIES, AbsDiffLUT, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT
 from .relation import ComparisonRelationLUT, ComparisonRelationSpec, ComparisonRoute
 from .s4_relation import GaugeAlignedS4Relation, circulant_relation_edges, s4_fourier_energy, s4_gauge_maps, s4_tables
 
@@ -31,6 +36,7 @@ __all__ = [
     "ComparisonRoute",
     "GaugeAlignedS4Relation",
     "GlobalChamberKernel",
+    "IntegerRootCache",
     "IntrinsicS4Kernel",
     "LUTModuleBase",
     "PAIRWISE_ANCHOR_POLICIES",
@@ -39,11 +45,15 @@ __all__ = [
     "PairwiseRoute",
     "PairwiseWalshLinear",
     "PairwiseWalshLUT",
+    "QuantizedRootIncidenceKernel",
+    "RELATION_QUANTIZATION_SPECS",
+    "RelationQuantizationSpec",
     "RootIncidenceKernel",
     "S4ObjectFeatures",
     "SameTableFullKernel",
     "circulant_relation_edges",
     "coxeter_representation_features",
+    "quantize_relation_coefficients",
     "s4_fourier_energy",
     "s4_gauge_maps",
     "s4_tables",

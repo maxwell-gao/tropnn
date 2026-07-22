@@ -26,6 +26,7 @@ from tropnn.tools.emnist_pair_relation_kernel import (
     sample_training_pair_indices,
     select_learning_rates,
     stratified_half_split,
+    summarize_results,
     validate_completed_config,
 )
 
@@ -262,3 +263,59 @@ def test_paired_gate_and_random_adjusted_retention_use_all_three_seeds() -> None
     assert gate["complete"] and gate["passed"] and gate["all_seed_same_sign"]
     retention = improvement_retention(indexed, right, left, "random_recall_at_16", 16.0 / 512.0, 0.7)
     assert retention["complete"] and retention["passed"]
+
+
+def test_summarize_uses_recorded_pair_macro_auc_for_digit_gates(tmp_path) -> None:
+    result_dir = tmp_path / "runs"
+
+    def write_group(
+        task: str,
+        split_mode: str,
+        payload_mode: str,
+        objective: str,
+        decoder: str,
+        *,
+        recall: float = 0.5,
+        macro_auc: float = 0.9,
+    ) -> None:
+        for seed in range(3):
+            result = {
+                "complete": True,
+                "config": {
+                    "task": task,
+                    "split_mode": split_mode,
+                    "payload_mode": payload_mode,
+                    "objective": objective,
+                    "decoder": decoder,
+                    "seed": seed,
+                },
+                "relation_parameters": 1,
+                "best_epoch": 1,
+                "test": {
+                    "pair_roc_auc": macro_auc,
+                    "pair_macro_roc_auc": macro_auc,
+                    "pair_pr_auc": macro_auc,
+                    "pair_accuracy": macro_auc,
+                    "random_recall_at_16": recall,
+                },
+            }
+            path = result_dir / task / split_mode / payload_mode / objective / decoder / f"seed{seed}" / "result.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(result))
+
+    write_group("same_class", "class", "float", "relation_only", "root_incidence", recall=0.60)
+    write_group("same_class", "class", "float", "relation_only", "same_table_full", recall=0.40)
+    write_group("same_class", "class", "float", "relation_only", "jointpair_t16", recall=0.40)
+    write_group("same_class", "class", "float", "relation_only", "global_coxeter_r12", recall=0.60)
+    write_group("same_class", "class", "float", "relation_only", "global_free_r12", recall=0.40)
+    write_group("same_class", "object", "float", "relation_only", "root_incidence", recall=0.70)
+    write_group("same_class", "class", "binary01", "relation_only", "root_incidence", recall=0.58)
+    write_group("same_class", "class", "float", "relation_aux", "root_incidence", recall=0.60)
+    write_group("digit_greater", "object", "float", "relation_only", "root_incidence", macro_auc=0.90)
+    write_group("digit_greater", "object", "float", "relation_only", "dense_qk_r16", macro_auc=0.91)
+    write_group("digit_greater", "object", "float", "relation_only", "same_table_full", macro_auc=0.70)
+
+    decision = summarize_results(SimpleNamespace(result_dir=result_dir, out_report=tmp_path / "report.md"))
+    assert decision["gates"]["digit_root_auc"]["mean"] == pytest.approx(0.90)
+    assert decision["digit_anisotropic_kernel_passed"]
+    assert decision["semantic_gate_passed"]
