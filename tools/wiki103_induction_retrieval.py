@@ -961,7 +961,6 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         "This is a frozen-state relation-selection test, not an online language-model result. Passing would justify a "
         "supervised scorer warm start; failing localizes the problem before online credit assignment. The cache boundary also "
         "prevents claiming that the source model was trained scoreless from initialization.",
-        "",
     ]
     args.out_report.parent.mkdir(parents=True, exist_ok=True)
     args.out_report.write_text("\n".join(lines) + "\n")
