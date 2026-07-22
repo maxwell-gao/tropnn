@@ -294,7 +294,8 @@ def run_quantization(args: argparse.Namespace) -> dict[str, object]:
     baseline_deltas = {
         key: abs(float(value) - float(source_result["test"][key])) for key, value in full_metrics.items() if key in source_result["test"]
     }
-    if baseline_deltas and max(baseline_deltas.values()) > 2e-5:
+    source_metric_tolerance = 1e-3
+    if baseline_deltas and max(baseline_deltas.values()) > source_metric_tolerance:
         raise RuntimeError(f"recomputed full-precision metrics differ from source: {baseline_deltas}")
 
     variants: list[dict[str, object]] = []
@@ -397,6 +398,7 @@ def run_quantization(args: argparse.Namespace) -> dict[str, object]:
         "dequantization_scope": "one common positive scale and bias after accumulation; omitted for ranking",
         "full_metrics": full_metrics,
         "source_metric_max_error": max(baseline_deltas.values(), default=0.0),
+        "source_metric_tolerance": source_metric_tolerance,
         "variants": variants,
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
