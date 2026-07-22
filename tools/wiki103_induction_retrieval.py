@@ -833,8 +833,19 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         write_csv(args.result_dir / "summary.csv", aggregate)
 
     metadata = json.loads((args.cache_dir / "metadata.json").read_text())
+    protocol = metadata["protocol"]
+    features = metadata["features"]
+    data = metadata["data"]
+    source = metadata["source"]
+    common_config = results[0]["config"] if results else {}
     lines = [
         "# Frozen Wiki103 Induction Retrieval in Ordinal Space",
+        "",
+        "## Outcome",
+        "",
+        "The ordinal-native Root-incidence scorer does **not** pass the preregistered gate. Dense QK does substantially better, "
+        "so the frozen states contain query-conditioned retrieval signal, but the tested sparse root support captures little of "
+        "that gain. The result stops this scorer before online tropical-attention integration.",
         "",
         "## Protocol",
         "",
@@ -843,29 +854,62 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         "content `score_lut` tensors are set exactly to zero. TroPE, ValueLUT, residual blocks, FFNs, and readout-side training "
         "history remain fixed.",
         "",
-        f"Boundary: {metadata['source']['boundary']}",
+        f"Boundary: {source['boundary']}.",
         "",
-        "Each query has 32 model-independent candidates and exactly one old matching bigram. Candidates satisfy `j < i-1`; "
+        f"The official training tokens supply train windows; the official validation tokens are divided into disjoint first-half "
+        f"validation and second-half test regions. The cache contains `{protocol['query_counts']['train']:,}` / "
+        f"`{protocol['query_counts']['validation']:,}` / `{protocol['query_counts']['test']:,}` train/validation/test queries from "
+        f"`{data['window_counts']['train']}` / `{data['window_counts']['validation']}` / `{data['window_counts']['test']}` "
+        f"non-overlapping windows of context `{data['context_size']}`.",
+        "",
+        f"Each query has {protocol['candidate_count']} model-independent candidates and exactly one old matching bigram. "
+        "Candidates satisfy `j < i-1`; "
         "the old successor `x_(j+1)` is therefore already in the causal past. Same-token/wrong-successor hard negatives are "
         "sampled before random negatives. The future target constructs labels only and is not part of either row vector.",
         "",
-        "The four decoders receive the same 32 target-free high-variance raw hidden coordinates. No learned projection or "
+        f"The four decoders receive the same {features['relation_dim']} target-free high-variance raw coordinates from each "
+        f"{features['hidden_dim']}-dimensional frozen state. No learned projection or "
         "whitening precedes the ordinal routes. Dense QK is a diagnostic, not a GEMM-free proposal.",
+        "",
+        "The comparison is deliberately small: Kendall is a fixed invariant kernel with learned scale/bias; Same-table full is "
+        "a free `16 x 24 x 24` chamber-pair LUT; Root-incidence is directed `c(q)^T M_incidence c(k)`; Dense QK is a rank-16 "
+        "continuous-coordinate diagnostic. Each uses seeds 0, 1, and 2. Training optimizes listwise cross-entropy over the one "
+        f"positive candidate with AdamW for `{common_config.get('epochs', 'unknown')}` epochs, batch "
+        f"`{common_config.get('batch_size', 'unknown')}`, learning rate `{common_config.get('learning_rate', 'unknown')}`, no "
+        "weight decay, and validation-R@1 checkpoint selection.",
         "",
         "## Three-seed results",
         "",
-        "| Decoder | Relation params | Test R@1 | Test R@4 | MRR | Successor hit@1 | Hard-negative top1 |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "Random relation ranking has R@1 `0.03125`. Recall measures recovery of the designated old matching bigram; successor "
+        "hit additionally gives credit to any selected candidate whose value token equals the future target.",
+        "",
+        "| Decoder | Relation params | Val R@1 | Test R@1 | Test R@4 | MRR | Successor hit@1 | Hard-negative top1 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in aggregate:
         low = int(row["relation_parameters_min"])
         high = int(row["relation_parameters_max"])
         params = f"{low:,}" if low == high else f"{low:,}-{high:,}"
         lines.append(
-            f"| {row['decoder']} | {params} | {row['test_recall_at_1_mean']:.4f} ± {row['test_recall_at_1_sem']:.4f} | "
+            f"| {row['decoder']} | {params} | {row['validation_recall_at_1_mean']:.4f} ± "
+            f"{row['validation_recall_at_1_sem']:.4f} | {row['test_recall_at_1_mean']:.4f} ± "
+            f"{row['test_recall_at_1_sem']:.4f} | "
             f"{row['test_recall_at_4_mean']:.4f} ± {row['test_recall_at_4_sem']:.4f} | "
             f"{row['test_mrr_mean']:.4f} | {row['test_successor_hit_at_1_mean']:.4f} | "
             f"{row['test_hard_negative_top1_rate_mean']:.4f} |"
+        )
+    lines += [
+        "",
+        "Per-seed audit:",
+        "",
+        "| Decoder | Seed | Params | Best epoch | Val R@1 | Test R@1 | Test successor hit@1 | Optimizer steps |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for result in sorted(results, key=lambda item: (DECODERS.index(item["config"]["decoder"]), item["config"]["seed"])):
+        lines.append(
+            f"| {result['config']['decoder']} | {result['config']['seed']} | {result['relation_parameters']:,} | "
+            f"{result['best_epoch']} | {result['validation']['recall_at_1']:.4f} | {result['test']['recall_at_1']:.4f} | "
+            f"{result['test']['successor_hit_at_1']:.4f} | {result['optimizer_steps']:,} |"
         )
     lines += [
         "",
@@ -881,11 +925,38 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         lines += [
             f"Root-incidence minus Kendall test R@1 is `{root_vs_kendall['mean_delta']:.4f}` with paired SEM "
             f"`{root_vs_kendall['sem']:.4f}`. Its gain-retention ratio relative to Dense QK is "
-            f"`{dense_retention['retention']:.4f}`.",
+            f"`{dense_retention['retention']:.4f}`: Root gains `{dense_retention['root_gain_over_kendall']:.4f}` over Kendall, "
+            f"whereas Dense QK gains `{dense_retention['dense_gain_over_kendall']:.4f}`.",
             "",
         ]
     lines += [
-        "## Interpretation boundary",
+        "## Interpretation",
+        "",
+        "Dense QK improves test R@1 from roughly 0.067 to 0.101 under the same frozen states, coordinates, candidates, labels, "
+        "and parameter scale. Therefore the earlier Wiki103 tropical-attention failure cannot be attributed only to absence "
+        "of relation signal in `z`. Conversely, the small Root-incidence gain shows that EMNIST success does not transfer "
+        "automatically to contextual token retrieval. Same-table full also stays near Kendall despite nine times the Dense-QK "
+        "parameter count, so merely enlarging local categorical relation LUTs is not enough.",
+        "",
+        "The controlled conclusion is about this D32, two-cover K4 chart system and its incidence support. It does not prove "
+        "that ordinal retrieval is impossible. It says the current native kernel is the bottleneck before online language-model "
+        "credit assignment; warm-starting it into attention is not justified by the preregistered rule.",
+        "",
+        "## Reproduction and artifacts",
+        "",
+        "```bash",
+        "GPU_LIST=0,1,2,3,4,5 scripts/run_tropnn_wiki103_induction_retrieval_6gpu.sh",
+        "```",
+        "",
+        f"- Source config: `{source['config']}` (`sha256 {source['config_sha256']}`).",
+        f"- Source checkpoint: `{source['checkpoint']}` at step `{source['checkpoint_metadata']['global_step']}` "
+        f"(`sha256 {source['checkpoint_sha256']}`).",
+        f"- Cache: `{args.cache_dir}` (fingerprint `{metadata['cache_fingerprint']}`).",
+        f"- Run JSON, histories, checkpoints, summary CSV, and decision JSON: `{args.result_dir}`.",
+        "- Logs: `logs/wiki103_induction_retrieval_20260722/`.",
+        "- Launcher: `scripts/run_tropnn_wiki103_induction_retrieval_6gpu.sh`.",
+        "",
+        "## Boundary",
         "",
         "This is a frozen-state relation-selection test, not an online language-model result. Passing would justify a "
         "supervised scorer warm start; failing localizes the problem before online credit assignment. The cache boundary also "
@@ -893,7 +964,7 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         "",
     ]
     args.out_report.parent.mkdir(parents=True, exist_ok=True)
-    args.out_report.write_text("\n".join(lines))
+    args.out_report.write_text("\n".join(lines) + "\n")
     print(json.dumps(decision, indent=2, sort_keys=True), flush=True)
     return decision
 

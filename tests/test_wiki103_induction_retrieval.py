@@ -163,7 +163,15 @@ def result_row(decoder: str, seed: int, recall: float) -> dict:
     }
     return {
         "complete": True,
-        "config": {"decoder": decoder, "seed": seed},
+        "config": {
+            "decoder": decoder,
+            "seed": seed,
+            "epochs": 20,
+            "batch_size": 128,
+            "learning_rate": 0.003,
+        },
+        "best_epoch": 10,
+        "optimizer_steps": 100,
         "relation_parameters": {"kendall": 2, "same_table_full": 9217, "root_incidence": 910, "dense_qk": 1025}[decoder],
         "validation": metrics,
         "test": metrics,
@@ -179,7 +187,22 @@ def test_summary_enforces_twelve_runs_and_preregistered_gates(tmp_path) -> None:
             {
                 "source": {
                     "boundary": "test boundary",
-                }
+                    "config": "config.yaml",
+                    "config_sha256": "config-hash",
+                    "checkpoint": "last.ckpt",
+                    "checkpoint_sha256": "checkpoint-hash",
+                    "checkpoint_metadata": {"global_step": 4000},
+                },
+                "cache_fingerprint": "cache-hash",
+                "data": {
+                    "context_size": 512,
+                    "window_counts": {"train": 2, "validation": 1, "test": 1},
+                },
+                "protocol": {
+                    "candidate_count": 32,
+                    "query_counts": {"train": 20, "validation": 10, "test": 10},
+                },
+                "features": {"hidden_dim": 256, "relation_dim": 32},
             }
         )
     )
