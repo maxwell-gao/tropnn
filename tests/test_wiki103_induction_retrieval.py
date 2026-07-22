@@ -67,6 +67,18 @@ def test_induction_protocol_is_causal_exactly_one_positive_and_hard_negative() -
     assert torch.equal(successor[positive], protocol["target"])
 
 
+def test_random_fill_marks_incidental_same_token_wrong_successors_as_hard() -> None:
+    tokens = torch.arange(81, dtype=torch.long) + 1000
+    for position in range(2, 34, 2):
+        tokens[position] = 7
+        tokens[position + 1] = 100 + position
+    tokens[35:37] = torch.tensor((7, 11))
+    tokens[70:72] = torch.tensor((7, 11))
+    protocol = build_induction_protocol(tokens.view(1, -1), candidate_count=32, max_hard_negatives=0, seed=1729)
+    validate_induction_protocol(tokens.view(1, -1), protocol)
+    assert protocol["hard_negative_mask"].any()
+
+
 @pytest.mark.parametrize("decoder", DECODERS)
 def test_all_decoders_score_candidate_groups_and_backpropagate(decoder: str) -> None:
     scorer, metadata = build_scorer(decoder, seed=0)

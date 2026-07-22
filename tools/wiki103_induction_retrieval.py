@@ -220,7 +220,7 @@ def build_induction_protocol(
             candidates = [positive, *negatives]
             rng.shuffle(candidates)
             relevant_index = candidates.index(positive)
-            hard_mask = [int(position in chosen_set) for position in candidates]
+            hard_mask = [int(tokens[position] == current and tokens[position + 1] != target) for position in candidates]
             query_flat = window_index * context_size + query_position
             candidate_flat = [window_index * context_size + position for position in candidates]
             records.append((query_flat, candidate_flat, relevant_index, target, hard_mask))
