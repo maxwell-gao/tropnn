@@ -803,6 +803,34 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
     missing_chamber = sorted(expected_chamber - found_chamber)
     if missing_base or missing_chamber:
         raise RuntimeError(f"incomplete result matrix: missing_base={missing_base}, missing_chamber={missing_chamber}")
+    matched_fields = (
+        "steps",
+        "batch_size",
+        "learning_rate",
+        "weight_decay",
+        "gradient_clip",
+        "validation_interval",
+        "validation_episodes",
+        "evaluation_episodes",
+        "evaluation_batch_size",
+        "vocab_size",
+        "relation_dim",
+        "dense_rank",
+        "relation_tables",
+        "relation_coverage",
+        "coxeter_rank",
+        "jointpair_tables",
+        "jointpair_comparisons",
+        "data_seed",
+        "codebook_seed",
+        "token_relabel_seed",
+        "device",
+    )
+    for field in matched_fields:
+        values = {json.dumps(result["config"][field], sort_keys=True) for result in results}
+        if len(values) != 1:
+            raise RuntimeError(f"formal matrix does not match on config field {field!r}: {sorted(values)}")
+    formal_config = results[0]["config"]
 
     spec = "length_p32_q8"
     chance = 1.0 / 32.0
@@ -842,14 +870,24 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             "threshold": TOKEN_RELABEL_RETENTION_GATE,
             "passed": token_relabel_retention["local_global_coxeter"] >= TOKEN_RELABEL_RETENTION_GATE,
         },
+        "kendall_identity_succeeds": {
+            "value": base_accuracy["local_kendall"],
+            "threshold": ORDINAL_ACCURACY_GATE,
+            "passed": base_accuracy["local_kendall"] >= ORDINAL_ACCURACY_GATE,
+        },
     }
     qualified = bool(gates["local_dense_succeeds"]["passed"] and gates["no_local_dense_is_negative"]["passed"])
     ordinal_success = {
         decoder: base_accuracy[decoder] >= ORDINAL_ACCURACY_GATE
         for decoder in ("local_kendall", "local_root_incidence", "local_global_coxeter", "local_jointpair_full")
     }
+    chamber_kendall_accuracy = _mean_sem(
+        _metric(results, "local_kendall", spec, "base", "target_token_accuracy", chamber=True)
+    )[0]
     if not qualified:
         interpretation = "invalid_relation_comparison"
+    elif gates["kendall_identity_succeeds"]["passed"] and chamber_kendall_accuracy >= ORDINAL_ACCURACY_GATE:
+        interpretation = "causal_mqar_reduces_to_relabel_invariant_chamber_identity"
     elif gates["global_coxeter_retains_dense_gain"]["passed"] and gates["global_coxeter_token_relabel"]["passed"]:
         interpretation = "global_coxeter_routes_causal_mqar"
     elif ordinal_success["local_jointpair_full"] and not ordinal_success["local_global_coxeter"]:
@@ -861,15 +899,21 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
 
     rows: list[dict[str, object]] = []
     for decoder in DECODERS:
-        sample = next(
+        decoder_results = [
             result
             for result in results
             if result["config"]["decoder"] == decoder and int(result["config"]["chamber_relabel_seed"]) < 0
+        ]
+        parameter_values = [int(result["relation_parameters"]) for result in decoder_results]
+        parameter_text = (
+            f"{parameter_values[0]:,}"
+            if min(parameter_values) == max(parameter_values)
+            else f"{min(parameter_values):,}-{max(parameter_values):,}"
         )
         rows.append(
             {
                 "decoder": decoder,
-                "relation_parameters": int(sample["relation_parameters"]),
+                "relation_parameters": parameter_text,
                 "target_accuracy_p8": _mean_sem(
                     _metric(results, decoder, "id_p8_q4", "base", "target_token_accuracy", chamber=False)
                 )[0],
@@ -880,6 +924,9 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
                     _metric(results, decoder, "length_p16_q8", "base", "target_token_accuracy", chamber=False)
                 )[0],
                 "target_accuracy_p32": base_accuracy[decoder],
+                "target_ce_p32": _mean_sem(
+                    _metric(results, decoder, spec, "base", "target_token_ce", chamber=False)
+                )[0],
                 "exact_p32": _mean_sem(
                     _metric(results, decoder, spec, "base", "multiquery_exact_accuracy", chamber=False)
                 )[0],
@@ -916,18 +963,19 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         "## Main results",
         "",
         "| Decoder | Relation params | P8 target acc | P8 all-query exact | "
-        "P16 target acc | P32 target acc | P32 all-query exact | "
+        "P16 target acc | P32 target acc | P32 CE | P32 all-query exact | "
         "P32 token-relabel acc | Pair scores/s |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         decoder = str(row["decoder"])
         lines.append(
-            f"| {decoder} | {int(row['relation_parameters']):,} | "
+            f"| {decoder} | {row['relation_parameters']} | "
             f"{_format_mean_sem(_metric(results, decoder, 'id_p8_q4', 'base', 'target_token_accuracy', chamber=False))} | "
             f"{_format_mean_sem(_metric(results, decoder, 'id_p8_q4', 'base', 'multiquery_exact_accuracy', chamber=False))} | "
             f"{_format_mean_sem(_metric(results, decoder, 'length_p16_q8', 'base', 'target_token_accuracy', chamber=False))} | "
             f"{_format_mean_sem(_metric(results, decoder, spec, 'base', 'target_token_accuracy', chamber=False))} | "
+            f"{_format_mean_sem(_metric(results, decoder, spec, 'base', 'target_token_ce', chamber=False))} | "
             f"{_format_mean_sem(_metric(results, decoder, spec, 'base', 'multiquery_exact_accuracy', chamber=False))} | "
             f"{_format_mean_sem(_metric(results, decoder, spec, 'token_relabel', 'target_token_accuracy', chamber=False))} | "
             f"{float(row['pair_scores_per_second']):,.0f} |"
@@ -972,6 +1020,12 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             "",
             f"Decision: `{interpretation}`.",
             "",
+            "The qualification succeeds, but it is not evidence that Global Coxeter's group geometry "
+            "is needed. The two-parameter Kendall kernel is already perfect through P32, and its "
+            "accuracy is unchanged after arbitrary per-table chamber relabeling and retraining. "
+            "Once the local write copies the exact same A chamber into K, this MQAR definition "
+            "reduces to equality matching. All tested ordinal decoders reach the same accuracy ceiling.",
+            "",
             "The Dense control must first reach at least 0.95 P32 target accuracy while "
             "No-local Dense remains below chance plus 0.05. Only then is a relation-kernel "
             "comparison qualified. Global Coxeter passes its positive gate only if it retains "
@@ -986,10 +1040,36 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             "primitive on ordinal token codes; it does not establish multi-hop composition, "
             "learned language states, or end-to-end LM quality.",
             "",
+            "Because values are injective one-hot token identities, target-token accuracy is "
+            "numerically equal to selecting the correct memory row. The experiment repairs causal "
+            "K/V alignment and tests value transport, but it cannot distinguish a transferable "
+            "learned relation geometry from relabel-invariant identity lookup.",
+            "",
             "Dense QK remains a diagnostic GEMM path. Global Coxeter retains a width-12 product "
             "in this reference implementation, and Root-incidence uses sparse signed accumulation. "
             "Throughput is warm forward-only Torch timing at the matched P32/Q8 shape; "
             "it is not a fused-kernel claim.",
+            "",
+            "## Reproduction",
+            "",
+            "```bash",
+            f"GPU_LIST={args.gpu_list} scripts/run_tropnn_causal_mqar_induction_6gpu.sh",
+            "```",
+            "",
+            f"- Results: `{args.result_dir}`.",
+            f"- Logs: `{args.result_dir.parent / 'logs'}`.",
+            f"- Formal seeds: `{', '.join(str(seed) for seed in expected_seeds)}`; "
+            f"{int(formal_config['steps']):,} optimizer steps per run; "
+            f"batch {int(formal_config['batch_size'])}; AdamW learning rate "
+            f"{float(formal_config['learning_rate']):g} and weight decay "
+            f"{float(formal_config['weight_decay']):g}.",
+            "- Training episodes sample P4-P8 and Q1-Q4. Each held P8/P16/P32 "
+            f"condition contains {int(formal_config['evaluation_episodes']):,} episodes per seed.",
+            "- Every complete run contains `result.json` and `best.pt`; the summary "
+            "requires all 18 base and 9 chamber-relabel runs.",
+            "- Semantic implementation and tests: "
+            "`python/src/tropnn/tools/causal_mqar_induction.py` and "
+            "`python/src/tropnn/tests/test_causal_mqar_induction.py`.",
             "",
         ]
     )
@@ -1047,6 +1127,7 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--result-dir", type=Path, required=True)
     summary.add_argument("--out-report", type=Path, required=True)
     summary.add_argument("--expected-seeds", type=int, nargs="+", default=(0, 1, 2))
+    summary.add_argument("--gpu-list", default="0,1,2,3,4,5")
     summary.set_defaults(function=summarize)
     return parser
 
