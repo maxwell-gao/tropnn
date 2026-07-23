@@ -875,28 +875,43 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         removed_fraction = (
             drop_mean / gain_mean if gain_mean > 0.0 else float("nan")
         )
+        dense_absolute_passed = dense_mean >= DENSE_R1_THRESHOLD
+        dense_gain_passed = gain_mean >= DENSE_OVER_KEY_THRESHOLD
+        raw_shuffle_passed = (
+            math.isfinite(removed_fraction)
+            and removed_fraction >= SHUFFLE_REMOVAL_THRESHOLD
+        )
+        shuffle_prerequisites_passed = (
+            dense_absolute_passed and dense_gain_passed
+        )
         gates = {
             "dense_absolute": {
                 "value": dense_mean,
                 "sem": dense_sem,
                 "threshold": DENSE_R1_THRESHOLD,
-                "passed": dense_mean >= DENSE_R1_THRESHOLD,
+                "passed": dense_absolute_passed,
             },
             "dense_over_key_only": {
                 "value": gain_mean,
                 "sem": gain_sem,
                 "paired_deltas": paired_gain,
                 "threshold": DENSE_OVER_KEY_THRESHOLD,
-                "passed": gain_mean >= DENSE_OVER_KEY_THRESHOLD,
+                "passed": dense_gain_passed,
             },
             "query_shuffle_gain_removal": {
                 "dense_drop": drop_mean,
                 "dense_drop_sem": drop_sem,
                 "value": removed_fraction,
                 "threshold": SHUFFLE_REMOVAL_THRESHOLD,
+                "raw_threshold_passed": raw_shuffle_passed,
+                "prerequisites_passed": shuffle_prerequisites_passed,
                 "passed": (
-                    math.isfinite(removed_fraction)
-                    and removed_fraction >= SHUFFLE_REMOVAL_THRESHOLD
+                    shuffle_prerequisites_passed and raw_shuffle_passed
+                ),
+                "reason": (
+                    None
+                    if shuffle_prerequisites_passed
+                    else "Dense absolute and relative qualification failed"
                 ),
             },
         }
@@ -927,8 +942,34 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         atomic_csv_write(args.result_dir / "summary.csv", aggregate)
 
     metadata = json.loads((args.cache_dir / "metadata.json").read_text())
+    common_config = results[0]["config"] if results else {}
+    if complete:
+        key_mean = statistics.mean(key)
+        dense_mean = statistics.mean(dense)
+        interpretation = (
+            f"Key-only reaches {key_mean:.4f} R@1, only "
+            f"{key_mean - 1.0 / CANDIDATE_COUNT:.4f} above random. Dense "
+            f"reaches {dense_mean:.4f} and adds just "
+            f"{gates['dense_over_key_only']['value']:.4f} over key-only; "
+            f"the paired SEM is {gates['dense_over_key_only']['sem']:.4f}. "
+            "This is not strong transferable query-key retrieval geometry. "
+            "The small absolute shuffle drop does not rescue the claim because "
+            "the reference Dense gain never qualified."
+        )
+    else:
+        interpretation = (
+            "The six-run matrix is incomplete, so no representation or "
+            "relation-kernel conclusion is available."
+        )
     lines = [
         "# Hard-only Wiki103 Induction Qualification",
+        "",
+        "## Outcome",
+        "",
+        "The hard-only frozen-state benchmark fails to qualify relation-kernel "
+        "research. Dense QK remains close to both random and the parameter-"
+        "matched key-only shortcut, so neither an ordinal kernel nor a "
+        "BitNet/MADDNESS compilation is tested on this representation.",
         "",
         "## Protocol",
         "",
@@ -946,7 +987,16 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         "",
         "Key-only is a parameter-matched nonlinear shortcut diagnostic. Dense "
         "QK is a rank-16 qualification diagnostic. Both use the same raw D32 "
-        "coordinates, candidates, labels, optimizer, and three seeds.",
+        "coordinates, candidates, labels, optimizer, and seeds 0, 1, and 2. "
+        f"Each trains for `{common_config.get('epochs', 'unknown')}` epochs "
+        f"with batch `{common_config.get('batch_size', 'unknown')}`, learning "
+        f"rate `{common_config.get('learning_rate', 'unknown')}`, and "
+        "validation-R@1 checkpoint selection.",
+        "",
+        f"Boundary: {metadata['source']['boundary']}. The source is a frozen "
+        "post-training content-score ablation, not a checkpoint trained "
+        "scoreless from initialization. The future target constructs candidates "
+        "and labels only; it is absent from every query/key row.",
         "",
         "## Results",
         "",
@@ -971,9 +1021,55 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         f"`{'PASS' if gates['dense_absolute']['passed'] else 'FAIL'}`.",
         f"- Dense minus key-only test R@1 >= 0.10: "
         f"`{'PASS' if gates['dense_over_key_only']['passed'] else 'FAIL'}`.",
-        f"- Query shuffle removes >=80% of Dense gain over key-only: "
+        f"- After Dense qualification, query shuffle removes >=80% of its "
+        f"gain over key-only: "
         f"`{'PASS' if gates['query_shuffle_gain_removal']['passed'] else 'FAIL'}`.",
         f"- Next stage: `{decision['next_stage']}`.",
+        "",
+    ]
+    if complete:
+        lines += [
+            f"Dense minus key-only test R@1 is "
+            f"`{gates['dense_over_key_only']['value']:.4f} +/- "
+            f"{gates['dense_over_key_only']['sem']:.4f}` across paired seeds. "
+            f"Query shuffle lowers Dense by "
+            f"`{gates['query_shuffle_gain_removal']['dense_drop']:.4f} +/- "
+            f"{gates['query_shuffle_gain_removal']['dense_drop_sem']:.4f}`. "
+            "The removal ratio is not qualifying when the Dense reference "
+            "gain itself fails its absolute and relative gates.",
+            "",
+            "Per-seed audit:",
+            "",
+            "| Decoder | Seed | Best epoch | Val R@1 | Test R@1 | "
+            "Shuffled test R@1 |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+        for result in sorted(
+            results,
+            key=lambda item: (
+                DECODERS.index(item["config"]["decoder"]),
+                item["config"]["seed"],
+            ),
+        ):
+            lines.append(
+                f"| {result['config']['decoder']} | "
+                f"{result['config']['seed']} | {result['best_epoch']} | "
+                f"{result['validation']['recall_at_1']:.4f} | "
+                f"{result['test']['recall_at_1']:.4f} | "
+                f"{result['test_query_shuffle']['recall_at_1']:.4f} |"
+            )
+        lines += [""]
+    lines += [
+        "## Interpretation",
+        "",
+        interpretation,
+        "",
+        "This result supersedes the stronger interpretation of the earlier "
+        "mixed 32-way protocol. The earlier Dense advantage was detectable, "
+        "but it is insufficient evidence for useful native retrieval once all "
+        "candidates share token identity and differ only by successor. The "
+        "correct next action is representation/task diagnosis, not Root, "
+        "BitNet, MADDNESS, or online-attention integration on this cache.",
         "",
         "Failure means the frozen representation/protocol pair has not "
         "qualified relation-kernel research; it does not rank Root-incidence "
@@ -990,6 +1086,11 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         f"- Cache: `{args.cache_dir}` "
         f"(`{metadata['cache_fingerprint']}`).",
         f"- Results: `{args.result_dir}`.",
+        f"- Source checkpoint: `{metadata['source']['checkpoint']}` at step "
+        f"`{metadata['source']['checkpoint_metadata']['global_step']}`.",
+        "- Logs: `logs/wiki103_hard_induction_qualification_20260723/`.",
+        "- Every formal run completed 320 optimizer steps; result JSON and "
+        "history CSV files preserve per-seed metrics.",
     ]
     args.out_report.parent.mkdir(parents=True, exist_ok=True)
     args.out_report.write_text("\n".join(lines) + "\n")

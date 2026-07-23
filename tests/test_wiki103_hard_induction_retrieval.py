@@ -130,6 +130,7 @@ def result_row(
     return {
         "complete": True,
         "config": {"decoder": decoder, "seed": seed},
+        "best_epoch": 10,
         "relation_parameters": {"key_only": 1021, "dense_qk": 1025}[decoder],
         "test": metrics(recall),
         "test_query_shuffle": metrics(shuffled_recall),
@@ -152,6 +153,11 @@ def write_summary_fixture(
         json.dumps(
             {
                 "cache_fingerprint": "cache-hash",
+                "source": {
+                    "boundary": "test source boundary",
+                    "checkpoint": "last.ckpt",
+                    "checkpoint_metadata": {"global_step": 4000},
+                },
                 "protocol": {
                     "query_counts": {
                         "train": 100,
@@ -205,4 +211,13 @@ def test_summary_stops_when_dense_absolute_recall_is_weak(tmp_path) -> None:
     assert decision["complete"] is True
     assert decision["dense_qualification_passed"] is False
     assert decision["gates"]["dense_absolute"]["passed"] is False
+    assert (
+        decision["gates"]["query_shuffle_gain_removal"]["raw_threshold_passed"]
+        is True
+    )
+    assert (
+        decision["gates"]["query_shuffle_gain_removal"]["prerequisites_passed"]
+        is False
+    )
+    assert decision["gates"]["query_shuffle_gain_removal"]["passed"] is False
     assert decision["next_stage"] == "stop_relation_kernel_search"
