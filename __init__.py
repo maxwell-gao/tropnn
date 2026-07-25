@@ -1,6 +1,8 @@
 from .layers import (
     PAIRWISE_ANCHOR_POLICIES,
     AbsDiffLUT,
+    ChamberLiftingStage,
+    ChamberLiftingTower,
     ComparatorTwoSidedMargin,
     ComparisonRelationLUT,
     ComparisonRelationSpec,
@@ -16,6 +18,7 @@ from .layers import (
     PairwiseWalshLinear,
     PairwiseWalshLUT,
     circulant_relation_edges,
+    permutation_rank4,
     s4_fourier_energy,
     s4_gauge_maps,
     s4_tables,
@@ -23,6 +26,8 @@ from .layers import (
 
 __all__ = [
     "AbsDiffLUT",
+    "ChamberLiftingStage",
+    "ChamberLiftingTower",
     "ComparatorTwoSidedMargin",
     "CoxeterLUT",
     "CoxeterRoute",
@@ -39,6 +44,7 @@ __all__ = [
     "PairwiseWalshLinear",
     "PairwiseWalshLUT",
     "circulant_relation_edges",
+    "permutation_rank4",
     "s4_fourier_energy",
     "s4_gauge_maps",
     "s4_tables",

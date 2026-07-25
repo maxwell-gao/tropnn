@@ -50,6 +50,7 @@ tropnn-emnist-route-conditioned = "tropnn.tools.emnist_route_conditioned:main"
 tropnn-partition-geometry-probe = "tropnn.tools.partition_geometry_probe:main"
 tropnn-emnist-braid-generators = "tropnn.tools.emnist_braid_generators:main"
 tropnn-emnist-cross-layer-anchor-sharing = "tropnn.tools.emnist_cross_layer_anchor_sharing:main"
+tropnn-chamber-lifting-qkv = "tropnn.tools.chamber_lifting_qkv_probe:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

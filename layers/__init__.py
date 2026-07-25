@@ -1,4 +1,5 @@
 from .base import LUTModuleBase
+from .chamber_lifting import ChamberLiftingStage, ChamberLiftingTower, permutation_rank4
 from .comparator_margin import ComparatorTwoSidedMargin
 from .coxeter import CoxeterLUT, CoxeterRoute, K4FullLUT
 from .pair_kernel import (
@@ -26,6 +27,8 @@ PairwiseWalshLinear = PairwiseWalshLUT
 __all__ = [
     "AbsDiffLUT",
     "BalancedS4Router",
+    "ChamberLiftingStage",
+    "ChamberLiftingTower",
     "ComparatorTwoSidedMargin",
     "CoxeterLUT",
     "CoxeterPairScorer",
@@ -54,6 +57,7 @@ __all__ = [
     "circulant_relation_edges",
     "coxeter_representation_features",
     "quantize_relation_coefficients",
+    "permutation_rank4",
     "s4_fourier_energy",
     "s4_gauge_maps",
     "s4_tables",
