@@ -83,6 +83,51 @@ def test_comparator_output_major_layout_preserves_sparse_writes() -> None:
             assert int(layer.write_indices[route, side, slot].item()) == dst
 
 
+def test_binary_comparator_matches_scaled_signed_float_initialization_and_trains_master() -> None:
+    torch.manual_seed(0)
+    binary = ComparatorTwoSidedMargin(
+        16,
+        11,
+        tables=5,
+        comparisons=3,
+        k_c=7,
+        backend="torch",
+        seed=4,
+        use_output_scaling=False,
+        weight_mode="binary",
+    )
+    float_ref = ComparatorTwoSidedMargin(
+        16,
+        11,
+        tables=5,
+        comparisons=3,
+        k_c=7,
+        backend="torch",
+        seed=4,
+        use_output_scaling=False,
+        weight_mode="float",
+    )
+    x_binary = torch.randn(6, 16, requires_grad=True)
+    x_float = x_binary.detach().clone().requires_grad_(True)
+
+    y_binary = binary(x_binary)
+    y_float = float_ref(x_float)
+
+    assert torch.equal(binary.hard_write_codes().unique(), torch.tensor([-1, 1], dtype=torch.int8))
+    assert binary.binary_code_flip_fraction() == 0.0
+    assert torch.allclose(y_binary, y_float)
+    y_binary.square().mean().backward()
+    assert binary.write_weight.grad is not None
+    assert binary.write_weight.grad.abs().sum() > 0
+    assert binary.thresholds.grad is not None
+    assert binary.thresholds.grad.abs().sum() > 0
+
+
+def test_binary_comparator_rejects_zero_weight_initialization() -> None:
+    with pytest.raises(ValueError, match="require weight_init='signed'"):
+        ComparatorTwoSidedMargin(8, 5, tables=2, comparisons=2, k_c=3, weight_mode="binary", weight_init="zero")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available() or not has_comparator_margin_triton(), reason="CUDA Triton backend is not available")
 def test_comparator_output_major_triton_matches_scatter_forward_backward() -> None:
     torch.manual_seed(0)

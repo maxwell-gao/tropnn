@@ -14,8 +14,15 @@ from .pairwise import PAIRWISE_ANCHOR_POLICIES, PairwiseRoute, _compute_dtype_fo
 ComparatorWritePolicy = Literal["endpoint", "local-linegraph", "expander"]
 ComparatorReductionLayout = Literal["scatter", "output_major", "tile_local"]
 ComparatorWeightInit = Literal["signed", "zero"]
+ComparatorWeightMode = Literal["float", "binary"]
 
-__all__ = ["ComparatorReductionLayout", "ComparatorTwoSidedMargin", "ComparatorWeightInit", "ComparatorWritePolicy"]
+__all__ = [
+    "ComparatorReductionLayout",
+    "ComparatorTwoSidedMargin",
+    "ComparatorWeightInit",
+    "ComparatorWeightMode",
+    "ComparatorWritePolicy",
+]
 
 
 @dataclass(frozen=True)
@@ -32,6 +39,7 @@ class ComparatorTwoSidedMarginSpec:
     reduction_layout: ComparatorReductionLayout
     output_tile_size: int
     weight_init: ComparatorWeightInit
+    weight_mode: ComparatorWeightMode
     use_output_scaling: bool
 
     def __post_init__(self) -> None:
@@ -53,6 +61,10 @@ class ComparatorTwoSidedMarginSpec:
             raise ValueError("output_tile_size must be one of 16, 32, 64, or 128")
         if self.weight_init not in {"signed", "zero"}:
             raise ValueError(f"unsupported weight_init {self.weight_init!r}")
+        if self.weight_mode not in {"float", "binary"}:
+            raise ValueError(f"unsupported weight_mode {self.weight_mode!r}")
+        if self.weight_mode == "binary" and self.weight_init == "zero":
+            raise ValueError("binary write weights require weight_init='signed'")
 
     @property
     def routes(self) -> int:
@@ -84,6 +96,7 @@ class ComparatorTwoSidedMargin(nn.Module):
         reduction_layout: ComparatorReductionLayout = "scatter",
         output_tile_size: int = 32,
         weight_init: ComparatorWeightInit = "signed",
+        weight_mode: ComparatorWeightMode = "float",
         use_output_scaling: bool = True,
         fixed_zero_threshold: bool = False,
     ) -> None:
@@ -101,6 +114,7 @@ class ComparatorTwoSidedMargin(nn.Module):
             reduction_layout,
             int(output_tile_size),
             weight_init,
+            weight_mode,
             bool(use_output_scaling),
         )
         self.spec = spec
@@ -116,6 +130,7 @@ class ComparatorTwoSidedMargin(nn.Module):
         self.reduction_layout = spec.reduction_layout
         self.output_tile_size = spec.output_tile_size
         self.weight_init = spec.weight_init
+        self.weight_mode = spec.weight_mode
         self.output_scale = spec.output_scale
         self.payload_width = spec.k_c
         self.write_degree = 2 * spec.k_c
@@ -131,8 +146,15 @@ class ComparatorTwoSidedMargin(nn.Module):
         self.register_buffer("csr_sources", csr_sources)
         self.register_buffer("csr_weight_indices", csr_weight_indices)
         self.csr_max_degree = csr_max_degree
-        write_weight = torch.zeros_like(write_signs) if spec.weight_init == "zero" else write_signs / math.sqrt(float(spec.k_c))
+        if spec.weight_init == "zero":
+            write_weight = torch.zeros_like(write_signs)
+        elif spec.weight_mode == "binary":
+            write_weight = write_signs * math.atanh(0.75)
+        else:
+            write_weight = write_signs / math.sqrt(float(spec.k_c))
         self.write_weight = nn.Parameter(write_weight)
+        initial_write_codes = write_signs.to(torch.int8) if spec.weight_mode == "binary" else torch.empty(0, dtype=torch.int8)
+        self.register_buffer("initial_write_codes", initial_write_codes)
 
         thresholds = torch.zeros(spec.tables, spec.comparisons)
         self.register_buffer("thresholds", thresholds) if fixed_zero_threshold else setattr(self, "thresholds", nn.Parameter(thresholds))
@@ -159,13 +181,36 @@ class ComparatorTwoSidedMargin(nn.Module):
     def clear_packed_payload_cache(self) -> None:
         return None
 
+    @property
+    def binary_weight_scale(self) -> float:
+        return 1.0 / math.sqrt(float(self.k_c))
+
+    def hard_write_codes(self) -> Tensor:
+        if self.weight_mode != "binary":
+            raise RuntimeError("hard_write_codes is defined only for binary write weights")
+        bounded = torch.tanh(self.write_weight.detach())
+        return torch.where(bounded >= 0, torch.ones_like(bounded), -torch.ones_like(bounded)).to(torch.int8)
+
+    def binary_code_flip_fraction(self) -> float:
+        if self.weight_mode != "binary":
+            return math.nan
+        return float((self.hard_write_codes().cpu() != self.initial_write_codes.cpu()).float().mean().item())
+
+    def _materialized_write_weight(self) -> Tensor:
+        if self.weight_mode == "float":
+            return self.write_weight
+        bounded = torch.tanh(self.write_weight)
+        hard = torch.where(bounded >= 0, torch.ones_like(bounded), -torch.ones_like(bounded))
+        ste = bounded + (hard - bounded).detach()
+        return ste * self.binary_weight_scale
+
     def extra_repr(self) -> str:
         return (
             f"input_dim={self.input_dim}, output_dim={self.output_dim}, tables={self.tables}, "
             f"comparisons={self.comparisons}, k_c={self.k_c}, backend={self.backend!r}, "
             f"anchor_policy={self.anchor_policy!r}, write_policy={self.write_policy!r}, "
             f"reduction_layout={self.reduction_layout!r}, output_tile_size={self.output_tile_size}, "
-            f"weight_init={self.weight_init!r}"
+            f"weight_init={self.weight_init!r}, weight_mode={self.weight_mode!r}"
         )
 
     def _make_write_pattern(self, seed: int) -> tuple[Tensor, Tensor]:
@@ -246,7 +291,9 @@ class ComparatorTwoSidedMargin(nn.Module):
     def _torch_output(self, margins: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
         items = margins.shape[0]
         values = torch.stack((F.relu(margins), F.relu(-margins)), dim=-1).reshape(items, self.routes, 2)
-        weighted = values.unsqueeze(-1) * self.write_weight.to(device=margins.device, dtype=compute_dtype).unsqueeze(0)
+        weighted = values.unsqueeze(-1) * self._materialized_write_weight().to(
+            device=margins.device, dtype=compute_dtype
+        ).unsqueeze(0)
         output = torch.zeros(items, self.output_dim, device=margins.device, dtype=compute_dtype)
         indices = self.write_indices.to(device=margins.device).view(1, self.routes, 2, self.k_c).expand(items, -1, -1, -1)
         output.scatter_add_(1, indices.reshape(items, -1), weighted.reshape(items, -1))
@@ -259,13 +306,14 @@ class ComparatorTwoSidedMargin(nn.Module):
             comparator_two_sided_margin_triton,
         )
 
+        materialized_write_weight = self._materialized_write_weight()
         if self.reduction_layout == "output_major":
             return comparator_two_sided_margin_output_major_triton(
                 x_flat.contiguous().float(),
                 self.anchors.to(device=x_flat.device),
                 self.thresholds.to(device=x_flat.device, dtype=torch.float32),
                 self.write_indices.to(device=x_flat.device),
-                self.write_weight.to(device=x_flat.device),
+                materialized_write_weight.to(device=x_flat.device),
                 self.csr_offsets.to(device=x_flat.device),
                 self.csr_sources.to(device=x_flat.device),
                 self.csr_weight_indices.to(device=x_flat.device),
@@ -279,7 +327,7 @@ class ComparatorTwoSidedMargin(nn.Module):
                 self.anchors.to(device=x_flat.device),
                 self.thresholds.to(device=x_flat.device, dtype=torch.float32),
                 self.write_indices.to(device=x_flat.device),
-                self.write_weight.to(device=x_flat.device),
+                materialized_write_weight.to(device=x_flat.device),
                 output_tile_size=int(self.output_tile_size),
                 output_dim=self.output_dim,
                 output_scale=self.output_scale,
@@ -290,7 +338,7 @@ class ComparatorTwoSidedMargin(nn.Module):
             self.anchors.to(device=x_flat.device),
             self.thresholds.to(device=x_flat.device, dtype=torch.float32),
             self.write_indices.to(device=x_flat.device),
-            self.write_weight.to(device=x_flat.device),
+            materialized_write_weight.to(device=x_flat.device),
             output_dim=self.output_dim,
             output_scale=self.output_scale,
         )

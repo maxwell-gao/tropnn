@@ -2004,6 +2004,7 @@ class PayloadWidthEmnistClassifier(nn.Module):
         comparator_write_policy: ComparatorWritePolicy,
         comparator_reduction_layout: Literal["scatter", "output_major", "tile_local"],
         comparator_output_tile_size: int,
+        comparator_weight_mode: Literal["float", "binary"],
         ternary_threshold: float,
         compare_swap_alpha_init: float,
         compare_swap_pair_count: int,
@@ -2225,6 +2226,7 @@ class PayloadWidthEmnistClassifier(nn.Module):
                     write_policy=comparator_write_policy,
                     reduction_layout=comparator_reduction_layout,
                     output_tile_size=comparator_output_tile_size,
+                    weight_mode=comparator_weight_mode,
                     anchor_policy=anchor_policy,
                     seed=layer_seed,
                     use_output_scaling=use_output_scaling,
@@ -2261,6 +2263,7 @@ class PayloadWidthEmnistClassifier(nn.Module):
                         write_policy=comparator_write_policy,
                         reduction_layout=comparator_reduction_layout,
                         output_tile_size=comparator_output_tile_size,
+                        weight_mode=comparator_weight_mode,
                         anchor_policy=anchor_policy,
                         seed=layer_seed,
                         use_output_scaling=use_output_scaling,
@@ -2615,6 +2618,7 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         comparator_write_policy=args.comparator_write_policy,
         comparator_reduction_layout=args.comparator_reduction_layout,
         comparator_output_tile_size=args.comparator_output_tile_size,
+        comparator_weight_mode=args.comparator_weight_mode,
         ternary_threshold=args.ternary_threshold,
         compare_swap_alpha_init=args.compare_swap_alpha_init,
         compare_swap_pair_count=args.compare_swap_pair_count,
@@ -2680,6 +2684,7 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
     hard_direction_density = (
         float((first_layer.hard_direction_codes() != 0).float().mean().item()) if is_ternary_action else math.nan
     )
+    is_binary_comparator = isinstance(first_layer, ComparatorTwoSidedMargin) and first_layer.weight_mode == "binary"
     return {
         "payload_variant": args.payload_variant,
         "payload_label": spec.payload_label,
@@ -2699,6 +2704,8 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         "comparator_write_policy": args.comparator_write_policy if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else "none",
         "comparator_reduction_layout": args.comparator_reduction_layout if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else "none",
         "comparator_output_tile_size": args.comparator_output_tile_size if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else 0,
+        "comparator_weight_mode": first_layer.weight_mode if isinstance(first_layer, ComparatorTwoSidedMargin) else "none",
+        "binary_write_flip_fraction": first_layer.binary_code_flip_fraction() if is_binary_comparator else math.nan,
         "ternary_action_mode": first_layer.mode if is_ternary_action else "none",
         "ternary_threshold": args.ternary_threshold if is_ternary_action else 0.0,
         "hard_input_density": hard_input_density,
@@ -2778,6 +2785,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comparator-write-policy", choices=["endpoint", "local-linegraph", "expander"], default="endpoint")
     parser.add_argument("--comparator-reduction-layout", choices=["scatter", "output_major", "tile_local"], default="scatter")
     parser.add_argument("--comparator-output-tile-size", type=int, choices=[16, 32, 64, 128], default=32)
+    parser.add_argument("--comparator-weight-mode", choices=["float", "binary"], default="float")
     parser.add_argument("--ternary-threshold", type=float, default=0.5)
     parser.add_argument("--compare-swap-alpha-init", type=float, default=0.0)
     parser.add_argument("--compare-swap-pair-count", type=int, default=0)
