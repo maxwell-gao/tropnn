@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 from tropnn.backends.comparator_margin_triton import has_comparator_margin_triton
@@ -126,6 +128,38 @@ def test_binary_comparator_matches_scaled_signed_float_initialization_and_trains
 def test_binary_comparator_rejects_zero_weight_initialization() -> None:
     with pytest.raises(ValueError, match="require weight_init='signed'"):
         ComparatorTwoSidedMargin(8, 5, tables=2, comparisons=2, k_c=3, weight_mode="binary", weight_init="zero")
+
+
+def test_ternary_comparator_materializes_zero_and_signed_write_codes_with_gradient() -> None:
+    layer = ComparatorTwoSidedMargin(
+        12,
+        9,
+        tables=4,
+        comparisons=3,
+        k_c=5,
+        backend="torch",
+        seed=6,
+        use_output_scaling=False,
+        weight_mode="ternary",
+        ternary_threshold=0.5,
+    )
+    with torch.no_grad():
+        layer.write_weight.reshape(-1)[:3].copy_(torch.tensor([math.atanh(0.75), 0.0, -math.atanh(0.75)]))
+
+    codes = layer.hard_write_codes()
+    materialized = layer._materialized_write_weight().detach()
+
+    assert torch.equal(codes.reshape(-1)[:3], torch.tensor([1, 0, -1], dtype=torch.int8))
+    assert torch.allclose(materialized, codes.float() / math.sqrt(layer.k_c))
+    assert layer.quantized_code_zero_fraction() > 0
+    assert layer.quantized_code_change_fraction() > 0
+
+    x = torch.randn(7, 12, requires_grad=True)
+    layer(x).square().mean().backward()
+    assert layer.write_weight.grad is not None
+    assert layer.write_weight.grad.abs().sum() > 0
+    assert layer.thresholds.grad is not None
+    assert layer.thresholds.grad.abs().sum() > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not has_comparator_margin_triton(), reason="CUDA Triton backend is not available")

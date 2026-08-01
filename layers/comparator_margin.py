@@ -14,7 +14,7 @@ from .pairwise import PAIRWISE_ANCHOR_POLICIES, PairwiseRoute, _compute_dtype_fo
 ComparatorWritePolicy = Literal["endpoint", "local-linegraph", "expander"]
 ComparatorReductionLayout = Literal["scatter", "output_major", "tile_local"]
 ComparatorWeightInit = Literal["signed", "zero"]
-ComparatorWeightMode = Literal["float", "binary"]
+ComparatorWeightMode = Literal["float", "binary", "ternary"]
 
 __all__ = [
     "ComparatorReductionLayout",
@@ -40,6 +40,7 @@ class ComparatorTwoSidedMarginSpec:
     output_tile_size: int
     weight_init: ComparatorWeightInit
     weight_mode: ComparatorWeightMode
+    ternary_threshold: float
     use_output_scaling: bool
 
     def __post_init__(self) -> None:
@@ -61,10 +62,12 @@ class ComparatorTwoSidedMarginSpec:
             raise ValueError("output_tile_size must be one of 16, 32, 64, or 128")
         if self.weight_init not in {"signed", "zero"}:
             raise ValueError(f"unsupported weight_init {self.weight_init!r}")
-        if self.weight_mode not in {"float", "binary"}:
+        if self.weight_mode not in {"float", "binary", "ternary"}:
             raise ValueError(f"unsupported weight_mode {self.weight_mode!r}")
         if self.weight_mode == "binary" and self.weight_init == "zero":
             raise ValueError("binary write weights require weight_init='signed'")
+        if not 0.0 < self.ternary_threshold < 1.0:
+            raise ValueError("ternary_threshold must be in (0, 1)")
 
     @property
     def routes(self) -> int:
@@ -97,6 +100,7 @@ class ComparatorTwoSidedMargin(nn.Module):
         output_tile_size: int = 32,
         weight_init: ComparatorWeightInit = "signed",
         weight_mode: ComparatorWeightMode = "float",
+        ternary_threshold: float = 0.5,
         use_output_scaling: bool = True,
         fixed_zero_threshold: bool = False,
     ) -> None:
@@ -115,6 +119,7 @@ class ComparatorTwoSidedMargin(nn.Module):
             int(output_tile_size),
             weight_init,
             weight_mode,
+            float(ternary_threshold),
             bool(use_output_scaling),
         )
         self.spec = spec
@@ -131,6 +136,7 @@ class ComparatorTwoSidedMargin(nn.Module):
         self.output_tile_size = spec.output_tile_size
         self.weight_init = spec.weight_init
         self.weight_mode = spec.weight_mode
+        self.ternary_threshold = spec.ternary_threshold
         self.output_scale = spec.output_scale
         self.payload_width = spec.k_c
         self.write_degree = 2 * spec.k_c
@@ -148,12 +154,14 @@ class ComparatorTwoSidedMargin(nn.Module):
         self.csr_max_degree = csr_max_degree
         if spec.weight_init == "zero":
             write_weight = torch.zeros_like(write_signs)
-        elif spec.weight_mode == "binary":
+        elif spec.weight_mode in {"binary", "ternary"}:
             write_weight = write_signs * math.atanh(0.75)
         else:
             write_weight = write_signs / math.sqrt(float(spec.k_c))
         self.write_weight = nn.Parameter(write_weight)
-        initial_write_codes = write_signs.to(torch.int8) if spec.weight_mode == "binary" else torch.empty(0, dtype=torch.int8)
+        initial_write_codes = (
+            write_signs.to(torch.int8) if spec.weight_mode in {"binary", "ternary"} else torch.empty(0, dtype=torch.int8)
+        )
         self.register_buffer("initial_write_codes", initial_write_codes)
 
         thresholds = torch.zeros(spec.tables, spec.comparisons)
@@ -186,21 +194,54 @@ class ComparatorTwoSidedMargin(nn.Module):
         return 1.0 / math.sqrt(float(self.k_c))
 
     def hard_write_codes(self) -> Tensor:
-        if self.weight_mode != "binary":
-            raise RuntimeError("hard_write_codes is defined only for binary write weights")
+        if self.weight_mode not in {"binary", "ternary"}:
+            raise RuntimeError("hard_write_codes is defined only for quantized write weights")
         bounded = torch.tanh(self.write_weight.detach())
-        return torch.where(bounded >= 0, torch.ones_like(bounded), -torch.ones_like(bounded)).to(torch.int8)
+        if self.weight_mode == "binary":
+            hard = torch.where(bounded >= 0, torch.ones_like(bounded), -torch.ones_like(bounded))
+        else:
+            hard = torch.where(
+                bounded > self.ternary_threshold,
+                torch.ones_like(bounded),
+                torch.where(
+                    bounded < -self.ternary_threshold,
+                    -torch.ones_like(bounded),
+                    torch.zeros_like(bounded),
+                ),
+            )
+        return hard.to(torch.int8)
+
+    def quantized_code_change_fraction(self) -> float:
+        if self.weight_mode not in {"binary", "ternary"}:
+            return math.nan
+        return float((self.hard_write_codes().cpu() != self.initial_write_codes.cpu()).float().mean().item())
+
+    def quantized_code_zero_fraction(self) -> float:
+        if self.weight_mode not in {"binary", "ternary"}:
+            return math.nan
+        return float((self.hard_write_codes() == 0).float().mean().item())
 
     def binary_code_flip_fraction(self) -> float:
         if self.weight_mode != "binary":
             return math.nan
-        return float((self.hard_write_codes().cpu() != self.initial_write_codes.cpu()).float().mean().item())
+        return self.quantized_code_change_fraction()
 
     def _materialized_write_weight(self) -> Tensor:
         if self.weight_mode == "float":
             return self.write_weight
         bounded = torch.tanh(self.write_weight)
-        hard = torch.where(bounded >= 0, torch.ones_like(bounded), -torch.ones_like(bounded))
+        if self.weight_mode == "binary":
+            hard = torch.where(bounded >= 0, torch.ones_like(bounded), -torch.ones_like(bounded))
+        else:
+            hard = torch.where(
+                bounded > self.ternary_threshold,
+                torch.ones_like(bounded),
+                torch.where(
+                    bounded < -self.ternary_threshold,
+                    -torch.ones_like(bounded),
+                    torch.zeros_like(bounded),
+                ),
+            )
         ste = bounded + (hard - bounded).detach()
         return ste * self.binary_weight_scale
 
@@ -210,7 +251,8 @@ class ComparatorTwoSidedMargin(nn.Module):
             f"comparisons={self.comparisons}, k_c={self.k_c}, backend={self.backend!r}, "
             f"anchor_policy={self.anchor_policy!r}, write_policy={self.write_policy!r}, "
             f"reduction_layout={self.reduction_layout!r}, output_tile_size={self.output_tile_size}, "
-            f"weight_init={self.weight_init!r}, weight_mode={self.weight_mode!r}"
+            f"weight_init={self.weight_init!r}, weight_mode={self.weight_mode!r}, "
+            f"ternary_threshold={self.ternary_threshold}"
         )
 
     def _make_write_pattern(self, seed: int) -> tuple[Tensor, Tensor]:
