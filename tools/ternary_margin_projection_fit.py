@@ -18,6 +18,7 @@ from ..layers import TernaryMarginAction
 @dataclass(frozen=True)
 class ProjectionFitRow:
     variant: str
+    teacher: str
     seed: int
     dim: int
     atoms: int
@@ -51,10 +52,25 @@ def orthogonal_teacher(dim: int, *, seed: int, device: torch.device) -> Tensor:
     return (q * signs.view(1, -1)).to(device)
 
 
+def ternary_teacher(dim: int, *, seed: int, device: torch.device) -> Tensor:
+    """Return a dense ternary teacher at the layer scale ``1/sqrt(dim)``."""
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    codes = torch.randint(-1, 2, (dim, dim), generator=generator).float()
+    return (codes / math.sqrt(dim)).to(device)
+
+
 def rank_ceiling_nmse(dim: int, atoms: int) -> float:
     """Best rank-``atoms`` NMSE for an orthogonal square teacher."""
 
     return 1.0 - min(dim, atoms) / dim
+
+
+def matrix_rank_ceiling_nmse(teacher: Tensor, atoms: int) -> float:
+    singular_values = torch.linalg.svdvals(teacher.float())
+    keep = min(atoms, singular_values.numel())
+    residual = singular_values[keep:].square().sum()
+    return float((residual / singular_values.square().sum().clamp_min(1e-12)).item())
 
 
 def balanced_supports(input_dim: int, atoms: int, fan_in: int, *, seed: int) -> Tensor:
@@ -74,6 +90,38 @@ class DenseProjection(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(x, self.weight)
+
+
+def _ternary_weight_ste(master: Tensor, threshold: float = 0.5) -> Tensor:
+    bounded = torch.tanh(master)
+    hard = torch.where(
+        bounded > threshold,
+        torch.ones_like(bounded),
+        torch.where(bounded < -threshold, -torch.ones_like(bounded), torch.zeros_like(bounded)),
+    )
+    return bounded + (hard - bounded).detach()
+
+
+class DenseTernaryProjection(nn.Module):
+    """Direct BitNet-like ternary matrix control with a fixed layer scale."""
+
+    def __init__(self, dim: int, *, seed: int) -> None:
+        super().__init__()
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        codes = torch.randint(-1, 2, (dim, dim), generator=generator).float()
+        self.master = nn.Parameter(codes * math.atanh(0.75))
+        self.output_scale = 1.0 / math.sqrt(dim)
+
+    def hard_codes(self) -> Tensor:
+        bounded = torch.tanh(self.master.detach())
+        return torch.where(
+            bounded > 0.5,
+            torch.ones_like(bounded),
+            torch.where(bounded < -0.5, -torch.ones_like(bounded), torch.zeros_like(bounded)),
+        ).to(torch.int8)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.linear(x, _ternary_weight_ste(self.master)) * self.output_scale
 
 
 class DenseLowRankProjection(nn.Module):
@@ -122,6 +170,36 @@ class FixedProjection(nn.Module):
         return F.linear(x, self.weight)
 
 
+class FixedTernaryProjection(nn.Module):
+    def __init__(self, teacher: Tensor, *, optimize_scale: bool) -> None:
+        super().__init__()
+        scale = teacher.new_tensor(1.0 / math.sqrt(teacher.shape[1]))
+        if optimize_scale:
+            for _ in range(32):
+                codes = torch.where(
+                    teacher.abs() > scale / 2,
+                    teacher.sign(),
+                    torch.zeros_like(teacher),
+                )
+                next_scale = (teacher * codes).sum() / codes.square().sum().clamp_min(1)
+                if torch.allclose(next_scale, scale, rtol=0.0, atol=1e-8):
+                    break
+                scale = next_scale
+        codes = torch.where(
+            teacher.abs() > scale / 2,
+            teacher.sign(),
+            torch.zeros_like(teacher),
+        )
+        self.register_buffer("codes", codes.to(torch.int8))
+        self.register_buffer("output_scale", scale)
+
+    def hard_codes(self) -> Tensor:
+        return self.codes
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.linear(x, self.codes.to(dtype=x.dtype)) * self.output_scale.to(dtype=x.dtype)
+
+
 def truncated_svd_teacher(teacher: Tensor, rank: int) -> Tensor:
     u, s, vh = torch.linalg.svd(teacher.float(), full_matrices=False)
     keep = min(rank, s.numel())
@@ -141,8 +219,14 @@ def build_student(
         return FixedProjection(teacher.clone())
     if variant == "svd_oracle":
         return FixedProjection(truncated_svd_teacher(teacher, atoms))
+    if variant == "ternary_oracle_fixed":
+        return FixedTernaryProjection(teacher, optimize_scale=False)
+    if variant == "ternary_oracle_scaled":
+        return FixedTernaryProjection(teacher, optimize_scale=True)
     if variant == "dense":
         return DenseProjection(dim)
+    if variant == "ternary_dense":
+        return DenseTernaryProjection(dim, seed=seed)
     if variant == "float_lowrank":
         return DenseLowRankProjection(dim, atoms, seed=seed)
     if variant == "sparse_float":
@@ -176,6 +260,10 @@ def cosine_mean(pred: Tensor, target: Tensor) -> float:
 
 
 def _hard_code_fractions(model: nn.Module) -> tuple[float, float]:
+    if isinstance(model, FixedTernaryProjection):
+        return math.nan, float((model.hard_codes() == 0).float().mean().item())
+    if isinstance(model, DenseTernaryProjection):
+        return math.nan, float((model.hard_codes() == 0).float().mean().item())
     if not isinstance(model, TernaryMarginAction):
         return math.nan, math.nan
     input_codes = model.hard_input_codes()
@@ -198,10 +286,16 @@ def fit_variant(
     batch_size: int,
     eval_size: int,
     device: str,
+    teacher_kind: str = "orthogonal",
     log_every: int = 0,
 ) -> ProjectionFitRow:
     dev = torch.device(device)
-    teacher = orthogonal_teacher(dim, seed=10_000 + seed, device=dev)
+    if teacher_kind == "orthogonal":
+        teacher = orthogonal_teacher(dim, seed=10_000 + seed, device=dev)
+    elif teacher_kind == "ternary":
+        teacher = ternary_teacher(dim, seed=10_000 + seed, device=dev)
+    else:
+        raise ValueError(f"unknown teacher kind {teacher_kind!r}")
     model = build_student(
         variant,
         teacher=teacher,
@@ -247,16 +341,23 @@ def fit_variant(
 
     return ProjectionFitRow(
         variant=variant,
+        teacher=teacher_kind,
         seed=seed,
         dim=dim,
         atoms=atoms,
         fan_in=fan_in,
         params=params,
         semantic_route_terms=(atoms * fan_in if variant in {"sparse_float", "ternary_margin"} else 0),
-        semantic_action_terms=(atoms * dim if variant in {"float_lowrank", "sparse_float", "ternary_margin"} else 0),
+        semantic_action_terms=(
+            dim * dim
+            if variant in {"ternary_dense", "ternary_oracle_fixed", "ternary_oracle_scaled"}
+            else atoms * dim
+            if variant in {"float_lowrank", "sparse_float", "ternary_margin"}
+            else 0
+        ),
         train_steps=(steps if trainable else 0),
         lr=(lr if trainable else 0.0),
-        rank_ceiling_nmse=rank_ceiling_nmse(dim, atoms),
+        rank_ceiling_nmse=matrix_rank_ceiling_nmse(teacher, atoms),
         eval_mse=mse,
         eval_nmse=nmse,
         eval_r2=1.0 - nmse,
@@ -276,13 +377,17 @@ def _parse_variants(value: str) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fit a full-rank orthogonal linear teacher with dense, low-rank, sparse-float, and ternary students."
+        description="Fit an orthogonal or ternary linear teacher with dense, low-rank, sparse-float, and ternary students."
     )
     parser.add_argument(
         "--variants",
-        default="dense_exact,svd_oracle,dense,float_lowrank,sparse_float,ternary_margin",
+        default=(
+            "dense_exact,svd_oracle,dense,ternary_dense,ternary_oracle_fixed,ternary_oracle_scaled,"
+            "float_lowrank,sparse_float,ternary_margin"
+        ),
     )
     parser.add_argument("--dim", type=int, default=64)
+    parser.add_argument("--teacher", choices=("orthogonal", "ternary"), default="orthogonal")
     parser.add_argument("--atoms", type=int, default=64)
     parser.add_argument("--fan-in", type=int, default=8)
     parser.add_argument("--steps", type=int, default=3000)
@@ -310,6 +415,7 @@ def main() -> None:
             batch_size=args.batch_size,
             eval_size=args.eval_size,
             device=args.device,
+            teacher_kind=args.teacher,
             log_every=args.log_every,
         )
         for variant in _parse_variants(args.variants)
