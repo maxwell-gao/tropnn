@@ -302,7 +302,7 @@ class ComparatorTwoSidedMargin(nn.Module):
             raise ValueError(f"ComparatorTwoSidedMargin expected last dimension {self.input_dim}, got shape {tuple(x.shape)}")
         prefix = x.shape[:-1]
         x_flat = x.reshape(-1, self.input_dim)
-        compute_dtype = compute_dtype if compute_dtype is not None else _compute_dtype_for_lut(x)
+        compute_dtype = compute_dtype if compute_dtype is not None else _compute_dtype_for_lut(x, "fp32")
         backend = "triton" if self.backend == "auto" and x.is_cuda else ("torch" if self.backend == "auto" else self.backend)
         if backend == "triton":
             output_flat, margins_flat = self._triton_output(x_flat)

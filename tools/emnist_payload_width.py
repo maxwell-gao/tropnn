@@ -10,6 +10,8 @@ written by each routed table row:
 * scalar_sign: each scalar row writes a fixed dense sign basis vector.
 * walsh_affine: low-degree Boolean generators plus margin-affine shared slopes.
 * comparator_*_kc: each comparator activation directly writes to k_c output coordinates.
+* ternary_margin_*: T sparse C-fan-in ternary margins drive dense ternary
+  linear or two-sided live actions, with semantic cost O(TC + TD).
 * ladder_*: explicit ablation ladder separating full-code payload width,
   margin-strength output, comparator-side routing, and sparse writes.
 * code_bits_k_hidden: hidden full-vector LUT plus explicit comparator-bit
@@ -38,7 +40,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from tropnn.layers import ComparatorTwoSidedMargin, CoxeterLUT, K4FullLUT
+from tropnn.layers import ComparatorTwoSidedMargin, CoxeterLUT, K4FullLUT, TernaryMarginAction
 from tropnn.layers.pairwise import PAIRWISE_ANCHOR_POLICIES, LutDType, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT, ste_heaviside
 from tropnn.tools.emnist_discrete_payload import (
     AccumulatorMode,
@@ -73,6 +75,8 @@ PayloadVariant = Literal[
     "comparator_margin_kc",
     "comparator_signed_margin_kc",
     "comparator_two_sided_margin_kc",
+    "ternary_margin_linear",
+    "ternary_margin_two_sided",
     "code_bits_k_hidden",
     "compare_swap_independent_hidden",
     "compare_swap_reused_anchor_hidden",
@@ -116,6 +120,8 @@ VARIANT_PAYLOAD_WIDTH: dict[str, int | None] = {
     "comparator_margin_kc": None,
     "comparator_signed_margin_kc": None,
     "comparator_two_sided_margin_kc": None,
+    "ternary_margin_linear": None,
+    "ternary_margin_two_sided": None,
     "code_bits_k_hidden": None,
     "compare_swap_independent_hidden": None,
     "compare_swap_reused_anchor_hidden": None,
@@ -166,6 +172,8 @@ class PayloadSpec:
             return "walsh_affine"
         if self.variant.startswith("comparator_"):
             return self.variant
+        if self.variant.startswith("ternary_margin_"):
+            return self.variant
         if self.variant == "code_bits_k_hidden":
             return f"code_bits_k{self.write_degree}_hidden"
         if self.variant.startswith("compare_swap_"):
@@ -192,6 +200,8 @@ def _payload_spec(variant: PayloadVariant, output_dim: int, write_degree: int) -
         return PayloadSpec(variant=variant, payload_width=max(1, min(write_degree, output_dim)), write_degree=max(1, min(write_degree, output_dim)), dense_sign_basis=False)
     if variant == "walsh_affine" or variant.startswith("comparator_"):
         return PayloadSpec(variant=variant, payload_width=0, write_degree=0, dense_sign_basis=False)
+    if variant.startswith("ternary_margin_"):
+        return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=True)
     if variant == "code_bits_k_hidden":
         group_size = max(1, min(write_degree, output_dim))
         return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=group_size, dense_sign_basis=False)
@@ -1994,6 +2004,7 @@ class PayloadWidthEmnistClassifier(nn.Module):
         comparator_write_policy: ComparatorWritePolicy,
         comparator_reduction_layout: Literal["scatter", "output_major", "tile_local"],
         comparator_output_tile_size: int,
+        ternary_threshold: float,
         compare_swap_alpha_init: float,
         compare_swap_pair_count: int,
         correction_gate_init: float,
@@ -2269,6 +2280,20 @@ class PayloadWidthEmnistClassifier(nn.Module):
                     use_output_scaling=use_output_scaling,
                     use_min_margin_ste=use_min_margin_ste,
                 )
+            if variant.startswith("ternary_margin_"):
+                mode = variant.removeprefix("ternary_margin_")
+                if mode not in {"linear", "two_sided"}:
+                    raise ValueError(f"unknown ternary margin action mode from variant {variant!r}")
+                return TernaryMarginAction(
+                    input_features,
+                    output_features,
+                    atoms=tables,
+                    fan_in=comparisons,
+                    mode=mode,  # type: ignore[arg-type]
+                    seed=layer_seed,
+                    ternary_threshold=ternary_threshold,
+                    use_output_scaling=use_output_scaling,
+                )
             return PayloadWidthLUTLayer(
                 input_features,
                 output_features,
@@ -2530,6 +2555,7 @@ def _build_optimizers(args: argparse.Namespace, model: PayloadWidthEmnistClassif
         or args.payload_variant.startswith("pairwise_glu_")
         or args.payload_variant == "binary_count_gated_lut"
         or args.payload_variant.startswith("comparator_")
+        or args.payload_variant.startswith("ternary_margin_")
         or args.payload_variant.startswith("ladder_")
     ):
         raise ValueError(f"{args.payload_variant} uses generator parameters and currently supports --optimizer adamw only")
@@ -2589,6 +2615,7 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         comparator_write_policy=args.comparator_write_policy,
         comparator_reduction_layout=args.comparator_reduction_layout,
         comparator_output_tile_size=args.comparator_output_tile_size,
+        ternary_threshold=args.ternary_threshold,
         compare_swap_alpha_init=args.compare_swap_alpha_init,
         compare_swap_pair_count=args.compare_swap_pair_count,
         correction_gate_init=args.correction_gate_init,
@@ -2646,6 +2673,13 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
     refinement = _refinement_probe(model, train_loader, args, device=device)
     first_layer = model.payload_layers()[0]
     spec = _payload_spec(args.payload_variant, 28 * 28, args.write_degree)
+    is_ternary_action = isinstance(first_layer, TernaryMarginAction)
+    hard_input_density = (
+        float((first_layer.hard_input_codes() != 0).float().mean().item()) if is_ternary_action else math.nan
+    )
+    hard_direction_density = (
+        float((first_layer.hard_direction_codes() != 0).float().mean().item()) if is_ternary_action else math.nan
+    )
     return {
         "payload_variant": args.payload_variant,
         "payload_label": spec.payload_label,
@@ -2665,6 +2699,12 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         "comparator_write_policy": args.comparator_write_policy if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else "none",
         "comparator_reduction_layout": args.comparator_reduction_layout if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else "none",
         "comparator_output_tile_size": args.comparator_output_tile_size if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else 0,
+        "ternary_action_mode": first_layer.mode if is_ternary_action else "none",
+        "ternary_threshold": args.ternary_threshold if is_ternary_action else 0.0,
+        "hard_input_density": hard_input_density,
+        "hard_direction_density": hard_direction_density,
+        "semantic_route_terms": first_layer.semantic_route_terms if is_ternary_action else 0,
+        "semantic_action_terms": first_layer.semantic_action_terms if is_ternary_action else 0,
         "compare_swap_alpha_init": args.compare_swap_alpha_init if args.payload_variant.startswith("compare_swap_") else 0.0,
         "compare_swap_pair_count": _compare_swap_pair_count(model),
         "compare_swap_alpha_mean": _compare_swap_alpha_mean(model),
@@ -2738,6 +2778,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comparator-write-policy", choices=["endpoint", "local-linegraph", "expander"], default="endpoint")
     parser.add_argument("--comparator-reduction-layout", choices=["scatter", "output_major", "tile_local"], default="scatter")
     parser.add_argument("--comparator-output-tile-size", type=int, choices=[16, 32, 64, 128], default=32)
+    parser.add_argument("--ternary-threshold", type=float, default=0.5)
     parser.add_argument("--compare-swap-alpha-init", type=float, default=0.0)
     parser.add_argument("--compare-swap-pair-count", type=int, default=0)
     parser.add_argument("--correction-gate-init", type=float, default=0.0)

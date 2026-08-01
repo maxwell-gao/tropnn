@@ -20,6 +20,7 @@ from .pair_kernel import (
 from .pairwise import PAIRWISE_ANCHOR_POLICIES, AbsDiffLUT, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT
 from .relation import ComparisonRelationLUT, ComparisonRelationSpec, ComparisonRoute
 from .s4_relation import GaugeAlignedS4Relation, circulant_relation_edges, s4_fourier_energy, s4_gauge_maps, s4_tables
+from .ternary_margin_action import TernaryMarginAction, TernaryMarginActionMode
 
 PairwiseLinear = PairwiseLUT
 PairwiseWalshLinear = PairwiseWalshLUT
@@ -54,6 +55,8 @@ __all__ = [
     "RootIncidenceKernel",
     "S4ObjectFeatures",
     "SameTableFullKernel",
+    "TernaryMarginAction",
+    "TernaryMarginActionMode",
     "circulant_relation_edges",
     "coxeter_representation_features",
     "quantize_relation_coefficients",
