@@ -18,6 +18,13 @@ from .pair_kernel import (
     quantize_relation_coefficients,
 )
 from .pairwise import PAIRWISE_ANCHOR_POLICIES, AbsDiffLUT, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT
+from .quantized_comparison_affine import (
+    QuantizedComparisonAffineLedger,
+    QuantizedComparisonAffineMode,
+    QuantizedComparisonAffineStack,
+    QuantizedComparisonAffineSweep,
+    QuantizedConditionalAffineAssignment,
+)
 from .relation import ComparisonRelationLUT, ComparisonRelationSpec, ComparisonRoute
 from .s4_relation import GaugeAlignedS4Relation, circulant_relation_edges, s4_fourier_energy, s4_gauge_maps, s4_tables
 from .ternary_margin_action import TernaryMarginAction, TernaryMarginActionMode
@@ -50,6 +57,11 @@ __all__ = [
     "PairwiseWalshLinear",
     "PairwiseWalshLUT",
     "QuantizedRootIncidenceKernel",
+    "QuantizedComparisonAffineLedger",
+    "QuantizedComparisonAffineMode",
+    "QuantizedComparisonAffineStack",
+    "QuantizedComparisonAffineSweep",
+    "QuantizedConditionalAffineAssignment",
     "RELATION_QUANTIZATION_SPECS",
     "RelationQuantizationSpec",
     "RootIncidenceKernel",
