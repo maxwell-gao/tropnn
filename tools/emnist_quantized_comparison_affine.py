@@ -452,6 +452,11 @@ def _health_summary(
         "masked_master_displacement_max": masked_displacement,
         "hard_code_values": sorted(code_values),
         "dyadic_scale_values": sorted(set(scale_values)),
+        "raw_log2_scale_master_values": [float(value) for block in model.core.blocks for value in block.log2_scale_master.detach().cpu().tolist()],
+        "raw_scale_master_above_upper_bound_fraction": sum(
+            float(value > args.maximum_scale_exponent) for block in model.core.blocks for value in block.log2_scale_master.detach().cpu().tolist()
+        )
+        / max(1, len(scale_values)),
         "run_stack_rms_ratio_max": run_stack_rms_ratio_max,
     }
 
