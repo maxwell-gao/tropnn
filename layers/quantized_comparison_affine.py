@@ -75,6 +75,19 @@ def _rms(value: Tensor) -> float:
     return float(value.detach().float().square().mean().sqrt().item())
 
 
+def _centered_rms(value: Tensor) -> float:
+    if value.numel() == 0:
+        return 0.0
+    centered = value.detach().float() - value.detach().float().mean(dim=-1, keepdim=True)
+    return float(centered.square().mean().sqrt().item())
+
+
+def _common_rms(value: Tensor) -> float:
+    if value.numel() == 0:
+        return 0.0
+    return float(value.detach().float().mean(dim=-1).square().mean().sqrt().item())
+
+
 def _tensor_hash(items: Iterable[tuple[str, Tensor]]) -> str:
     digest = hashlib.sha256()
     for name, tensor in items:
@@ -198,13 +211,7 @@ class QuantizedConditionalAffineAssignment(nn.Module):
         v = state[:, self.target]
         margin = u - v - self.threshold.to(device=state.device, dtype=state.dtype)
         q = _hard_tanh_ste(margin, self.tau)
-        new_v = (
-            (1.0 + row[_ELL]) * v
-            + row[_SOURCE] * u
-            + row[_BIAS]
-            + row[_HINGE] * F.relu(margin)
-            + q * (row[_SELF_JUMP] * v + row[_BIAS_JUMP])
-        )
+        new_v = (1.0 + row[_ELL]) * v + row[_SOURCE] * u + row[_BIAS] + row[_HINGE] * F.relu(margin) + q * (row[_SELF_JUMP] * v + row[_BIAS_JUMP])
         output = state.clone()
         output[:, self.target] = new_v
         return output
@@ -364,20 +371,8 @@ class QuantizedComparisonAffineSweep(nn.Module):
         q = (margin > 0.0).to(state.dtype) if hard_only else _hard_tanh_ste(margin, self.tau)
         hinge = F.relu(margin)
 
-        new_u = (
-            (1.0 + row_u[_ELL]) * u
-            + row_u[_SOURCE] * v
-            + row_u[_BIAS]
-            + row_u[_HINGE] * hinge
-            + q * (row_u[_SELF_JUMP] * u + row_u[_BIAS_JUMP])
-        )
-        new_v = (
-            (1.0 + row_v[_ELL]) * v
-            + row_v[_SOURCE] * u
-            + row_v[_BIAS]
-            + row_v[_HINGE] * hinge
-            + q * (row_v[_SELF_JUMP] * v + row_v[_BIAS_JUMP])
-        )
+        new_u = (1.0 + row_u[_ELL]) * u + row_u[_SOURCE] * v + row_u[_BIAS] + row_u[_HINGE] * hinge + q * (row_u[_SELF_JUMP] * u + row_u[_BIAS_JUMP])
+        new_v = (1.0 + row_v[_ELL]) * v + row_v[_SOURCE] * u + row_v[_BIAS] + row_v[_HINGE] * hinge + q * (row_v[_SELF_JUMP] * v + row_v[_BIAS_JUMP])
         output = self._join_round(new_u, new_v, stride, self.carrier_dim)
         return output, {
             "u": u,
@@ -390,6 +385,43 @@ class QuantizedComparisonAffineSweep(nn.Module):
             "row_v": row_v,
             "scale": scales[round_index],
         }
+
+    def hard_branch_matrices(self, round_index: int) -> tuple[Tensor, Tensor]:
+        """Return the q=0/q=1 hard-forward 2x2 affine Jacobians.
+
+        These matrices exclude the tanh route-surrogate derivative used only
+        by training.  In ``free`` mode they also do not summarize the finite
+        output jump at the comparison wall.
+        """
+
+        if not 0 <= round_index < self.rounds:
+            raise IndexError(f"round_index must be in [0,{self.rounds}), got {round_index}")
+        coefficients, _scales = self.effective_coefficients()
+        row_u = coefficients[round_index, 0]
+        row_v = coefficients[round_index, 1]
+        matrix_zero = torch.stack(
+            (
+                torch.stack((1.0 + row_u[_ELL], row_u[_SOURCE])),
+                torch.stack((row_v[_SOURCE], 1.0 + row_v[_ELL])),
+            )
+        )
+        matrix_one = torch.stack(
+            (
+                torch.stack(
+                    (
+                        1.0 + row_u[_ELL] + row_u[_HINGE] + row_u[_SELF_JUMP],
+                        row_u[_SOURCE] - row_u[_HINGE],
+                    )
+                ),
+                torch.stack(
+                    (
+                        row_v[_SOURCE] + row_v[_HINGE],
+                        1.0 + row_v[_ELL] - row_v[_HINGE] + row_v[_SELF_JUMP],
+                    )
+                ),
+            )
+        )
+        return matrix_zero, matrix_one
 
     def forward(self, state: Tensor) -> Tensor:
         if state.ndim != 2 or state.shape[1] != self.carrier_dim:
@@ -424,6 +456,12 @@ class QuantizedComparisonAffineSweep(nn.Module):
             wall_jump = torch.stack((jump_u, jump_v), dim=-1)
             branch_coverage = ((q.amin(dim=0) == 0) & (q.amax(dim=0) == 1)).float().mean()
             forced_u, forced_v = self.forced_branch_delta(state_in, round_index)
+            matrix_zero, matrix_one = self.hard_branch_matrices(round_index)
+            matrix_zero = matrix_zero.float()
+            matrix_one = matrix_one.float()
+            singular_values = torch.cat((torch.linalg.svdvals(matrix_zero), torch.linalg.svdvals(matrix_one)))
+            determinants = torch.stack((torch.linalg.det(matrix_zero), torch.linalg.det(matrix_one)))
+            raw_log2_scale = float(self.log2_scale_master[round_index].detach().item())
             rows.append(
                 {
                     "round": round_index,
@@ -433,10 +471,22 @@ class QuantizedComparisonAffineSweep(nn.Module):
                     "tie_fraction": float((margin.abs() <= 1e-6).float().mean().item()),
                     "state_in_rms": _rms(state_in),
                     "state_out_rms": _rms(state),
+                    "state_in_centered_rms": _centered_rms(state_in),
+                    "state_out_centered_rms": _centered_rms(state),
+                    "state_in_common_rms": _common_rms(state_in),
+                    "state_out_common_rms": _common_rms(state),
                     "action_rms": _rms(state - state_in),
                     "wall_jump_rms": _rms(wall_jump),
                     "forced_branch_delta_rms": _rms(torch.stack((forced_u, forced_v), dim=-1)),
                     "scale": float(values["scale"].item()),
+                    "raw_log2_scale_master": raw_log2_scale,
+                    "scale_at_upper_bound": int(float(values["scale"].item()) >= 2.0**self.maximum_scale_exponent),
+                    "scale_master_above_upper_bound": int(raw_log2_scale > self.maximum_scale_exponent),
+                    "hard_branch_sigma_max": float(singular_values.max().item()),
+                    "hard_branch_sigma_min": float(singular_values.min().item()),
+                    "hard_branch_det_min": float(determinants.min().item()),
+                    "hard_branch_det_max": float(determinants.max().item()),
+                    "hard_branch_abs_det_min": float(determinants.abs().min().item()),
                     "code_zero_fraction": float((codes[round_index] == 0).float().mean().item()),
                     "code_change_fraction": float((codes[round_index] != initial_codes[round_index]).float().mean().item()),
                     "threshold_rms": _rms(self.thresholds[round_index]),
@@ -565,12 +615,18 @@ class QuantizedComparisonAffineStack(nn.Module):
     def trace(self, state: Tensor) -> list[dict[str, float | int]]:
         rows: list[dict[str, float | int]] = []
         input_rms = _rms(state)
+        input_centered_rms = _centered_rms(state)
+        input_common_rms = _common_rms(state)
         for block_index, block in enumerate(self.blocks):
             state_in = state
             block_rows = block.trace(state_in)
             state = block(state_in)
             block_input_rms = _rms(state_in)
             block_output_rms = _rms(state)
+            block_input_centered_rms = _centered_rms(state_in)
+            block_output_centered_rms = _centered_rms(state)
+            block_input_common_rms = _common_rms(state_in)
+            block_output_common_rms = _common_rms(state)
             for row in block_rows:
                 rows.append(
                     {
@@ -581,6 +637,14 @@ class QuantizedComparisonAffineStack(nn.Module):
                         "block_output_rms": block_output_rms,
                         "block_gain_rms": block_output_rms / max(block_input_rms, 1e-12),
                         "block_output_over_input_rms": block_output_rms / max(input_rms, 1e-12),
+                        "block_input_centered_rms": block_input_centered_rms,
+                        "block_output_centered_rms": block_output_centered_rms,
+                        "block_centered_gain_rms": block_output_centered_rms / max(block_input_centered_rms, 1e-12),
+                        "block_output_over_input_centered_rms": block_output_centered_rms / max(input_centered_rms, 1e-12),
+                        "block_input_common_rms": block_input_common_rms,
+                        "block_output_common_rms": block_output_common_rms,
+                        "block_common_gain_rms": block_output_common_rms / max(block_input_common_rms, 1e-12),
+                        "block_output_over_input_common_rms": block_output_common_rms / max(input_common_rms, 1e-12),
                     }
                 )
         return rows
@@ -610,10 +674,7 @@ class QuantizedComparisonAffineStack(nn.Module):
 
     def displacement(self) -> dict[str, float]:
         rows = [block.displacement() for block in self.blocks]
-        return {
-            key: math.sqrt(sum(row[key] * row[key] for row in rows) / len(rows))
-            for key in rows[0]
-        }
+        return {key: math.sqrt(sum(row[key] * row[key] for row in rows) / len(rows)) for key in rows[0]}
 
     def block_displacements(self) -> list[dict[str, float]]:
         return [block.displacement() for block in self.blocks]

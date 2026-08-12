@@ -14,6 +14,7 @@ from tropnn.layers.quantized_comparison_affine import (
 )
 from tropnn.tools.emnist_quantized_comparison_affine import (
     EmnistQuantizedComparisonAffineClassifier,
+    parse_args,
 )
 
 
@@ -47,9 +48,7 @@ def test_continuous_sweep_matches_scalar_reference() -> None:
         hinge = torch.relu(margin)
         new_u = u - 0.25 * hinge
         new_v = v + 0.25 * hinge
-        expected = torch.stack(
-            (new_u.reshape(1, -1, stride), new_v.reshape(1, -1, stride)), dim=2
-        ).reshape_as(expected)
+        expected = torch.stack((new_u.reshape(1, -1, stride), new_v.reshape(1, -1, stride)), dim=2).reshape_as(expected)
 
     torch.testing.assert_close(layer(state), expected, rtol=0.0, atol=0.0)
 
@@ -219,6 +218,8 @@ def test_emnist_classifier_uses_common_head_without_hidden_vector_payload() -> N
         "tau": 0.1,
         "ternary_threshold": 0.5,
         "initial_scale_exponent": -4,
+        "minimum_scale_exponent": -8,
+        "maximum_scale_exponent": 0,
         "tables": 4,
         "comparisons": 2,
     }
@@ -230,6 +231,116 @@ def test_emnist_classifier_uses_common_head_without_hidden_vector_payload() -> N
     torch.testing.assert_close(continuous(images), free(images), rtol=0.0, atol=0.0)
     assert continuous(images).shape == (5, 3)
     assert continuous.core.ledger().full_width_payload_scalars == 0
+
+
+def test_scale_cap_preserves_initial_forward_and_bounds_all_effective_scales() -> None:
+    old = QuantizedComparisonAffineStack(
+        depth=2,
+        carrier_dim=8,
+        rounds=3,
+        mode="continuous",
+        initial_scale_exponent=-4,
+        minimum_scale_exponent=-8,
+        maximum_scale_exponent=0,
+    )
+    capped = QuantizedComparisonAffineStack(
+        depth=2,
+        carrier_dim=8,
+        rounds=3,
+        mode="continuous",
+        initial_scale_exponent=-4,
+        minimum_scale_exponent=-8,
+        maximum_scale_exponent=-3,
+    )
+    assert old.initial_hash() == capped.initial_hash()
+    state = torch.randn(37, 8)
+    assert torch.equal(old(state), capped(state))
+
+    with torch.no_grad():
+        for block in capped.blocks:
+            block.log2_scale_master.copy_(torch.tensor([-20.0, -2.6, 7.0]))
+    for block in capped.blocks:
+        _coefficients, scales = block.effective_coefficients()
+        assert bool(torch.all(scales <= 2.0**-3))
+        assert bool(torch.all(scales >= 2.0**-8))
+        assert all(float(value).is_integer() for value in torch.log2(scales).tolist())
+
+
+def test_trace_separates_centered_common_and_branch_spectral_gain() -> None:
+    layer = QuantizedComparisonAffineStack(
+        depth=1,
+        carrier_dim=8,
+        rounds=3,
+        mode="continuous",
+        maximum_scale_exponent=-3,
+    )
+    rows = layer.trace(torch.randn(31, 8))
+    assert len(rows) == 3
+    for row in rows:
+        assert float(row["state_out_centered_rms"]) >= 0.0
+        assert float(row["state_out_common_rms"]) >= 0.0
+        assert float(row["hard_branch_sigma_max"]) >= float(row["hard_branch_sigma_min"]) > 0.0
+        assert float(row["hard_branch_abs_det_min"]) > 0.0
+        assert float(row["scale"]) <= 2.0**-3
+        assert int(row["scale_at_upper_bound"]) in {0, 1}
+
+
+def test_hard_branch_matrices_match_autograd_away_from_the_wall() -> None:
+    layer = QuantizedComparisonAffineSweep(
+        carrier_dim=2,
+        rounds=1,
+        mode="free",
+        initial_scale_exponent=-2,
+    )
+    codes = torch.tensor([[[1.0, -1.0, 1.0, 1.0, -1.0, 1.0], [-1.0, 1.0, -1.0, -1.0, 1.0, -1.0]]])
+    _set_codes(layer, codes)
+    with torch.no_grad():
+        layer.thresholds.fill_(0.125)
+    matrix_zero, matrix_one = layer.hard_branch_matrices(0)
+
+    def hard_round(state: torch.Tensor) -> torch.Tensor:
+        return layer._round(state.unsqueeze(0), 0, hard_only=True)[0].squeeze(0)
+
+    state_zero = torch.tensor([-1.0, 1.0], requires_grad=True)
+    state_one = torch.tensor([1.0, -1.0], requires_grad=True)
+    jacobian_zero = torch.autograd.functional.jacobian(hard_round, state_zero)
+    jacobian_one = torch.autograd.functional.jacobian(hard_round, state_one)
+    torch.testing.assert_close(jacobian_zero, matrix_zero, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(jacobian_one, matrix_one, rtol=0.0, atol=0.0)
+
+
+def test_emnist_scale_cap_v2_cli_defaults_and_rejects_invalid_bounds(tmp_path) -> None:
+    args = parse_args(
+        [
+            "--mode",
+            "continuous",
+            "--root",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+    assert args.initial_scale_exponent == -4
+    assert args.minimum_scale_exponent == -8
+    assert args.maximum_scale_exponent == -3
+
+    try:
+        parse_args(
+            [
+                "--mode",
+                "continuous",
+                "--root",
+                str(tmp_path),
+                "--out-dir",
+                str(tmp_path / "bad"),
+                "--maximum-scale-exponent",
+                "-5",
+            ]
+        )
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError("invalid scale bounds were accepted")
 
 
 def test_addressable_instruction_exactly_implements_max_and_preserves_source() -> None:

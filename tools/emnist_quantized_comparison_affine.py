@@ -42,8 +42,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from tropnn.layers import PairwiseLUT, QuantizedComparisonAffineMode, QuantizedComparisonAffineStack
 from tropnn.tools.emnist_payload_dtype_sweep import _find_emnist_file, _load_emnist_split
 
-SCHEMA_VERSION = "1"
-PROTOCOL_ID = "emnist_qcga_caa_l4_v1"
+SCHEMA_VERSION = "2"
+PROTOCOL_ID = "emnist_qcga_caa_l4_scale_cap_v2"
 
 
 def _rms(value: Tensor) -> float:
@@ -137,9 +137,7 @@ def _strict_json_value(value: object) -> object:
 def _write_json_atomic(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(_strict_json_value(value), indent=2, sort_keys=True, allow_nan=False) + "\n"
-    )
+    temporary.write_text(json.dumps(_strict_json_value(value), indent=2, sort_keys=True, allow_nan=False) + "\n")
     os.replace(temporary, path)
 
 
@@ -221,6 +219,8 @@ class EmnistQuantizedComparisonAffineClassifier(nn.Module):
         tau: float,
         ternary_threshold: float,
         initial_scale_exponent: int,
+        minimum_scale_exponent: int,
+        maximum_scale_exponent: int,
         tables: int,
         comparisons: int,
     ) -> None:
@@ -238,6 +238,8 @@ class EmnistQuantizedComparisonAffineClassifier(nn.Module):
             tau=tau,
             ternary_threshold=ternary_threshold,
             initial_scale_exponent=initial_scale_exponent,
+            minimum_scale_exponent=minimum_scale_exponent,
+            maximum_scale_exponent=maximum_scale_exponent,
         )
         self.readout = PairwiseLUT(
             input_dim,
@@ -377,7 +379,22 @@ def _trace_aggregates(rows: list[dict[str, float | int]]) -> dict[str, float]:
         "state_out_rms_max": max(values("state_out_rms")),
         "block_gain_rms_max": max(values("block_gain_rms")),
         "stack_output_over_input_rms": float(rows[-1]["block_output_over_input_rms"]),
+        "state_out_centered_rms_max": max(values("state_out_centered_rms")),
+        "block_centered_gain_rms_max": max(values("block_centered_gain_rms")),
+        "stack_output_over_input_centered_rms": float(rows[-1]["block_output_over_input_centered_rms"]),
+        "stack_output_over_input_common_rms": float(rows[-1]["block_output_over_input_common_rms"]),
         "scale_mean": mean("scale"),
+        "scale_min": min(values("scale")),
+        "scale_max": max(values("scale")),
+        "raw_log2_scale_master_min": min(values("raw_log2_scale_master")),
+        "raw_log2_scale_master_max": max(values("raw_log2_scale_master")),
+        "scale_at_upper_bound_fraction": mean("scale_at_upper_bound"),
+        "scale_master_above_upper_bound_fraction": mean("scale_master_above_upper_bound"),
+        "hard_branch_sigma_max_max": max(values("hard_branch_sigma_max")),
+        "hard_branch_sigma_min_min": min(values("hard_branch_sigma_min")),
+        "hard_branch_det_min": min(values("hard_branch_det_min")),
+        "hard_branch_det_max": max(values("hard_branch_det_max")),
+        "hard_branch_abs_det_min": min(values("hard_branch_abs_det_min")),
         "code_zero_fraction_mean": mean("code_zero_fraction"),
         "code_change_fraction_mean": mean("code_change_fraction"),
         "threshold_rms_mean": mean("threshold_rms"),
@@ -420,19 +437,13 @@ def _health_summary(
         "forced_branch_delta_live": aggregate["forced_branch_delta_rms_mean"] > 1e-6,
         "state_rms_bounded": run_stack_rms_ratio_max <= args.max_stack_rms_ratio,
         "ternary_alphabet_valid": code_values <= {-1, 0, 1},
-        "dyadic_scales_valid": all(
-            value > 0.0 and abs(math.log2(value) - round(math.log2(value))) <= 1e-7
-            for value in scale_values
+        "dyadic_scales_valid": all(value > 0.0 and abs(math.log2(value) - round(math.log2(value))) <= 1e-7 for value in scale_values),
+        "dyadic_scales_within_registered_bounds": all(
+            2.0**args.minimum_scale_exponent <= value <= 2.0**args.maximum_scale_exponent for value in scale_values
         ),
-        "continuous_wall_matched": (
-            aggregate["wall_jump_rms_max"] <= 1e-8 if args.mode == "continuous" else True
-        ),
+        "continuous_wall_matched": (aggregate["wall_jump_rms_max"] <= 1e-8 if args.mode == "continuous" else True),
         "constant_zero_slope_by_construction": args.mode != "constant"
-        or all(
-            int(value) == 0
-            for block in model.core.blocks
-            for value in block.hard_coefficient_codes()[:, :, [0, 1, 3, 4]].flatten().tolist()
-        ),
+        or all(int(value) == 0 for block in model.core.blocks for value in block.hard_coefficient_codes()[:, :, [0, 1, 3, 4]].flatten().tolist()),
     }
     return {
         "pass": all(checks.values()),
@@ -461,6 +472,8 @@ def _build_model(
         tau=args.tau,
         ternary_threshold=args.ternary_threshold,
         initial_scale_exponent=args.initial_scale_exponent,
+        minimum_scale_exponent=args.minimum_scale_exponent,
+        maximum_scale_exponent=args.maximum_scale_exponent,
         tables=args.tables,
         comparisons=args.comparisons,
     ).to(device)
@@ -482,10 +495,26 @@ def _run_overfit_probe(
     if len(batches) != 2:
         raise RuntimeError("overfit probe requires at least two batches")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
+
+    @torch.no_grad()
+    def trace_batches(step: int) -> dict[str, float | int]:
+        images = torch.cat([batch_images for batch_images, _labels in batches], dim=0)
+        state = images.flatten(1)
+        if model.carrier_dim > model.input_dim:
+            state = F.pad(state, (0, model.carrier_dim - model.input_dim))
+        return {"step": step, **_trace_aggregates(model.core.trace(state))}
+
+    trace_checkpoints: list[dict[str, float | int]] = [trace_batches(0)]
     with torch.no_grad():
         initial_loss = sum(float(F.cross_entropy(model(x), y).item()) for x, y in batches) / 2.0
     coefficient_grad_max = 0.0
     threshold_grad_max = 0.0
+    component_grad_max = {
+        "active_code_grad_norm": 0.0,
+        "masked_code_grad_norm": 0.0,
+        "scale_grad_norm": 0.0,
+        "threshold_grad_norm": 0.0,
+    }
     for step in range(args.overfit_steps):
         images, labels = batches[step % 2]
         optimizer.zero_grad(set_to_none=True)
@@ -501,10 +530,33 @@ def _run_overfit_probe(
             threshold_grad_max,
             _parameter_grad_norm(model.core.threshold_parameters()),
         )
+        for name, value in _core_gradient_components(model.core).items():
+            component_grad_max[name] = max(component_grad_max[name], value)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
+        completed_steps = step + 1
+        if completed_steps % args.overfit_trace_interval == 0 or completed_steps == args.overfit_steps:
+            trace_checkpoints.append(trace_batches(completed_steps))
     with torch.no_grad():
         final_loss = sum(float(F.cross_entropy(model(x), y).item()) for x, y in batches) / 2.0
+    final_trace = trace_checkpoints[-1]
+    smoke_stack_rms_ratio_observed_max = max(float(row["stack_output_over_input_rms"]) for row in trace_checkpoints)
+    smoke_block_gain_rms_observed_max = max(float(row["block_gain_rms_max"]) for row in trace_checkpoints)
+    smoke_checks = {
+        "loss_decreased_10pct": final_loss / initial_loss <= 0.9,
+        "coefficient_gradient_live": coefficient_grad_max > 0.0,
+        "threshold_gradient_live": threshold_grad_max > 0.0,
+        "active_code_gradient_live": component_grad_max["active_code_grad_norm"] > 0.0,
+        "scale_gradient_live": component_grad_max["scale_grad_norm"] > 0.0,
+        "masked_code_gradient_zero": component_grad_max["masked_code_grad_norm"] <= 1e-12,
+        "stack_rms_bounded_at_trace_checkpoints": smoke_stack_rms_ratio_observed_max <= args.smoke_max_stack_rms_ratio,
+        "block_gain_bounded_at_trace_checkpoints": smoke_block_gain_rms_observed_max <= args.smoke_max_block_gain_rms,
+        "branch_minority": float(final_trace["minority_fraction_min"]) >= 0.05,
+        "pair_branch_coverage": float(final_trace["pair_branch_coverage_fraction_mean"]) >= 0.50,
+        "forced_branch_delta_live": float(final_trace["forced_branch_delta_rms_mean"]) > 1e-6,
+        "scale_bound_respected": float(final_trace["scale_max"]) <= 2.0**args.maximum_scale_exponent,
+        "continuous_wall_matched": (float(final_trace["wall_jump_rms_max"]) <= 1e-8 if args.mode == "continuous" else True),
+    }
     result: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "protocol_id": PROTOCOL_ID,
@@ -518,20 +570,20 @@ def _run_overfit_probe(
         "loss_ratio": final_loss / initial_loss,
         "coefficient_grad_max": coefficient_grad_max,
         "threshold_grad_max": threshold_grad_max,
+        "component_grad_max": component_grad_max,
+        "trace_checkpoints": trace_checkpoints,
+        "smoke_stack_rms_ratio_observed_max": smoke_stack_rms_ratio_observed_max,
+        "smoke_block_gain_rms_observed_max": smoke_block_gain_rms_observed_max,
+        "final_trace": final_trace,
         "core_initial_hash": model.core.initial_hash(),
         "head_initial_hash": model.head_initial_hash(),
         "source_manifest": source_manifest,
         "health": {
-            "pass": final_loss / initial_loss <= 0.9
-            and coefficient_grad_max > 0.0
-            and threshold_grad_max > 0.0,
-            "checks": {
-                "loss_decreased_10pct": final_loss / initial_loss <= 0.9,
-                "coefficient_gradient_live": coefficient_grad_max > 0.0,
-                "threshold_gradient_live": threshold_grad_max > 0.0,
-            },
+            "pass": all(smoke_checks.values()),
+            "checks": smoke_checks,
         },
     }
+    _write_csv_atomic(out_dir / "smoke_trace.csv", trace_checkpoints)
     _write_json_atomic(out_dir / "smoke.json", result)
     print(json.dumps(result, sort_keys=True), flush=True)
     return result
@@ -561,17 +613,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if ledger.receptive_field != args.carrier_dim:
         raise RuntimeError(f"core is not globally connected: receptive_field={ledger.receptive_field}")
     if ledger.stored_parameters != core_parameters:
-        raise RuntimeError(
-            f"core parameter ledger mismatch: actual={core_parameters}, registered={ledger.stored_parameters}"
-        )
+        raise RuntimeError(f"core parameter ledger mismatch: actual={core_parameters}, registered={ledger.stored_parameters}")
     if ledger.full_width_payload_scalars != 0:
         raise RuntimeError("core unexpectedly registered a carrier-width payload")
     if any(isinstance(module, nn.Linear) for module in model.core.modules()):
         raise RuntimeError("core contains a forbidden nn.Linear")
-    if any(
-        parameter.ndim >= 2 and parameter.shape[-1] == args.carrier_dim
-        for parameter in model.core.parameters()
-    ):
+    if any(parameter.ndim >= 2 and parameter.shape[-1] == args.carrier_dim for parameter in model.core.parameters()):
         raise RuntimeError("core contains a forbidden carrier-width parameter tensor")
 
     config: dict[str, object] = vars(args).copy()
@@ -656,10 +703,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             **model.core.displacement(),
         }
     )
-    trace_rows.extend(
-        {"mode": args.mode, "seed": args.seed, "epoch": 0, **row}
-        for row in trace
-    )
+    trace_rows.extend({"mode": args.mode, "seed": args.seed, "epoch": 0, **row} for row in trace)
     _write_csv_atomic(out_dir / "metrics.csv", metric_rows)
     _write_csv_atomic(out_dir / "round_trace.csv", trace_rows)
     print(
@@ -700,9 +744,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             head_grad = _parameter_grad_norm(model.readout.parameters())
             block_grads = model.core.block_grad_norms()
             component_grads = _core_gradient_components(model.core)
-            if not math.isfinite(core_grad + head_grad) or not all(
-                math.isfinite(value) for value in block_grads
-            ):
+            if not math.isfinite(core_grad + head_grad) or not all(math.isfinite(value) for value in block_grads):
                 raise RuntimeError(f"nonfinite gradient at epoch={epoch}, step={gradient_steps}")
             core_grad_sum += core_grad
             head_grad_sum += head_grad
@@ -744,19 +786,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "core_block_grad_norm_min": min(block_grad_means),
                 "core_block_grad_norm_max": max(block_grad_means),
                 "head_grad_norm_mean": head_grad_sum / max(1, gradient_steps),
-                **{
-                    f"{name}_mean": value / max(1, gradient_steps)
-                    for name, value in component_grad_sums.items()
-                },
+                **{f"{name}_mean": value / max(1, gradient_steps) for name, value in component_grad_sums.items()},
                 **{f"{name}_max": value for name, value in component_grad_max.items()},
                 **aggregate,
                 **model.core.displacement(),
             }
         )
-        trace_rows.extend(
-            {"mode": args.mode, "seed": args.seed, "epoch": epoch, **row}
-            for row in trace
-        )
+        trace_rows.extend({"mode": args.mode, "seed": args.seed, "epoch": epoch, **row} for row in trace)
         _write_csv_atomic(out_dir / "metrics.csv", metric_rows)
         _write_csv_atomic(out_dir / "round_trace.csv", trace_rows)
         print(
@@ -833,6 +869,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "tau": args.tau,
             "ternary_threshold": args.ternary_threshold,
             "initial_scale_exponent": args.initial_scale_exponent,
+            "minimum_scale_exponent": args.minimum_scale_exponent,
+            "maximum_scale_exponent": args.maximum_scale_exponent,
             "tables": args.tables,
             "comparisons": args.comparisons,
             "batch_size": args.batch_size,
@@ -897,24 +935,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument("--ternary-threshold", type=float, default=0.5)
     parser.add_argument("--initial-scale-exponent", type=int, default=-4)
+    parser.add_argument("--minimum-scale-exponent", type=int, default=-8)
+    parser.add_argument("--maximum-scale-exponent", type=int, default=-3)
     parser.add_argument("--max-stack-rms-ratio", type=float, default=20.0)
+    parser.add_argument("--smoke-max-stack-rms-ratio", type=float, default=12.0)
+    parser.add_argument("--smoke-max-block-gain-rms", type=float, default=4.0)
     parser.add_argument("--tables", type=int, default=64)
     parser.add_argument("--comparisons", type=int, default=6)
     parser.add_argument("--trace-examples", type=int, default=4096)
     parser.add_argument("--max-train", type=int, default=0)
     parser.add_argument("--max-test", type=int, default=0)
     parser.add_argument("--overfit-steps", type=int, default=0)
+    parser.add_argument("--overfit-trace-interval", type=int, default=10)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     if args.epochs < 0 or args.batch_size < 1 or args.workers < 0:
         parser.error("epochs/workers must be nonnegative and batch-size must be positive")
-    if args.core_depth < 1 or args.overfit_steps < 0:
+    if args.core_depth < 1 or args.overfit_steps < 0 or args.overfit_trace_interval < 1:
         parser.error("core-depth must be positive and overfit-steps nonnegative")
     if args.max_train < 0 or args.max_test < 0:
         parser.error("max-train and max-test must be nonnegative")
     if args.max_stack_rms_ratio <= 0.0:
         parser.error("max-stack-rms-ratio must be positive")
+    if args.smoke_max_stack_rms_ratio <= 0.0 or args.smoke_max_block_gain_rms <= 0.0:
+        parser.error("smoke RMS bounds must be positive")
+    if not (args.minimum_scale_exponent <= args.initial_scale_exponent <= args.maximum_scale_exponent):
+        parser.error("initial-scale-exponent must lie within the registered scale bounds")
     return args
 
 
