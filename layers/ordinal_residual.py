@@ -11,8 +11,22 @@ from torch import Tensor, nn
 from .chamber_lifting import permutation_rank4
 
 OrdinalResidualKind = Literal["row", "coxeter", "coxeter_relabel", "dense", "noop"]
+FactorialOrdinalResidualKind = Literal[
+    "constant_canonical",
+    "constant_relabel",
+    "live_canonical",
+    "live_relabel",
+    "dense",
+    "noop",
+]
 
-__all__ = ["MatchedOrdinalResidualBlock", "OrdinalResidualKind", "s4_diffusion_features"]
+__all__ = [
+    "FactorialOrdinalResidualBlock",
+    "FactorialOrdinalResidualKind",
+    "MatchedOrdinalResidualBlock",
+    "OrdinalResidualKind",
+    "s4_diffusion_features",
+]
 
 
 _LIFTING_PAIRS = (
@@ -184,6 +198,128 @@ class MatchedOrdinalResidualBlock(nn.Module):
         else:
             hidden = F.relu(F.linear(normalized, self.w1))
             output = x + self.residual_scale * F.linear(hidden, self.w2)
+        after = self.chamber_codes(self._normalize(output))
+        return output, before, after
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.forward_with_codes(x)[0]
+
+
+class FactorialOrdinalResidualBlock(nn.Module):
+    """Minimal constant/live x canonical/relabel ordinal residual factorial."""
+
+    chamber_count = 24
+    feature_rank = 8
+    action_rank = 4
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        kind: FactorialOrdinalResidualKind,
+        seed: int,
+        residual_scale: float = 0.25,
+        rms_eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        valid = {
+            "constant_canonical",
+            "constant_relabel",
+            "live_canonical",
+            "live_relabel",
+            "dense",
+            "noop",
+        }
+        if dim < 4 or dim % 4:
+            raise ValueError("dim must be positive and divisible by four")
+        if kind not in valid:
+            raise ValueError(f"unsupported residual kind {kind!r}")
+        self.dim = int(dim)
+        self.groups = self.dim // 4
+        self.kind = kind
+        self.residual_scale = float(residual_scale)
+        self.rms_eps = float(rms_eps)
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        permutation = torch.arange(dim) if seed == 0 else torch.randperm(dim, generator=generator)
+        self.register_buffer("permutation", permutation)
+        self.register_buffer("inverse_permutation", torch.argsort(permutation))
+        self.register_buffer("chamber_features", s4_diffusion_features(rank=self.feature_rank))
+        if kind.endswith("relabel"):
+            relabel_generator = torch.Generator(device="cpu").manual_seed(seed + 0xFA17)
+            relabel = torch.randperm(self.chamber_count, generator=relabel_generator)
+        else:
+            relabel = torch.arange(self.chamber_count)
+        self.register_buffer("chamber_relabel", relabel)
+
+        if kind.startswith(("constant", "live")):
+            self.feature_weight = nn.Parameter(torch.zeros(self.groups, self.feature_rank, self.action_rank))
+        elif kind == "dense":
+            hidden = self.action_rank
+            self.w1 = nn.Parameter(torch.empty(hidden, self.dim))
+            self.w2 = nn.Parameter(torch.zeros(self.dim, hidden))
+            nn.init.kaiming_uniform_(self.w1, a=math.sqrt(5), generator=generator)
+
+    @property
+    def operator_parameters(self) -> int:
+        return sum(parameter.numel() for parameter in self.parameters())
+
+    @property
+    def expected_operator_parameters(self) -> int:
+        return 0 if self.kind == "noop" else self.groups * self.feature_rank * self.action_rank
+
+    def _normalize(self, x: Tensor) -> Tensor:
+        return x * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + self.rms_eps).to(x.dtype)
+
+    def _group_order_chamber(self, normalized: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        grouped = normalized.index_select(-1, self.permutation).reshape(-1, self.groups, 4)
+        order = torch.argsort(grouped, dim=-1, stable=True)
+        chamber = permutation_rank4(order)
+        return grouped, order, chamber
+
+    def chamber_codes(self, x: Tensor) -> Tensor:
+        return self._group_order_chamber(x)[2].reshape(*x.shape[:-1], self.groups)
+
+    def _coefficients(self, chamber: Tensor) -> Tensor:
+        labels = self.chamber_relabel.index_select(0, chamber.reshape(-1)).reshape(-1, self.groups)
+        features = self.chamber_features.index_select(0, labels.reshape(-1)).reshape(-1, self.groups, self.feature_rank)
+        return torch.tanh(torch.einsum("bgr,gra->bga", features, self.feature_weight))
+
+    def _factorial_delta(self, normalized: Tensor, *, live: bool) -> tuple[Tensor, Tensor]:
+        prefix = normalized.shape[:-1]
+        grouped, order, chamber = self._group_order_chamber(normalized)
+        sorted_values = torch.gather(grouped, -1, order)
+        coefficients = self._coefficients(chamber)
+        if live:
+            delta = torch.zeros_like(sorted_values)
+            gaps = sorted_values[..., 1:] - sorted_values[..., :-1]
+            adjacent = coefficients[..., :3] * gaps
+            delta[..., :3] += adjacent
+            delta[..., 1:] -= adjacent
+            centered = sorted_values - sorted_values.mean(dim=-1, keepdim=True)
+            delta += coefficients[..., 3:4] * centered
+        else:
+            delta = coefficients
+        inverse_order = torch.argsort(order, dim=-1)
+        grouped_delta = torch.gather(delta, -1, inverse_order)
+        restored = grouped_delta.reshape(*prefix, self.dim).index_select(-1, self.inverse_permutation)
+        return restored, chamber.reshape(*prefix, self.groups)
+
+    def forward_with_codes(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        if x.shape[-1] != self.dim:
+            raise ValueError(f"expected final dimension {self.dim}, got {tuple(x.shape)}")
+        normalized = self._normalize(x)
+        if self.kind == "noop":
+            before = self.chamber_codes(normalized)
+            output = x
+        elif self.kind.startswith("constant"):
+            delta, before = self._factorial_delta(normalized, live=False)
+            output = x + self.residual_scale * delta
+        elif self.kind.startswith("live"):
+            delta, before = self._factorial_delta(normalized, live=True)
+            output = x + self.residual_scale * delta
+        else:
+            before = self.chamber_codes(normalized)
+            output = x + self.residual_scale * F.linear(F.relu(F.linear(normalized, self.w1)), self.w2)
         after = self.chamber_codes(self._normalize(output))
         return output, before, after
 
