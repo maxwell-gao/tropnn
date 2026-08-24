@@ -9,11 +9,11 @@ from typing import Literal
 
 import numpy as np
 import torch
-from torch import Tensor, nn
 import torch.nn.functional as F
+from torch import Tensor, nn
 
 from tropnn.tools.emnist_payload_dtype_sweep import _build_local_loaders, _eval_model
-from tropnn.tools.emnist_payload_width import PayloadWidthEmnistClassifier, PayloadVariant
+from tropnn.tools.emnist_payload_width import PayloadVariant, PayloadWidthEmnistClassifier
 from tropnn.tools.partition_geometry_probe import ResidualReLUMlpWithSignatures, _pca_plane
 
 ProbeModel = Literal[
@@ -144,6 +144,20 @@ def _build_model(args: argparse.Namespace, classes: int) -> nn.Module:
         comparator_write_policy=args.comparator_write_policy,
         comparator_reduction_layout="scatter",
         comparator_output_tile_size=32,
+        comparator_weight_mode="float",
+        ternary_threshold=0.5,
+        hash_candidates=2,
+        hash_pool_size=16,
+        hash_selection_mode="hash",
+        hash_margin_fan_in=3,
+        hash_write_fan_out=4,
+        hash_fixed_zero_threshold=False,
+        compare_swap_alpha_init=0.0,
+        compare_swap_pair_count=0,
+        correction_gate_init=0.0,
+        correction_kc=48,
+        correction_init_std=0.02,
+        route_affine_pair_count=0,
     )
 
 
@@ -284,7 +298,6 @@ class RefinementMetrics:
 def _refinement_metrics(signatures: list[Tensor], *, grid_size: int) -> RefinementMetrics:
     total_points = grid_size * grid_size
     if not signatures:
-        ids = torch.zeros(total_points, dtype=torch.long)
         return RefinementMetrics(
             unique_signatures=1,
             signature_saturation=1.0 / max(total_points, 1),

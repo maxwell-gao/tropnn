@@ -12,6 +12,10 @@ written by each routed table row:
 * comparator_*_kc: each comparator activation directly writes to k_c output coordinates.
 * ternary_margin_*: T sparse C-fan-in ternary margins drive dense ternary
   linear or two-sided live actions, with semantic cost O(TC + TD).
+* hash_selected_sparse_hinge: a joint PC-LUT hash shortlists a few learned
+  sparse affine margins whose ReLU amplitudes drive sparse live writes.
+* hash_shared_sparse_hinge: a joint hash selects from a cross-code shared
+  sparse hinge program pool, with fixed-subset and all-scan controls.
 * ladder_*: explicit ablation ladder separating full-code payload width,
   margin-strength output, comparator-side routing, and sparse writes.
 * code_bits_k_hidden: hidden full-vector LUT plus explicit comparator-bit
@@ -37,16 +41,18 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 import torch
-from torch import Tensor, nn
 import torch.nn.functional as F
+from torch import Tensor, nn
 
-from tropnn.layers import ComparatorTwoSidedMargin, CoxeterLUT, K4FullLUT, TernaryMarginAction
-from tropnn.layers.pairwise import PAIRWISE_ANCHOR_POLICIES, LutDType, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT, ste_heaviside
-from tropnn.tools.emnist_discrete_payload import (
-    AccumulatorMode,
-    DiscreteMethod,
-    RowLocalDiscretePayloadOptimizer,
+from tropnn.layers import (
+    ComparatorTwoSidedMargin,
+    CoxeterLUT,
+    HashSelectedSparseHinge,
+    HashSharedSparseHinge,
+    K4FullLUT,
+    TernaryMarginAction,
 )
+from tropnn.layers.pairwise import PAIRWISE_ANCHOR_POLICIES, LutDType, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT, ste_heaviside
 from tropnn.tools.emnist_cross_layer_anchor_sharing import (
     _boundary_density,
     _connected_components,
@@ -57,6 +63,10 @@ from tropnn.tools.emnist_cross_layer_anchor_sharing import (
     _route_entropy,
     _route_persistence,
     _signature_ids,
+)
+from tropnn.tools.emnist_discrete_payload import (
+    DiscreteMethod,
+    RowLocalDiscretePayloadOptimizer,
 )
 from tropnn.tools.emnist_payload_dtype_sweep import _build_local_loaders, _loader_examples
 
@@ -77,6 +87,8 @@ PayloadVariant = Literal[
     "comparator_two_sided_margin_kc",
     "ternary_margin_linear",
     "ternary_margin_two_sided",
+    "hash_selected_sparse_hinge",
+    "hash_shared_sparse_hinge",
     "code_bits_k_hidden",
     "compare_swap_independent_hidden",
     "compare_swap_reused_anchor_hidden",
@@ -122,6 +134,8 @@ VARIANT_PAYLOAD_WIDTH: dict[str, int | None] = {
     "comparator_two_sided_margin_kc": None,
     "ternary_margin_linear": None,
     "ternary_margin_two_sided": None,
+    "hash_selected_sparse_hinge": None,
+    "hash_shared_sparse_hinge": None,
     "code_bits_k_hidden": None,
     "compare_swap_independent_hidden": None,
     "compare_swap_reused_anchor_hidden": None,
@@ -174,6 +188,8 @@ class PayloadSpec:
             return self.variant
         if self.variant.startswith("ternary_margin_"):
             return self.variant
+        if self.variant in {"hash_selected_sparse_hinge", "hash_shared_sparse_hinge"}:
+            return self.variant
         if self.variant == "code_bits_k_hidden":
             return f"code_bits_k{self.write_degree}_hidden"
         if self.variant.startswith("compare_swap_"):
@@ -197,8 +213,18 @@ def _payload_spec(variant: PayloadVariant, output_dim: int, write_degree: int) -
     if variant.startswith("ladder_"):
         if variant in {"ladder_a_full_code_full_payload", "ladder_d_comparator_side_full_payload"}:
             return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=False)
-        return PayloadSpec(variant=variant, payload_width=max(1, min(write_degree, output_dim)), write_degree=max(1, min(write_degree, output_dim)), dense_sign_basis=False)
-    if variant == "walsh_affine" or variant.startswith("comparator_"):
+        return PayloadSpec(
+            variant=variant,
+            payload_width=max(1, min(write_degree, output_dim)),
+            write_degree=max(1, min(write_degree, output_dim)),
+            dense_sign_basis=False,
+        )
+    if (
+        variant == "walsh_affine"
+        or variant.startswith("comparator_")
+        or variant == "hash_selected_sparse_hinge"
+        or variant == "hash_shared_sparse_hinge"
+    ):
         return PayloadSpec(variant=variant, payload_width=0, write_degree=0, dense_sign_basis=False)
     if variant.startswith("ternary_margin_"):
         return PayloadSpec(variant=variant, payload_width=output_dim, write_degree=output_dim, dense_sign_basis=True)
@@ -385,7 +411,7 @@ class PayloadWidthLUTLayer(nn.Module):
         if self.use_min_margin_ste:
             bit = margins.abs().argmin(dim=-1)
             margin = margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
-            neighbor_indices = indices ^ (2 ** bit).long()
+            neighbor_indices = indices ^ (2**bit).long()
             ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
             delta = self._lookup(neighbor_indices) - payload
             return self._payload_to_output(delta * ste_delta.unsqueeze(-1))
@@ -516,7 +542,7 @@ class SharedRoutePairwiseGLULayer(nn.Module):
         if self.use_min_margin_ste:
             bit = margins.abs().argmin(dim=-1)
             margin = margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
-            neighbor_indices = indices ^ (2 ** bit).long()
+            neighbor_indices = indices ^ (2**bit).long()
             ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
             neighbor_value_payload = self.value_lut._lookup(neighbor_indices)
             neighbor_gate_payload = self._lookup_gate(neighbor_indices)
@@ -767,7 +793,7 @@ class BinaryCountGatedLUTLayer(nn.Module):
         if self.use_min_margin_ste:
             bit = margins.abs().argmin(dim=-1)
             margin = margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
-            neighbor_indices = indices ^ (2 ** bit).long()
+            neighbor_indices = indices ^ (2**bit).long()
             ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
             neighbor_value_payload = self._lookup_payload(value_table, neighbor_indices)
             neighbor_gate_payload = self._lookup_payload(gate_table, neighbor_indices)
@@ -1347,7 +1373,9 @@ class FullLutGatedCorrectionLayer(nn.Module):
     def _chamber_diagonal_correction(self, x: Tensor, indices: Tensor) -> Tensor:
         table_offsets = torch.arange(self.tables, device=indices.device, dtype=torch.long).view(1, self.tables) * self.table_size
         flat_indices = (indices + table_offsets).reshape(-1)
-        rows = self.chamber_diag.to(device=x.device, dtype=x.dtype).reshape(self.tables * self.table_size, self.output_dim).index_select(0, flat_indices)
+        rows = (
+            self.chamber_diag.to(device=x.device, dtype=x.dtype).reshape(self.tables * self.table_size, self.output_dim).index_select(0, flat_indices)
+        )
         scale = rows.view(x.shape[0], self.tables, self.output_dim).sum(dim=1) * self.correction_scale
         return x * scale
 
@@ -1495,7 +1523,7 @@ class FullCodeSparsePayloadLayer(nn.Module):
         if self.use_min_margin_ste:
             bit = margins.abs().argmin(dim=-1)
             margin = margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
-            neighbor_indices = indices ^ (2 ** bit).long()
+            neighbor_indices = indices ^ (2**bit).long()
             neighbor_payload, neighbor_writes = self._select_payload_and_writes(neighbor_indices)
             ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
             return self._payload_to_output(neighbor_payload * ste_delta.unsqueeze(-1), neighbor_writes) - self._payload_to_output(
@@ -1532,7 +1560,9 @@ class FullCodeMarginSparseLayer(FullCodeSparsePayloadLayer):
         super().__init__(*args, **kwargs)
         self.variant = "ladder_c_full_code_margin_sparse"
         del self.lut
-        self.write_weight = nn.Parameter(_fixed_signs((self.tables, self.table_size, self.payload_width), 7919) / math.sqrt(float(self.payload_width)))
+        self.write_weight = nn.Parameter(
+            _fixed_signs((self.tables, self.table_size, self.payload_width), 7919) / math.sqrt(float(self.payload_width))
+        )
 
     @property
     def payload_params(self) -> int:
@@ -1555,7 +1585,7 @@ class FullCodeMarginSparseLayer(FullCodeSparsePayloadLayer):
     def _ste_correction(self, indices: Tensor, margins: Tensor, payload: Tensor, writes: Tensor) -> Tensor:
         bit = margins.abs().argmin(dim=-1)
         margin = margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
-        neighbor_indices = indices ^ (2 ** bit).long()
+        neighbor_indices = indices ^ (2**bit).long()
         neighbor_weight, neighbor_writes = self._select_weight_and_writes(neighbor_indices)
         ste_delta = ste_heaviside(margin) - (margin > 0).to(margin.dtype)
         amplitude = margins.abs().mean(dim=-1).unsqueeze(-1)
@@ -2006,6 +2036,12 @@ class PayloadWidthEmnistClassifier(nn.Module):
         comparator_output_tile_size: int,
         comparator_weight_mode: Literal["float", "binary", "ternary"],
         ternary_threshold: float,
+        hash_candidates: int,
+        hash_pool_size: int,
+        hash_selection_mode: Literal["hash", "fixed", "all"],
+        hash_margin_fan_in: int,
+        hash_write_fan_out: int,
+        hash_fixed_zero_threshold: bool,
         compare_swap_alpha_init: float,
         compare_swap_pair_count: int,
         correction_gate_init: float,
@@ -2014,6 +2050,7 @@ class PayloadWidthEmnistClassifier(nn.Module):
         route_affine_pair_count: int,
     ) -> None:
         super().__init__()
+
         def make_layer(input_features: int, output_features: int, layer_seed: int, *, is_hidden: bool) -> nn.Module:
             if variant == "k4_full_vector":
                 return K4FullLUT(
@@ -2070,8 +2107,8 @@ class PayloadWidthEmnistClassifier(nn.Module):
                     lut_init_std=lut_init_std,
                     write_degree=write_degree,
                     use_output_scaling=use_output_scaling,
-                        use_min_margin_ste=use_min_margin_ste,
-                    )
+                    use_min_margin_ste=use_min_margin_ste,
+                )
             if variant == "pairwise_glu_shared_route":
                 return SharedRoutePairwiseGLULayer(
                     input_features,
@@ -2231,6 +2268,38 @@ class PayloadWidthEmnistClassifier(nn.Module):
                     anchor_policy=anchor_policy,
                     seed=layer_seed,
                     use_output_scaling=use_output_scaling,
+                )
+            if variant == "hash_selected_sparse_hinge":
+                return HashSelectedSparseHinge(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    candidates=hash_candidates,
+                    margin_fan_in=min(hash_margin_fan_in, input_features),
+                    write_fan_out=min(hash_write_fan_out, output_features),
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                    fixed_zero_hash_threshold=hash_fixed_zero_threshold,
+                )
+            if variant == "hash_shared_sparse_hinge":
+                return HashSharedSparseHinge(
+                    input_features,
+                    output_features,
+                    tables=tables,
+                    comparisons=comparisons,
+                    pool_size=hash_pool_size,
+                    candidates_per_code=hash_candidates,
+                    margin_fan_in=min(hash_margin_fan_in, input_features),
+                    write_fan_out=min(hash_write_fan_out, output_features),
+                    selection_mode=hash_selection_mode,
+                    anchor_policy=anchor_policy,
+                    seed=layer_seed,
+                    use_output_scaling=use_output_scaling,
+                    use_min_margin_ste=use_min_margin_ste,
+                    fixed_zero_hash_threshold=hash_fixed_zero_threshold,
                 )
             if variant == "walsh_affine":
                 return WalshAffinePayloadLayer(
@@ -2445,6 +2514,8 @@ class EvalResult:
     acc: float
     route_entropy: float
     route_persistence: float
+    candidate_activation_rate: float
+    candidate_selection_coverage: float
 
 
 @dataclass(frozen=True)
@@ -2465,6 +2536,19 @@ def _eval(model: PayloadWidthEmnistClassifier, loader, device: torch.device) -> 
     total_seen = 0
     route_entropies: list[float] = []
     route_persistences: list[float] = []
+    first_layer = model.payload_layers()[0]
+    shared_layer = first_layer if isinstance(first_layer, HashSharedSparseHinge) else None
+    candidate_selected = (
+        torch.zeros(
+            shared_layer.tables,
+            shared_layer.pool_size,
+            dtype=torch.long,
+        )
+        if shared_layer is not None
+        else None
+    )
+    candidate_positive = 0
+    candidate_total = 0
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -2475,12 +2559,25 @@ def _eval(model: PayloadWidthEmnistClassifier, loader, device: torch.device) -> 
         total_seen += int(labels.numel())
         route_entropies.append(_route_entropy(model.last_routes, model.blocks[0].table_size if model.blocks else 1))
         route_persistences.append(_route_persistence(model.last_routes))
+        if shared_layer is not None and shared_layer.last_candidate_ids is not None and shared_layer.last_learned_margins is not None:
+            selected = shared_layer.last_candidate_ids.detach().cpu()
+            offsets = torch.arange(shared_layer.tables, dtype=torch.long).view(1, shared_layer.tables, 1).mul(shared_layer.pool_size)
+            counts = torch.bincount(
+                (selected + offsets).reshape(-1),
+                minlength=shared_layer.tables * shared_layer.pool_size,
+            ).view(shared_layer.tables, shared_layer.pool_size)
+            candidate_selected += counts
+            learned_margins = shared_layer.last_learned_margins
+            candidate_positive += int((learned_margins > 0).sum().item())
+            candidate_total += int(learned_margins.numel())
     model.train()
     return EvalResult(
         loss=total_loss / max(total_seen, 1),
         acc=total_correct / max(total_seen, 1),
         route_entropy=sum(route_entropies) / max(1, len(route_entropies)),
         route_persistence=sum(route_persistences) / max(1, len(route_persistences)),
+        candidate_activation_rate=(candidate_positive / candidate_total if candidate_total > 0 else math.nan),
+        candidate_selection_coverage=(float((candidate_selected > 0).float().mean().item()) if candidate_selected is not None else math.nan),
     )
 
 
@@ -2549,6 +2646,29 @@ def _optimizer_name(args: argparse.Namespace) -> OptimizerName:
     return args.optimizer if args.optimizer == "adamw" else args.discrete_method
 
 
+def _hash_candidate_grad_coverage(layer: HashSharedSparseHinge) -> float:
+    touched = torch.zeros(
+        layer.tables,
+        layer.pool_size,
+        dtype=torch.bool,
+        device=layer.read_weight.device,
+    )
+    for parameter in (
+        layer.read_weight,
+        layer.margin_thresholds,
+        layer.write_weight,
+    ):
+        if parameter.grad is None:
+            continue
+        per_candidate = parameter.grad.detach().reshape(
+            layer.tables,
+            layer.pool_size,
+            -1,
+        )
+        touched |= per_candidate.abs().sum(dim=-1) > 0
+    return float(touched.float().mean().item())
+
+
 def _build_optimizers(args: argparse.Namespace, model: PayloadWidthEmnistClassifier):
     if args.optimizer == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay), None
@@ -2561,6 +2681,8 @@ def _build_optimizers(args: argparse.Namespace, model: PayloadWidthEmnistClassif
         or args.payload_variant == "binary_count_gated_lut"
         or args.payload_variant.startswith("comparator_")
         or args.payload_variant.startswith("ternary_margin_")
+        or args.payload_variant == "hash_selected_sparse_hinge"
+        or args.payload_variant == "hash_shared_sparse_hinge"
         or args.payload_variant.startswith("ladder_")
     ):
         raise ValueError(f"{args.payload_variant} uses generator parameters and currently supports --optimizer adamw only")
@@ -2622,6 +2744,12 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         comparator_output_tile_size=args.comparator_output_tile_size,
         comparator_weight_mode=args.comparator_weight_mode,
         ternary_threshold=args.ternary_threshold,
+        hash_candidates=args.hash_candidates,
+        hash_pool_size=args.hash_pool_size,
+        hash_selection_mode=args.hash_selection_mode,
+        hash_margin_fan_in=args.hash_margin_fan_in,
+        hash_write_fan_out=args.hash_write_fan_out,
+        hash_fixed_zero_threshold=args.hash_fixed_zero_threshold,
         compare_swap_alpha_init=args.compare_swap_alpha_init,
         compare_swap_pair_count=args.compare_swap_pair_count,
         correction_gate_init=args.correction_gate_init,
@@ -2629,6 +2757,8 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         correction_init_std=args.correction_init_std,
         route_affine_pair_count=args.route_affine_pair_count,
     ).to(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     main_optimizer, payload_optimizer = _build_optimizers(args, model)
 
     final_train_loss = math.nan
@@ -2680,16 +2810,13 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
     first_layer = model.payload_layers()[0]
     spec = _payload_spec(args.payload_variant, 28 * 28, args.write_degree)
     is_ternary_action = isinstance(first_layer, TernaryMarginAction)
-    hard_input_density = (
-        float((first_layer.hard_input_codes() != 0).float().mean().item()) if is_ternary_action else math.nan
-    )
-    hard_direction_density = (
-        float((first_layer.hard_direction_codes() != 0).float().mean().item()) if is_ternary_action else math.nan
-    )
+    hard_input_density = float((first_layer.hard_input_codes() != 0).float().mean().item()) if is_ternary_action else math.nan
+    hard_direction_density = float((first_layer.hard_direction_codes() != 0).float().mean().item()) if is_ternary_action else math.nan
     is_binary_comparator = isinstance(first_layer, ComparatorTwoSidedMargin) and first_layer.weight_mode == "binary"
-    is_quantized_comparator = (
-        isinstance(first_layer, ComparatorTwoSidedMargin) and first_layer.weight_mode in {"binary", "ternary"}
-    )
+    is_quantized_comparator = isinstance(first_layer, ComparatorTwoSidedMargin) and first_layer.weight_mode in {"binary", "ternary"}
+    is_hash_selected_hinge = isinstance(first_layer, HashSelectedSparseHinge)
+    is_hash_shared_hinge = isinstance(first_layer, HashSharedSparseHinge)
+    is_hash_hinge = is_hash_selected_hinge or is_hash_shared_hinge
     return {
         "payload_variant": args.payload_variant,
         "payload_label": spec.payload_label,
@@ -2705,20 +2832,43 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         "walsh_lut_dtype": args.walsh_lut_dtype if args.payload_variant == "walsh_affine" else "none",
         "walsh_order": args.walsh_order if args.payload_variant == "walsh_affine" else 0,
         "walsh_slope_order": args.walsh_slope_order if args.payload_variant == "walsh_affine" else 0,
-        "comparator_kc": args.comparator_kc if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else 0,
-        "comparator_write_policy": args.comparator_write_policy if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else "none",
-        "comparator_reduction_layout": args.comparator_reduction_layout if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else "none",
-        "comparator_output_tile_size": args.comparator_output_tile_size if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse" else 0,
+        "comparator_kc": args.comparator_kc
+        if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse"
+        else 0,
+        "comparator_write_policy": args.comparator_write_policy
+        if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse"
+        else "none",
+        "comparator_reduction_layout": args.comparator_reduction_layout
+        if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse"
+        else "none",
+        "comparator_output_tile_size": args.comparator_output_tile_size
+        if args.payload_variant.startswith("comparator_") or args.payload_variant == "ladder_e_comparator_side_sparse"
+        else 0,
         "comparator_weight_mode": first_layer.weight_mode if isinstance(first_layer, ComparatorTwoSidedMargin) else "none",
         "binary_write_flip_fraction": first_layer.binary_code_flip_fraction() if is_binary_comparator else math.nan,
         "quantized_write_change_fraction": first_layer.quantized_code_change_fraction() if is_quantized_comparator else math.nan,
         "quantized_write_zero_fraction": first_layer.quantized_code_zero_fraction() if is_quantized_comparator else math.nan,
         "ternary_action_mode": first_layer.mode if is_ternary_action else "none",
         "ternary_threshold": args.ternary_threshold if is_ternary_action else 0.0,
+        "hash_candidates": (first_layer.candidates_per_code if is_hash_shared_hinge else first_layer.candidates if is_hash_selected_hinge else 0),
+        "hash_active_candidates": (first_layer.active_candidates if is_hash_shared_hinge else 0),
+        "hash_pool_size": first_layer.pool_size if is_hash_shared_hinge else 0,
+        "hash_selection_mode": first_layer.selection_mode if is_hash_shared_hinge else "private",
+        "hash_margin_fan_in": first_layer.margin_fan_in if is_hash_hinge else 0,
+        "hash_write_fan_out": first_layer.write_fan_out if is_hash_hinge else 0,
+        "hash_active_margins": first_layer.active_margin_count if is_hash_hinge else 0,
+        "hash_candidate_bank": first_layer.candidate_bank_size if is_hash_hinge else 0,
+        "hash_support_index_count": first_layer.support_index_count if is_hash_hinge else 0,
+        "hash_candidate_degree_min": (int(first_layer.candidate_code_degrees.min().item()) if is_hash_shared_hinge else 0),
+        "hash_candidate_degree_max": (int(first_layer.candidate_code_degrees.max().item()) if is_hash_shared_hinge else 0),
+        "hash_candidate_activation_rate": valid.candidate_activation_rate,
+        "hash_candidate_eval_coverage": valid.candidate_selection_coverage,
+        "hash_candidate_grad_coverage": (_hash_candidate_grad_coverage(first_layer) if is_hash_shared_hinge else math.nan),
+        "hash_fixed_zero_threshold": args.hash_fixed_zero_threshold if is_hash_hinge else False,
         "hard_input_density": hard_input_density,
         "hard_direction_density": hard_direction_density,
-        "semantic_route_terms": first_layer.semantic_route_terms if is_ternary_action else 0,
-        "semantic_action_terms": first_layer.semantic_action_terms if is_ternary_action else 0,
+        "semantic_route_terms": (first_layer.semantic_route_terms if is_ternary_action or is_hash_hinge else 0),
+        "semantic_action_terms": (first_layer.semantic_action_terms if is_ternary_action or is_hash_hinge else 0),
         "compare_swap_alpha_init": args.compare_swap_alpha_init if args.payload_variant.startswith("compare_swap_") else 0.0,
         "compare_swap_pair_count": _compare_swap_pair_count(model),
         "compare_swap_alpha_mean": _compare_swap_alpha_mean(model),
@@ -2760,7 +2910,10 @@ def _run(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
         "saturation_fraction": last_saturation_fraction,
         "changed_codes": last_changed_codes,
         "total_codes": last_total_codes,
+        "cuda_peak_allocated_mib": (torch.cuda.max_memory_allocated(device) / (1024 * 1024) if device.type == "cuda" else 0.0),
+        "cuda_peak_reserved_mib": (torch.cuda.max_memory_reserved(device) / (1024 * 1024) if device.type == "cuda" else 0.0),
         "seed": args.seed,
+        "loader_seed": args.loader_seed if args.loader_seed is not None else -1,
     }
 
 
@@ -2794,6 +2947,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comparator-output-tile-size", type=int, choices=[16, 32, 64, 128], default=32)
     parser.add_argument("--comparator-weight-mode", choices=["float", "binary", "ternary"], default="float")
     parser.add_argument("--ternary-threshold", type=float, default=0.5)
+    parser.add_argument("--hash-candidates", type=int, default=4)
+    parser.add_argument("--hash-pool-size", type=int, default=16)
+    parser.add_argument(
+        "--hash-selection-mode",
+        choices=["hash", "fixed", "all"],
+        default="hash",
+    )
+    parser.add_argument("--hash-margin-fan-in", type=int, default=8)
+    parser.add_argument("--hash-write-fan-out", type=int, default=16)
+    parser.add_argument("--hash-fixed-zero-threshold", action="store_true")
     parser.add_argument("--compare-swap-alpha-init", type=float, default=0.0)
     parser.add_argument("--compare-swap-pair-count", type=int, default=0)
     parser.add_argument("--correction-gate-init", type=float, default=0.0)
@@ -2818,6 +2981,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--loader-seed", type=int, default=None)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--payload-lr", type=float, default=None)

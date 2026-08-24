@@ -5,14 +5,24 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
-from torch import Tensor, nn
 import torch.nn.functional as F
+from torch import Tensor, nn
 
 from ..backend import Backend
 from .pairwise import PAIRWISE_ANCHOR_POLICIES, PairwiseRoute, _compute_dtype_for_lut, _make_pairwise_anchors
 
-ComparatorWritePolicy = Literal["endpoint", "local-linegraph", "expander"]
-ComparatorReductionLayout = Literal["scatter", "output_major", "tile_local"]
+ComparatorWritePolicy = Literal[
+    "endpoint",
+    "local-linegraph",
+    "expander",
+    "expander_unique",
+]
+ComparatorReductionLayout = Literal[
+    "scatter",
+    "output_major",
+    "tile_local",
+    "dense_training",
+]
 ComparatorWeightInit = Literal["signed", "zero"]
 ComparatorWeightMode = Literal["float", "binary", "ternary"]
 
@@ -52,12 +62,29 @@ class ComparatorTwoSidedMarginSpec:
             raise ValueError(f"unsupported backend {self.backend!r}")
         if self.anchor_policy not in PAIRWISE_ANCHOR_POLICIES:
             raise ValueError(f"unsupported anchor policy {self.anchor_policy!r}")
-        if self.write_policy not in {"endpoint", "local-linegraph", "expander"}:
+        if self.write_policy not in {
+            "endpoint",
+            "local-linegraph",
+            "expander",
+            "expander_unique",
+        }:
             raise ValueError(f"unsupported write policy {self.write_policy!r}")
-        if self.reduction_layout not in {"scatter", "output_major", "tile_local"}:
+        if self.write_policy == "expander_unique" and self.k_c > self.output_dim:
+            raise ValueError("write_policy='expander_unique' requires k_c <= output_dim")
+        if self.reduction_layout not in {
+            "scatter",
+            "output_major",
+            "tile_local",
+            "dense_training",
+        }:
             raise ValueError(f"unsupported reduction_layout {self.reduction_layout!r}")
         if self.reduction_layout == "tile_local" and self.write_policy != "expander":
             raise ValueError("tile_local reduction currently requires write_policy='expander'")
+        if self.reduction_layout == "dense_training" and self.backend == "triton":
+            raise ValueError(
+                "dense_training materializes the fixed sparse action as a dense "
+                "matrix and requires backend='torch' or 'auto'"
+            )
         if self.output_tile_size not in {16, 32, 64, 128}:
             raise ValueError("output_tile_size must be one of 16, 32, 64, or 128")
         if self.weight_init not in {"signed", "zero"}:
@@ -271,6 +298,8 @@ class ComparatorTwoSidedMargin(nn.Module):
             for side in range(2):
                 virtual_route = route * 2 + side
                 side_sign = 1.0 if side == 0 else -1.0
+                if self.write_policy == "expander_unique":
+                    indices[route, side] = torch.randperm(self.output_dim, generator=gen)[: self.k_c]
                 for slot in range(self.k_c):
                     if self.reduction_layout == "tile_local":
                         hashed = (virtual_route * 1103515245 + slot * 12345 + 97) & 0x7FFFFFFF
@@ -286,6 +315,9 @@ class ComparatorTwoSidedMargin(nn.Module):
                         nb = int(anchors[neighbor, 1].item()) % self.output_dim
                         indices[route, side, slot] = na if slot % 2 == 0 else nb
                         signs[route, side, slot] = side_sign if slot % 2 == 0 else -side_sign
+                    elif self.write_policy == "expander_unique":
+                        hashed = (virtual_route * 1103515245 + slot * 12345 + 97) & 0x7FFFFFFF
+                        signs[route, side, slot] = 1.0 if ((hashed // max(1, self.output_dim)) & 1) == 0 else -1.0
                     else:
                         hashed = (virtual_route * 1103515245 + slot * 12345 + 97) & 0x7FFFFFFF
                         indices[route, side, slot] = hashed % self.output_dim
@@ -341,6 +373,39 @@ class ComparatorTwoSidedMargin(nn.Module):
         output.scatter_add_(1, indices.reshape(items, -1), weighted.reshape(items, -1))
         return output * self.output_scale
 
+    def _dense_training_output(self, margins: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
+        """Evaluate the same sparse action through a materialized dense matrix.
+
+        This spelling exists to make large-batch GPU training practical.  The
+        fixed ``write_indices`` still define the learned sparse function and
+        gradients flow only to ``write_weight``.  Materializing its equivalent
+        ``[2 * routes, output_dim]`` matrix merely changes reduction order and
+        execution hardware; it is not a sparse deployment-throughput claim.
+        """
+        items = margins.shape[0]
+        device_type = margins.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            margins_compute = margins.to(dtype=compute_dtype)
+            values = torch.stack(
+                (F.relu(margins_compute), F.relu(-margins_compute)),
+                dim=-1,
+            ).reshape(items, self.routes * 2)
+            indices = self.write_indices.to(device=margins.device).reshape(
+                self.routes * 2,
+                self.k_c,
+            )
+            weights = self._materialized_write_weight().to(
+                device=margins.device,
+                dtype=compute_dtype,
+            ).reshape(self.routes * 2, self.k_c)
+            dense_action = torch.zeros(
+                self.routes * 2,
+                self.output_dim,
+                device=margins.device,
+                dtype=compute_dtype,
+            ).scatter_add(1, indices, weights)
+            return (values @ dense_action) * self.output_scale
+
     def _triton_output(self, x_flat: Tensor) -> tuple[Tensor, Tensor]:
         from ..backends.comparator_margin_triton import (
             comparator_two_sided_margin_output_major_triton,
@@ -393,6 +458,17 @@ class ComparatorTwoSidedMargin(nn.Module):
         prefix = x.shape[:-1]
         x_flat = x.reshape(-1, self.input_dim)
         compute_dtype = compute_dtype if compute_dtype is not None else _compute_dtype_for_lut(x, "fp32")
+        if self.reduction_layout == "dense_training":
+            route_flat = self._route(x_flat.to(compute_dtype))
+            output_flat = self._dense_training_output(
+                route_flat.margins,
+                compute_dtype=compute_dtype,
+            )
+            route = PairwiseRoute(
+                route_flat.indices.view(*prefix, self.tables),
+                route_flat.margins.view(*prefix, self.tables, self.comparisons),
+            )
+            return output_flat.view(*prefix, self.output_dim).to(dtype=input_dtype), route
         backend = "triton" if self.backend == "auto" and x.is_cuda else ("torch" if self.backend == "auto" else self.backend)
         if backend == "triton":
             output_flat, margins_flat = self._triton_output(x_flat)

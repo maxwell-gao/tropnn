@@ -197,7 +197,18 @@ def _build_local_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoad
     classes = int(max(int(y_train.max().item()), int(y_valid.max().item())) + 1)
     train_set = TensorDataset(x_train, y_train)
     valid_set = TensorDataset(x_valid, y_valid)
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=args.device == "cuda")
+    loader_seed = getattr(args, "loader_seed", None)
+    train_generator = None
+    if loader_seed is not None:
+        train_generator = torch.Generator(device="cpu").manual_seed(int(loader_seed))
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.workers,
+        pin_memory=args.device == "cuda",
+        generator=train_generator,
+    )
     valid_loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=args.device == "cuda")
     return train_loader, valid_loader, classes
 
@@ -287,7 +298,14 @@ def _eval_model(model: nn.Module, loader, *, device: torch.device) -> tuple[floa
     return total_loss / max(1, total_seen), total_correct / max(1, total_seen)
 
 
-def _train_model(model: nn.Module, train_loader, valid_loader, args: argparse.Namespace, *, device: torch.device) -> tuple[float, float, float, float, dict[str, float | int]]:
+def _train_model(
+    model: nn.Module,
+    train_loader,
+    valid_loader,
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+) -> tuple[float, float, float, float, dict[str, float | int]]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     finite_loss_steps = 0
     nonfinite_loss_steps = 0

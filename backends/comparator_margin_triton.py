@@ -39,6 +39,27 @@ def _block_d(output_dim: int) -> int:
     return 32
 
 
+def _backward_block_n(k_c: int) -> int:
+    """Keep the route-by-item backward tile near 2K scalar lanes."""
+    if k_c <= 16:
+        return 64
+    if k_c <= 32:
+        return 32
+    if k_c <= 64:
+        return 16
+    return 8
+
+
+def _backward_block_w(k_c: int) -> int:
+    if k_c <= 16:
+        return 32
+    if k_c <= 32:
+        return 64
+    if k_c <= 64:
+        return 128
+    return 256
+
+
 if triton is not None:
 
     @triton.jit
@@ -155,6 +176,76 @@ if triton is not None:
         tl.atomic_add(grad_x_ptr + row * IN_FEATURES + a, grad_margin)
         tl.atomic_add(grad_x_ptr + row * IN_FEATURES + b, -grad_margin)
         tl.atomic_add(grad_thresholds_ptr + route, -grad_margin)
+
+
+    @triton.jit
+    def _twosided_margin_bwd_reduced_kernel(
+        grad_out_ptr,
+        margins_ptr,
+        anchors_ptr,
+        write_indices_ptr,
+        write_weight_ptr,
+        grad_x_ptr,
+        grad_thresholds_ptr,
+        grad_weight_ptr,
+        ITEMS: tl.constexpr,
+        IN_FEATURES: tl.constexpr,
+        OUT_FEATURES: tl.constexpr,
+        ROUTES: tl.constexpr,
+        K_C: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_W: tl.constexpr,
+        SCALE: tl.constexpr,
+    ):
+        """Backward with per-item-tile reductions before global atomics.
+
+        The legacy kernel launches one program for every ``(item, route)`` and
+        atomically accumulates all ``2 * K_C`` write-weight gradients.  Here a
+        program owns ``BLOCK_N`` items for one route.  It reduces weight and
+        threshold gradients inside the program, while retaining the exact
+        sparse gather/scatter definition for the input gradient.
+        """
+        item_block = tl.program_id(0)
+        route = tl.program_id(1)
+
+        n = item_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_mask = n < ITEMS
+        w_offs = tl.arange(0, BLOCK_W)
+        w_mask = w_offs < 2 * K_C
+
+        margin = tl.load(margins_ptr + n * ROUTES + route, mask=n_mask, other=0.0).to(tl.float32)
+        is_negative_side = w_offs >= K_C
+        side_sign = tl.where(is_negative_side, -1.0, 1.0)
+
+        base = route * 2 * K_C
+        output_index = tl.load(write_indices_ptr + base + w_offs, mask=w_mask, other=0).to(tl.int32)
+        weight = tl.load(write_weight_ptr + base + w_offs, mask=w_mask, other=0.0).to(tl.float32)
+
+        signed_margin = margin[:, None] * side_sign[None, :]
+        active = signed_margin > 0.0
+        gather_mask = n_mask[:, None] & w_mask[None, :] & active
+        grad_out = tl.load(
+            grad_out_ptr + n[:, None] * OUT_FEATURES + output_index[None, :],
+            mask=gather_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        value = tl.maximum(signed_margin, 0.0)
+        grad_weight_partial = tl.sum(grad_out * value, axis=0) * SCALE
+        tl.atomic_add(
+            grad_weight_ptr + base + w_offs,
+            grad_weight_partial,
+            mask=w_mask,
+        )
+
+        grad_margin = tl.sum(grad_out * weight[None, :] * side_sign[None, :], axis=1) * SCALE
+        grad_margin = tl.where(n_mask, grad_margin, 0.0)
+
+        a = tl.load(anchors_ptr + route * 2).to(tl.int32)
+        b = tl.load(anchors_ptr + route * 2 + 1).to(tl.int32)
+        tl.atomic_add(grad_x_ptr + n * IN_FEATURES + a, grad_margin, mask=n_mask)
+        tl.atomic_add(grad_x_ptr + n * IN_FEATURES + b, -grad_margin, mask=n_mask)
+        tl.atomic_add(grad_thresholds_ptr + route, -tl.sum(grad_margin, axis=0))
 
 
     @triton.jit
@@ -329,9 +420,10 @@ class _TwoSidedMarginTritonFunction(torch.autograd.Function):
         grad_x = torch.zeros(items, in_features, device=grad_output.device, dtype=torch.float32)
         grad_thresholds = torch.zeros(routes, device=grad_output.device, dtype=torch.float32)
         grad_weight = torch.zeros(int(write_weight_flat.numel()), device=grad_output.device, dtype=torch.float32)
-        block_k = _block_k(k_c)
+        block_n = _backward_block_n(k_c)
+        block_w = _backward_block_w(k_c)
 
-        _twosided_margin_bwd_kernel[(items, routes)](
+        _twosided_margin_bwd_reduced_kernel[(triton.cdiv(items, block_n), routes)](
             grad_flat,
             margins.contiguous(),
             anchors_flat,
@@ -345,8 +437,10 @@ class _TwoSidedMarginTritonFunction(torch.autograd.Function):
             int(ctx.output_dim),
             routes,
             k_c,
-            BLOCK_K=block_k,
+            BLOCK_N=block_n,
+            BLOCK_W=block_w,
             SCALE=float(ctx.output_scale),
+            num_warps=8,
         )
 
         return grad_x, None, grad_thresholds.view(ctx.threshold_shape), None, grad_weight.view(ctx.weight_shape), None, None

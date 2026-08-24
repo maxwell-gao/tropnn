@@ -2,6 +2,8 @@ from .base import LUTModuleBase
 from .chamber_lifting import ChamberLiftingStage, ChamberLiftingTower, permutation_rank4
 from .comparator_margin import ComparatorTwoSidedMargin
 from .coxeter import CoxeterLUT, CoxeterRoute, K4FullLUT
+from .hash_selected_sparse_hinge import HashSelectedSparseHinge
+from .hash_shared_sparse_hinge import HashSharedSelectionMode, HashSharedSparseHinge
 from .pair_kernel import (
     RELATION_QUANTIZATION_SPECS,
     BalancedS4Router,
@@ -38,6 +40,9 @@ __all__ = [
     "ChamberLiftingStage",
     "ChamberLiftingTower",
     "ComparatorTwoSidedMargin",
+    "HashSelectedSparseHinge",
+    "HashSharedSelectionMode",
+    "HashSharedSparseHinge",
     "CoxeterLUT",
     "CoxeterPairScorer",
     "CoxeterRoute",

@@ -220,6 +220,18 @@ def main() -> None:
         output_tile_size=args.output_tile_size,
         seed=args.seed,
     )
+    dense_training = _make_layer(
+        layout="dense_training",
+        device=device,
+        backend="torch",
+        input_dim=args.input_dim,
+        output_dim=args.output_dim,
+        tables=args.tables,
+        comparisons=args.comparisons,
+        k_c=args.k_c,
+        output_tile_size=args.output_tile_size,
+        seed=args.seed,
+    )
     tile_ref = _make_layer(
         layout="tile_local",
         device=device,
@@ -244,15 +256,30 @@ def main() -> None:
         seed=args.seed,
     )
     _clone_reference_state(scatter, output_major)
+    _clone_reference_state(scatter, dense_training)
     _clone_reference_state(tile_ref, tile_local)
     x = torch.randn(args.batch_size, args.seq_len, args.input_dim, device=device, dtype=dtype)
 
     fwd_diff, grad_x_diff, grad_weight_diff, grad_threshold_diff = _equivalence(scatter, output_major, x)
+    dense_fwd_diff, dense_grad_x_diff, dense_grad_weight_diff, dense_grad_threshold_diff = _equivalence(
+        scatter,
+        dense_training,
+        x,
+    )
     tile_fwd_diff, tile_grad_x_diff, tile_grad_weight_diff, tile_grad_threshold_diff = _equivalence(tile_ref, tile_local, x)
     rows: list[LayoutBenchRow] = []
     for layer, diffs in (
         (scatter, (0.0, 0.0, 0.0, 0.0)),
         (output_major, (fwd_diff, grad_x_diff, grad_weight_diff, grad_threshold_diff)),
+        (
+            dense_training,
+            (
+                dense_fwd_diff,
+                dense_grad_x_diff,
+                dense_grad_weight_diff,
+                dense_grad_threshold_diff,
+            ),
+        ),
         (tile_local, (tile_fwd_diff, tile_grad_x_diff, tile_grad_weight_diff, tile_grad_threshold_diff)),
     ):
         forward_ms, fwd_bwd_ms, peak_mem_mb = _benchmark_layout(layer, x=x, warmups=args.warmups, iters=args.iters)

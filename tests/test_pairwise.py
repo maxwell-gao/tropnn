@@ -4,9 +4,15 @@ import math
 
 import pytest
 import torch
-from tropnn.backends.comparator_margin_triton import has_comparator_margin_triton
-from tropnn.backends.pairwise_zig import has_pairwise_zig, pairwise_zig_forward, pairwise_zig_paged_forward, pairwise_zig_soa_forward, pairwise_zig_tree_tiled_forward
 from tropnn import AbsDiffLUT, ComparatorTwoSidedMargin, PairwiseLUT, PairwiseWalshLUT
+from tropnn.backends.comparator_margin_triton import has_comparator_margin_triton
+from tropnn.backends.pairwise_zig import (
+    has_pairwise_zig,
+    pairwise_zig_forward,
+    pairwise_zig_paged_forward,
+    pairwise_zig_soa_forward,
+    pairwise_zig_tree_tiled_forward,
+)
 from tropnn.examples.emnist import EmnistPairwiseWalshClassifier
 from tropnn.layers.surrogate import surrogate_gradient
 from tropnn.tools.emnist_payload_width import ComparatorGeneratorLayer
@@ -34,7 +40,14 @@ def test_pairwise_zig_paged_forward_matches_standard_zig_forward() -> None:
     layer = PairwiseLUT(16, 9, tables=5, comparisons=3, backend="torch", seed=2, lut_init_std=0.02, use_output_scaling=False)
     x = torch.randn(4, 3, 16)
     standard = pairwise_zig_forward(x.float(), layer.anchors, layer.thresholds.detach().float(), layer.lut.detach().float(), lut_dtype="f32")
-    paged = pairwise_zig_paged_forward(x.float(), layer.anchors, layer.thresholds.detach().float(), layer.lut.detach().float(), lut_dtype="f32", page_size=4)
+    paged = pairwise_zig_paged_forward(
+        x.float(),
+        layer.anchors,
+        layer.thresholds.detach().float(),
+        layer.lut.detach().float(),
+        lut_dtype="f32",
+        page_size=4,
+    )
     assert torch.allclose(paged, standard, atol=1e-6)
 
 
@@ -83,6 +96,226 @@ def test_comparator_output_major_layout_preserves_sparse_writes() -> None:
             route = source // 2
             side = source - route * 2
             assert int(layer.write_indices[route, side, slot].item()) == dst
+
+
+def test_comparator_dense_training_matches_sparse_action_forward_backward() -> None:
+    torch.manual_seed(11)
+    scatter = ComparatorTwoSidedMargin(
+        16,
+        13,
+        tables=5,
+        comparisons=3,
+        k_c=7,
+        backend="torch",
+        seed=4,
+        use_output_scaling=True,
+        reduction_layout="scatter",
+    )
+    dense_training = ComparatorTwoSidedMargin(
+        16,
+        13,
+        tables=5,
+        comparisons=3,
+        k_c=7,
+        backend="torch",
+        seed=4,
+        use_output_scaling=True,
+        reduction_layout="dense_training",
+    )
+    with torch.no_grad():
+        dense_training.thresholds.copy_(scatter.thresholds)
+        dense_training.write_weight.copy_(scatter.write_weight)
+
+    assert torch.equal(dense_training.anchors, scatter.anchors)
+    assert torch.equal(dense_training.write_indices, scatter.write_indices)
+
+    x_scatter = torch.randn(6, 4, 16, requires_grad=True)
+    x_dense = x_scatter.detach().clone().requires_grad_(True)
+    y_scatter = scatter(x_scatter)
+    y_dense = dense_training(x_dense)
+    assert torch.allclose(y_dense, y_scatter, atol=1e-5, rtol=1e-5)
+
+    grad = torch.randn_like(y_scatter)
+    y_scatter.backward(grad)
+    y_dense.backward(grad)
+    assert torch.allclose(x_dense.grad, x_scatter.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(
+        dense_training.thresholds.grad,
+        scatter.thresholds.grad,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        dense_training.write_weight.grad,
+        scatter.write_weight.grad,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_comparator_dense_training_rejects_misleading_triton_backend() -> None:
+    with pytest.raises(ValueError, match="requires backend='torch' or 'auto'"):
+        ComparatorTwoSidedMargin(
+            8,
+            5,
+            tables=2,
+            comparisons=2,
+            k_c=3,
+            backend="triton",
+            reduction_layout="dense_training",
+        )
+
+
+@pytest.mark.parametrize("k_c", [7, 13])
+def test_comparator_unique_expander_writes_are_unique_and_cover_full_output(k_c: int) -> None:
+    output_dim = 13
+    layer = ComparatorTwoSidedMargin(
+        16,
+        output_dim,
+        tables=5,
+        comparisons=3,
+        k_c=k_c,
+        backend="torch",
+        seed=4,
+        write_policy="expander_unique",
+        use_output_scaling=False,
+    )
+
+    sorted_indices = layer.write_indices.reshape(-1, k_c).sort(dim=-1).values
+    if k_c > 1:
+        assert torch.all(sorted_indices[:, 1:] > sorted_indices[:, :-1])
+    if k_c == output_dim:
+        expected = torch.arange(output_dim).expand_as(sorted_indices)
+        assert torch.equal(sorted_indices, expected)
+    assert "write_policy='expander_unique'" in repr(layer)
+
+
+def test_comparator_unique_expander_rejects_more_writes_than_outputs() -> None:
+    with pytest.raises(ValueError, match="requires k_c <= output_dim"):
+        ComparatorTwoSidedMargin(
+            8,
+            5,
+            tables=2,
+            comparisons=2,
+            k_c=6,
+            backend="torch",
+            write_policy="expander_unique",
+        )
+
+
+def test_comparator_unique_expander_dense_training_matches_scatter_forward_backward() -> None:
+    torch.manual_seed(12)
+    scatter = ComparatorTwoSidedMargin(
+        16,
+        13,
+        tables=5,
+        comparisons=3,
+        k_c=13,
+        backend="torch",
+        seed=4,
+        write_policy="expander_unique",
+        use_output_scaling=True,
+        reduction_layout="scatter",
+    )
+    dense_training = ComparatorTwoSidedMargin(
+        16,
+        13,
+        tables=5,
+        comparisons=3,
+        k_c=13,
+        backend="torch",
+        seed=4,
+        write_policy="expander_unique",
+        use_output_scaling=True,
+        reduction_layout="dense_training",
+    )
+    with torch.no_grad():
+        dense_training.thresholds.copy_(scatter.thresholds)
+        dense_training.write_weight.copy_(scatter.write_weight)
+
+    assert torch.equal(dense_training.anchors, scatter.anchors)
+    assert torch.equal(dense_training.write_indices, scatter.write_indices)
+
+    x_scatter = torch.randn(6, 4, 16, requires_grad=True)
+    x_dense = x_scatter.detach().clone().requires_grad_(True)
+    y_scatter = scatter(x_scatter)
+    y_dense = dense_training(x_dense)
+    assert torch.allclose(y_dense, y_scatter, atol=1e-5, rtol=1e-5)
+
+    grad = torch.randn_like(y_scatter)
+    y_scatter.backward(grad)
+    y_dense.backward(grad)
+    assert torch.allclose(x_dense.grad, x_scatter.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(
+        dense_training.thresholds.grad,
+        scatter.thresholds.grad,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        dense_training.write_weight.grad,
+        scatter.write_weight.grad,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("weight_mode", ["binary", "ternary"])
+def test_quantized_unique_expander_dense_training_matches_scatter_forward_backward(
+    weight_mode: str,
+) -> None:
+    torch.manual_seed(13)
+    common = dict(
+        input_dim=12,
+        output_dim=9,
+        tables=4,
+        comparisons=3,
+        k_c=9,
+        backend="torch",
+        seed=6,
+        write_policy="expander_unique",
+        use_output_scaling=True,
+        weight_mode=weight_mode,
+        ternary_threshold=0.5,
+    )
+    scatter = ComparatorTwoSidedMargin(
+        **common,
+        reduction_layout="scatter",
+    )
+    dense_training = ComparatorTwoSidedMargin(
+        **common,
+        reduction_layout="dense_training",
+    )
+    with torch.no_grad():
+        if weight_mode == "ternary":
+            scatter.write_weight.reshape(-1)[:3].copy_(
+                torch.tensor([math.atanh(0.75), 0.0, -math.atanh(0.75)])
+            )
+        dense_training.thresholds.copy_(scatter.thresholds)
+        dense_training.write_weight.copy_(scatter.write_weight)
+
+    x_scatter = torch.randn(5, 3, 12, requires_grad=True)
+    x_dense = x_scatter.detach().clone().requires_grad_(True)
+    y_scatter = scatter(x_scatter)
+    y_dense = dense_training(x_dense)
+    assert torch.allclose(y_dense, y_scatter, atol=1e-5, rtol=1e-5)
+
+    grad = torch.randn_like(y_scatter)
+    y_scatter.backward(grad)
+    y_dense.backward(grad)
+    assert torch.allclose(x_dense.grad, x_scatter.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(
+        dense_training.thresholds.grad,
+        scatter.thresholds.grad,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        dense_training.write_weight.grad,
+        scatter.write_weight.grad,
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_binary_comparator_matches_scaled_signed_float_initialization_and_trains_master() -> None:
@@ -160,6 +393,60 @@ def test_ternary_comparator_materializes_zero_and_signed_write_codes_with_gradie
     assert layer.write_weight.grad.abs().sum() > 0
     assert layer.thresholds.grad is not None
     assert layer.thresholds.grad.abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not has_comparator_margin_triton(), reason="CUDA Triton backend is not available")
+def test_comparator_scatter_triton_matches_torch_forward_backward() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    torch_ref = ComparatorTwoSidedMargin(
+        32,
+        19,
+        tables=7,
+        comparisons=4,
+        k_c=9,
+        backend="torch",
+        seed=5,
+        use_output_scaling=False,
+        reduction_layout="scatter",
+    ).to(device)
+    triton_scatter = ComparatorTwoSidedMargin(
+        32,
+        19,
+        tables=7,
+        comparisons=4,
+        k_c=9,
+        backend="triton",
+        seed=5,
+        use_output_scaling=False,
+        reduction_layout="scatter",
+    ).to(device)
+    with torch.no_grad():
+        triton_scatter.thresholds.copy_(torch_ref.thresholds)
+        triton_scatter.write_weight.copy_(torch_ref.write_weight)
+
+    x_ref = torch.randn(6, 3, 32, device=device, requires_grad=True)
+    x_triton = x_ref.detach().clone().requires_grad_(True)
+    y_ref = torch_ref(x_ref)
+    y_triton = triton_scatter(x_triton)
+    assert torch.allclose(y_triton, y_ref, atol=1e-5, rtol=1e-5)
+
+    grad = torch.randn_like(y_ref)
+    y_ref.backward(grad)
+    y_triton.backward(grad)
+    assert torch.allclose(x_triton.grad, x_ref.grad, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(
+        triton_scatter.thresholds.grad,
+        torch_ref.thresholds.grad,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert torch.allclose(
+        triton_scatter.write_weight.grad,
+        torch_ref.write_weight.grad,
+        atol=1e-4,
+        rtol=1e-4,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not has_comparator_margin_triton(), reason="CUDA Triton backend is not available")
