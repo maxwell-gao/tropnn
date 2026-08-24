@@ -4,6 +4,7 @@ from .comparator_margin import ComparatorTwoSidedMargin
 from .coxeter import CoxeterLUT, CoxeterRoute, K4FullLUT
 from .hash_selected_sparse_hinge import HashSelectedSparseHinge
 from .hash_shared_sparse_hinge import HashSharedSelectionMode, HashSharedSparseHinge
+from .ordinal_residual import MatchedOrdinalResidualBlock, OrdinalResidualKind, s4_diffusion_features
 from .pair_kernel import (
     RELATION_QUANTIZATION_SPECS,
     BalancedS4Router,
@@ -55,6 +56,8 @@ __all__ = [
     "IntegerRootCache",
     "IntrinsicS4Kernel",
     "LUTModuleBase",
+    "MatchedOrdinalResidualBlock",
+    "OrdinalResidualKind",
     "PAIRWISE_ANCHOR_POLICIES",
     "PairwiseLinear",
     "PairwiseLUT",
@@ -79,6 +82,7 @@ __all__ = [
     "quantize_relation_coefficients",
     "permutation_rank4",
     "s4_fourier_energy",
+    "s4_diffusion_features",
     "s4_gauge_maps",
     "s4_tables",
 ]
