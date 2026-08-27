@@ -3,42 +3,25 @@ from __future__ import annotations
 import torch
 from tropnn.tools.random_linear_address_action_factorial import (
     ArmResult,
-    PairPageRegressor,
-    flat_leaf_probabilities,
+    _make_pair_page_regressor,
     orthogonal_teacher,
     summarize,
-    tree_leaf_probabilities,
 )
 
 
-def test_flat_and_tree_probabilities_are_hard_one_hot() -> None:
-    bits = torch.tensor([[0.0, 1.0, 1.0], [1.0, 0.0, 0.0]])
-    flat = flat_leaf_probabilities(bits)
-    assert torch.equal(flat.argmax(dim=1), torch.tensor([3, 4]))
-    assert torch.equal(flat.sum(dim=1), torch.ones(2))
-
-    tree_bits = torch.zeros(2, 7)
-    tree_bits[0, 0] = 1
-    tree_bits[0, 2] = 1
-    tree_bits[0, 6] = 1
-    tree = tree_leaf_probabilities(tree_bits, depth=3)
-    assert torch.equal(tree.argmax(dim=1), torch.tensor([7, 0]))
-    assert torch.equal(tree.sum(dim=1), torch.ones(2))
-
-
-def test_hard_probability_and_sequential_codes_match() -> None:
+def test_experiment_models_use_hard_one_hot_shared_routes() -> None:
     for address in ("flat", "tree"):
-        model = PairPageRegressor(8, 3, address, "constant", anchor_seed=3, row_seed=4)
+        model = _make_pair_page_regressor(8, 3, address, "constant", anchor_seed=3, row_seed=4, tau=1.0)
         x = torch.randn(64, 8)
-        probability_code = model.leaf_probabilities(x).argmax(dim=1)
+        probability_code = model.leaf_probabilities(x).argmax(dim=-1)
         assert torch.equal(probability_code, model.hard_codes(x))
 
 
 def test_zero_slope_live_is_exact_constant() -> None:
-    constant = PairPageRegressor(8, 3, "tree", "constant", anchor_seed=5, row_seed=6)
-    live = PairPageRegressor(8, 3, "tree", "live", anchor_seed=5, row_seed=6)
+    constant = _make_pair_page_regressor(8, 3, "tree", "constant", anchor_seed=5, row_seed=6, tau=1.0)
+    live = _make_pair_page_regressor(8, 3, "tree", "live", anchor_seed=5, row_seed=6, tau=1.0)
     x = torch.randn(32, 8)
-    assert torch.equal(constant.anchors, live.anchors)
+    assert torch.equal(constant.supports, live.supports)
     assert torch.equal(constant.rows, live.rows)
     assert torch.equal(constant(x), live(x))
 

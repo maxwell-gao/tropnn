@@ -57,6 +57,24 @@ y = layer(x)
 Use Torch as the semantic reference. Optimized paths must preserve route,
 payload decode, output reduction, and STE semantics.
 
+### Shared hard-router implementation
+
+Research variants must use the public primitives in
+`tropnn.layers.hard_lookup` rather than implementing route packing, adaptive
+traversal, row gathering, or STE inside a tool. `HardLookupRouter` spans
+Pair/Unary predicates, Flat/Adaptive topologies, level-shared/node-specific
+supports, soft-product/local-counterfactual backward paths, and
+constant/diagonal-live rows. `ProductGridLookupRouter` supplies mixed-radix
+multi-threshold product cells, while `adaptive_hard_route_lookahead` supplies
+bit-exact speculative schedules for a frozen adaptive tree. Random
+initialization and scientific protocol choices remain in experiment code.
+
+`PairwiseLUT` keeps its optimized backend surface, but its Torch route, row
+reduction, and neighbor-delta reference use the same shared primitives. The
+MADDNESS adapters in `layers/maddness.py` also configure this core. See
+[`../../../doc/HARD_LOOKUP_CORE_ARCHITECTURE.md`](../../../doc/HARD_LOOKUP_CORE_ARCHITECTURE.md)
+for the implementation boundary and migration map.
+
 ## Backends
 
 | Backend | Purpose |
@@ -153,6 +171,11 @@ cd python/src/tropnn
 /home/ubuntu/.nix-profile/bin/uv sync --extra dev
 PYTHONPATH=. .venv/bin/pytest tests -q
 ```
+
+Do not add a trainable route/lookup/STE implementation under `tools/`. A new
+experiment should construct `HardLookupRouter` from explicit tensors and keep
+only data, initialization, composition, optimization, evaluation, and artifact
+logic in its tool module.
 
 Read [`../../report/README.md`](../../report/README.md) for evidence and
 [`../../../doc/PAIRWISE_LUT_CURRENT_STATE.md`](../../../doc/PAIRWISE_LUT_CURRENT_STATE.md)

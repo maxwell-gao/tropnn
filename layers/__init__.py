@@ -2,8 +2,10 @@ from .base import LUTModuleBase
 from .chamber_lifting import ChamberLiftingStage, ChamberLiftingTower, permutation_rank4
 from .comparator_margin import ComparatorTwoSidedMargin
 from .coxeter import CoxeterLUT, CoxeterRoute, K4FullLUT
+from .hard_lookup import HardLookupRoute, HardLookupRouter, HardLookupSpec, ProductGridLookupRouter, ProductGridRoute
 from .hash_selected_sparse_hinge import HashSelectedSparseHinge
 from .hash_shared_sparse_hinge import HashSharedSelectionMode, HashSharedSparseHinge
+from .maddness import CompiledMaddness, FrozenMaddness, LocalCounterfactualMaddness, SoftPQMaddness
 from .ordinal_residual import (
     FactorialOrdinalResidualBlock,
     FactorialOrdinalResidualKind,
@@ -47,9 +49,17 @@ __all__ = [
     "ChamberLiftingStage",
     "ChamberLiftingTower",
     "ComparatorTwoSidedMargin",
+    "CompiledMaddness",
     "HashSelectedSparseHinge",
     "HashSharedSelectionMode",
     "HashSharedSparseHinge",
+    "HardLookupRoute",
+    "HardLookupRouter",
+    "HardLookupSpec",
+    "ProductGridLookupRouter",
+    "ProductGridRoute",
+    "FrozenMaddness",
+    "LocalCounterfactualMaddness",
     "CoxeterLUT",
     "CoxeterPairScorer",
     "CoxeterRoute",
@@ -83,6 +93,7 @@ __all__ = [
     "RootIncidenceKernel",
     "S4ObjectFeatures",
     "SameTableFullKernel",
+    "SoftPQMaddness",
     "TernaryMarginAction",
     "TernaryMarginActionMode",
     "circulant_relation_edges",

@@ -1,7 +1,7 @@
 import torch
 from tropnn.tools.random_linear_multitable_address_action_factorial import (
-    MultiTablePairRegressor,
     _build_models,
+    _make_multitable_regressor,
 )
 
 
@@ -19,7 +19,7 @@ def test_multitable_hard_routes_and_zero_slope_nesting() -> None:
 
 def test_leaf_probabilities_are_hard_one_hot_in_forward() -> None:
     for address in ("flat", "tree"):
-        model = MultiTablePairRegressor(8, 3, 2, address, "constant", anchor_seed=1, row_seed=2, tau=1.0)
+        model = _make_multitable_regressor(8, 3, 2, address, "constant", anchor_seed=1, row_seed=2, tau=1.0)
         x = torch.randn(17, 8)
         leaf = model.leaf_probabilities(x)
         assert leaf.shape == (17, 3, 4)

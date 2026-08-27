@@ -12,12 +12,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from tropnn.layers.hard_lookup import HardLookupRouter
 from tropnn.tools.random_linear_address_action_factorial import (
     _metrics,
     _parse_seeds,
     orthogonal_teacher,
     sample_pair_anchors,
-    straight_through_bit,
 )
 
 Address = Literal["flat", "tree"]
@@ -42,79 +42,38 @@ class ArmResult:
     training_curve: list[dict[str, float]]
 
 
-class MultiTablePairRegressor(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        tables: int,
-        depth: int,
-        address: Address,
-        action: Action,
-        *,
-        anchor_seed: int,
-        row_seed: int,
-        tau: float,
-    ) -> None:
-        super().__init__()
-        self.dim = dim
-        self.tables = tables
-        self.depth = depth
-        self.address = address
-        self.action = action
-        self.tau = tau
-        predicates = depth if address == "flat" else 2**depth - 1
-        self.register_buffer("anchors", sample_pair_anchors(tables * predicates, dim, anchor_seed).view(tables, predicates, 2))
-        self.thresholds = nn.Parameter(torch.zeros(tables, predicates))
-        generator = torch.Generator(device="cpu").manual_seed(row_seed)
-        rows = torch.randn(tables, 2**depth, dim, generator=generator) * (0.01 / tables**0.5)
-        self.rows = nn.Parameter(rows)
-        if action == "live":
-            self.slopes = nn.Parameter(torch.zeros_like(rows))
-        else:
-            self.register_parameter("slopes", None)
-
-    def _bits(self, x: Tensor) -> Tensor:
-        left = self.anchors[..., 0]
-        right = self.anchors[..., 1]
-        margins = x[:, left] - x[:, right] - self.thresholds
-        return straight_through_bit(margins, self.tau)
-
-    def leaf_probabilities(self, x: Tensor) -> Tensor:
-        bits = self._bits(x)
-        if self.address == "flat":
-            codes = torch.arange(2**self.depth, device=x.device)
-            shifts = torch.arange(self.depth - 1, -1, -1, device=x.device)
-            patterns = ((codes[:, None] >> shifts[None, :]) & 1).to(x.dtype)
-            return (bits[:, :, None, :] * patterns[None, None, :, :] + (1 - bits[:, :, None, :]) * (1 - patterns[None, None, :, :])).prod(-1)
-        mass = torch.ones((x.shape[0], self.tables, 1), device=x.device, dtype=x.dtype)
-        offset = 0
-        for level in range(self.depth):
-            width = 2**level
-            level_bits = bits[:, :, offset : offset + width]
-            mass = torch.stack((mass * (1 - level_bits), mass * level_bits), dim=-1).reshape(x.shape[0], self.tables, -1)
-            offset += width
-        return mass
-
-    @torch.no_grad()
-    def hard_codes(self, x: Tensor) -> Tensor:
-        bits = self._bits(x) >= 0.5
-        code = torch.zeros((x.shape[0], self.tables), dtype=torch.int64, device=x.device)
-        if self.address == "flat":
-            for column in range(self.depth):
-                code = 2 * code + bits[:, :, column].to(torch.int64)
-            return code
-        for level in range(self.depth):
-            node = (2**level - 1) + code
-            branch = bits.gather(2, node.unsqueeze(-1)).squeeze(-1).to(torch.int64)
-            code = 2 * code + branch
-        return code
-
-    def forward(self, x: Tensor) -> Tensor:
-        leaf = self.leaf_probabilities(x)
-        output = torch.einsum("btr,trd->bd", leaf, self.rows)
-        if self.slopes is not None:
-            output = output + torch.einsum("btr,trd->bd", leaf, self.slopes) * x
-        return output
+def _make_multitable_regressor(
+    dim: int,
+    tables: int,
+    depth: int,
+    address: Address,
+    action: Action,
+    *,
+    anchor_seed: int,
+    row_seed: int,
+    tau: float,
+) -> HardLookupRouter:
+    predicates = depth if address == "flat" else 2**depth - 1
+    supports = sample_pair_anchors(tables * predicates, dim, anchor_seed).view(tables, predicates, 2)
+    thresholds = torch.zeros(tables, predicates)
+    generator = torch.Generator(device="cpu").manual_seed(row_seed)
+    rows = torch.randn(tables, 2**depth, dim, generator=generator) * (0.01 / tables**0.5)
+    slopes = torch.zeros_like(rows) if action == "live" else None
+    return HardLookupRouter(
+        dim,
+        dim,
+        depth=depth,
+        predicate="pair",
+        topology="flat" if address == "flat" else "adaptive",
+        support_layout="level" if address == "flat" else "node",
+        supports=supports,
+        thresholds=thresholds,
+        rows=rows,
+        surrogate="soft_product",
+        action="constant" if action == "constant" else "diagonal_live",
+        slopes=slopes,
+        tau=tau,
+    )
 
 
 def _route_health(codes: Tensor, rows: int) -> tuple[float, float, float]:
@@ -131,15 +90,24 @@ def _route_health(codes: Tensor, rows: int) -> tuple[float, float, float]:
     return sum(observed) / len(observed), sum(entropies) / len(entropies), maximum_mass
 
 
-def _build_models(dim: int, tables: int, depth: int, seed: int, tau: float, device: torch.device) -> dict[str, MultiTablePairRegressor]:
-    models: dict[str, MultiTablePairRegressor] = {}
+def _build_models(dim: int, tables: int, depth: int, seed: int, tau: float, device: torch.device) -> dict[str, HardLookupRouter]:
+    models: dict[str, HardLookupRouter] = {}
     for address, anchor_seed, row_seed in (("flat", seed + 1_000, seed + 3_000), ("tree", seed + 2_000, seed + 4_000)):
         for action in ("constant", "live"):
             arm = f"{address}_{action}"
-            models[arm] = MultiTablePairRegressor(dim, tables, depth, address, action, anchor_seed=anchor_seed, row_seed=row_seed, tau=tau).to(device)  # type: ignore[arg-type]
+            models[arm] = _make_multitable_regressor(
+                dim,
+                tables,
+                depth,
+                address,  # type: ignore[arg-type]
+                action,  # type: ignore[arg-type]
+                anchor_seed=anchor_seed,
+                row_seed=row_seed,
+                tau=tau,
+            ).to(device)
     for address in ("flat", "tree"):
         constant, live = models[f"{address}_constant"], models[f"{address}_live"]
-        if not torch.equal(constant.anchors, live.anchors) or not torch.equal(constant.rows, live.rows):
+        if not torch.equal(constant.supports, live.supports) or not torch.equal(constant.rows, live.rows):
             raise AssertionError("constant/live initialization mismatch")
         with torch.no_grad():
             probe = torch.randn(16, dim, device=device)

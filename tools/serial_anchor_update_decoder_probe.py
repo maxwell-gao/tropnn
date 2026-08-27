@@ -13,11 +13,11 @@ import torch
 from torch import Tensor, nn
 
 from tropnn.layers import PairwiseLUT
-from tropnn.layers.pairwise import PairwiseRoute, _cache_pairwise_index, _make_pairwise_anchors
+from tropnn.layers.hard_lookup import HardLookupSpec, hard_route
+from tropnn.layers.pairwise import PairwiseRoute, _make_pairwise_anchors
 from tropnn.layers.surrogate import ste_heaviside
 from tropnn.tools.bilinear_retrieval_probe import retrieval_metrics, teacher_scores
 from tropnn.tools.fixed_route_relation_energy_probe import make_relation_pairs, pair_accuracy
-
 
 DEPTHS = (2, 4, 8, 16)
 UPDATE_VARIANTS = ("signed", "two_sided")
@@ -43,6 +43,16 @@ class AnchorRouteUpdate(nn.Module):
         self.tables = tables
         self.comparisons = comparisons
         self.variant = variant
+        self._route_spec = HardLookupSpec(
+            input_dim,
+            input_dim,
+            comparisons,
+            "pair",
+            "flat",
+            bit_order="lsb",
+            tie_break="positive",
+            surrogate="none",
+        )
         self.output_scale = 1.0 / math.sqrt(tables)
         self.register_buffer(
             "anchors",
@@ -54,7 +64,8 @@ class AnchorRouteUpdate(nn.Module):
         self.payload = nn.Parameter(torch.zeros(tables, 1 << comparisons, comparisons, sides))
 
     def route(self, x: Tensor) -> PairwiseRoute:
-        return _cache_pairwise_index(x, self.anchors, self.thresholds, self.powers)
+        route = hard_route(x, self.anchors, self.thresholds, self._route_spec)
+        return PairwiseRoute(route.codes, route.margins)
 
     def _lookup(self, indices: Tensor) -> Tensor:
         table = torch.arange(self.tables, device=indices.device).view(1, 1, self.tables)

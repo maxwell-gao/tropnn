@@ -11,10 +11,14 @@ from torch import Tensor
 
 from ..backend import Backend
 from .base import LUTLayerSpec, LUTModuleBase, finish_lut_output
+from .hard_lookup import HardLookupSpec, hard_route, sum_lookup_rows, weighted_neighbor_delta
 from .surrogate import ste_heaviside, surrogate_gradient
 
 PAIRWISE_ANCHOR_POLICIES = ("random", "random_no_replace", "local", "cyclic", "block", "expander", "permuted")
-LutDType = Literal["fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "ternary_int2", "ternary_fixed", "binary01_fixed", "binary01_1bit", "binary01_bf16", "fp4", "nf4"]
+LutDType = Literal[
+    "fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "ternary_int2",
+    "ternary_fixed", "binary01_fixed", "binary01_1bit", "binary01_bf16", "fp4", "nf4",
+]
 
 __all__ = ["AbsDiffLUT", "AbsDiffSpec", "PAIRWISE_ANCHOR_POLICIES", "PairwiseLUT", "PairwiseRoute", "PairwiseSpec", "PairwiseWalshLUT"]
 
@@ -44,7 +48,10 @@ class PairwiseSpec:
             raise ValueError("cpu_lut_dtype must be 'f32' or 'f16'")
         if self.anchor_policy not in PAIRWISE_ANCHOR_POLICIES:
             raise ValueError(f"unsupported anchor policy {self.anchor_policy!r}")
-        if self.lut_dtype not in {"fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "ternary_int2", "ternary_fixed", "binary01_fixed", "binary01_1bit", "binary01_bf16", "fp4", "nf4"}:
+        if self.lut_dtype not in {
+            "fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "ternary_int2",
+            "ternary_fixed", "binary01_fixed", "binary01_1bit", "binary01_bf16", "fp4", "nf4",
+        }:
             raise ValueError(f"unsupported lut_dtype {self.lut_dtype!r}")
         if not 0.0 <= self.table_dropout < 1.0:
             raise ValueError("table_dropout must be in [0, 1)")
@@ -152,9 +159,22 @@ class PairwiseLUT(LUTModuleBase):
         surrogate_gradient(torch.zeros((), dtype=torch.float32), spec.surrogate)
         super().__init__(LUTLayerSpec.build(spec.input_dim, spec.output_dim, backend=spec.backend, output_scale=spec.output_scale))
         self.spec = spec
+        self._shared_route_spec = HardLookupSpec(
+            spec.input_dim,
+            spec.output_dim,
+            spec.comparisons,
+            "pair",
+            "flat",
+            bit_order="lsb",
+            tie_break="positive",
+            surrogate="none",
+        )
         self._use_min_margin_ste = spec.use_min_margin_ste
         self._zig_cache = _ZigLutCache(spec.cpu_lut_dtype)
-        self.register_buffer("anchors", _make_pairwise_anchors(spec.input_dim, spec.tables, spec.comparisons, policy=spec.anchor_policy, seed=spec.anchor_seed))
+        self.register_buffer(
+            "anchors",
+            _make_pairwise_anchors(spec.input_dim, spec.tables, spec.comparisons, policy=spec.anchor_policy, seed=spec.anchor_seed),
+        )
         self.register_buffer("powers", 2 ** torch.arange(spec.comparisons, dtype=torch.long))
         thresholds = torch.zeros(spec.tables, spec.comparisons)
         self.register_buffer("thresholds", thresholds) if fixed_zero_threshold else setattr(self, "thresholds", nn.Parameter(thresholds))
@@ -224,13 +244,14 @@ class PairwiseLUT(LUTModuleBase):
         return output, route
 
     def cache_index(self, x: Tensor) -> PairwiseRoute:
-        return _cache_pairwise_index(x, self.anchors, self.thresholds, self.powers)
+        route = hard_route(x, self.anchors, self.thresholds, self._shared_route_spec)
+        return PairwiseRoute(route.codes, route.margins)
 
     def lut_payload(self, *, dtype: torch.dtype, device: torch.device) -> Tensor:
         return _materialize_lut_payload(self.lut, self.lut_dtype, dtype=dtype, device=device)
 
     def lut_forward(self, route: PairwiseRoute, lut: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
-        return _sum_lut_rows(route.indices, lut, table_size=self.table_size, output_dim=self.output_dim, compute_dtype=compute_dtype)
+        return sum_lookup_rows(lut, route.indices, accumulation_dtype=torch.float32).to(compute_dtype)
 
     def lut_backward_surrogate(self, route: PairwiseRoute, lut: Tensor) -> Tensor:
         if self.use_min_margin_ste:
@@ -238,12 +259,15 @@ class PairwiseLUT(LUTModuleBase):
             margin = route.margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
             neighbor = route.indices ^ (2**bit).long()
             ste = ste_heaviside(margin, self.surrogate) - (margin > 0).to(margin.dtype)
-            return _single_bit_ste_delta(route.indices, neighbor, ste, lut, table_size=self.table_size, output_dim=self.output_dim)
-        return _all_bits_ste_delta(route, self.powers, lut, table_size=self.table_size, output_dim=self.output_dim, surrogate=self.surrogate)
+            return weighted_neighbor_delta(lut, route.indices, neighbor, ste)
+        neighbor = route.indices.unsqueeze(-1) ^ self.powers.to(device=route.indices.device).view(*([1] * route.indices.ndim), -1)
+        ste = ste_heaviside(route.margins, self.surrogate) - (route.margins > 0).to(route.margins.dtype)
+        return weighted_neighbor_delta(lut, route.indices, neighbor, ste)
 
     def route(self, x: Tensor) -> PairwiseRoute: return self.cache_index(x)
     def payload_table(self, *, dtype: torch.dtype, device: torch.device) -> Tensor: return self.lut_payload(dtype=dtype, device=device)
-    def lookup(self, route: PairwiseRoute, lut: Tensor, *, compute_dtype: torch.dtype) -> Tensor: return self.lut_forward(route, lut, compute_dtype=compute_dtype)
+    def lookup(self, route: PairwiseRoute, lut: Tensor, *, compute_dtype: torch.dtype) -> Tensor:
+        return self.lut_forward(route, lut, compute_dtype=compute_dtype)
     def ste_correction(self, route: PairwiseRoute, lut: Tensor) -> Tensor: return self.lut_backward_surrogate(route, lut)
     def set_ste_mode(self, use_min_margin: bool) -> None: self._use_min_margin_ste = bool(use_min_margin)
     def clear_packed_payload_cache(self) -> None:
@@ -310,7 +334,10 @@ class PairwiseLUT(LUTModuleBase):
             raise RuntimeError("PairwiseLUT backend='zig' is inference-only; call .eval() or use backend='torch' for training")
         from ..backends import pairwise_zig_forward
 
-        output = pairwise_zig_forward(x, self.anchors, self.thresholds.detach().to(dtype=torch.float32, device="cpu"), self._zig_cache.materialize(self.lut), lut_dtype=self.cpu_lut_dtype)
+        output = pairwise_zig_forward(
+            x, self.anchors, self.thresholds.detach().to(dtype=torch.float32, device="cpu"),
+            self._zig_cache.materialize(self.lut), lut_dtype=self.cpu_lut_dtype,
+        )
         return output.to(device=x.device, dtype=compute_dtype), route
 
 
@@ -359,7 +386,12 @@ class PairwiseWalshLUT(PairwiseLUT):
             raise ValueError("slope_order must be 0, 1, or 2")
         if backend != "torch":
             raise ValueError("PairwiseWalshLUT only supports backend='torch'")
-        super().__init__(input_dim, output_dim, tables=tables, comparisons=comparisons, backend=backend, seed=seed, lut_init_std=0.0, use_min_margin_ste=use_min_margin_ste, use_output_scaling=use_output_scaling, fixed_zero_threshold=fixed_zero_threshold, surrogate=surrogate, anchor_policy=anchor_policy, anchor_seed=anchor_seed, lut_dtype=lut_dtype)
+        super().__init__(
+            input_dim, output_dim, tables=tables, comparisons=comparisons, backend=backend, seed=seed,
+            lut_init_std=0.0, use_min_margin_ste=use_min_margin_ste, use_output_scaling=use_output_scaling,
+            fixed_zero_threshold=fixed_zero_threshold, surrogate=surrogate, anchor_policy=anchor_policy,
+            anchor_seed=anchor_seed, lut_dtype=lut_dtype,
+        )
         del self.lut
         self.walsh_order = int(walsh_order)
         self.slope_order = int(slope_order)
@@ -434,11 +466,17 @@ class PairwiseWalshLUT(PairwiseLUT):
         device = device if device is not None else self.constant.device
         bits = self.walsh_bits.to(dtype=dtype, device=device)
         output = self.constant.to(dtype=dtype, device=device).unsqueeze(1)
-        output = output + (bits.view(1, self.table_size, self.comparisons, 1) * self.linear_coeff.to(dtype=dtype, device=device).view(self.tables, 1, self.comparisons, self.output_dim)).sum(dim=2)
+        output = output + (
+            bits.view(1, self.table_size, self.comparisons, 1)
+            * self.linear_coeff.to(dtype=dtype, device=device).view(self.tables, 1, self.comparisons, self.output_dim)
+        ).sum(dim=2)
         if self.pair_indices.numel() > 0:
             pairs = self.pair_indices.to(device=device)
             pair_bits = bits[:, pairs[:, 0]] * bits[:, pairs[:, 1]]
-            output = output + (pair_bits.view(1, self.table_size, -1, 1) * self.pair_coeff.to(dtype=dtype, device=device).view(self.tables, 1, -1, self.output_dim)).sum(dim=2)
+            output = output + (
+                pair_bits.view(1, self.table_size, -1, 1)
+                * self.pair_coeff.to(dtype=dtype, device=device).view(self.tables, 1, -1, self.output_dim)
+            ).sum(dim=2)
         return _materialize_lut_payload(output, self.lut_dtype, dtype=dtype, device=device)
 
     def materialize_slope_coeff(self, *, dtype: torch.dtype | None = None, device: torch.device | None = None) -> Tensor:
@@ -450,7 +488,10 @@ class PairwiseWalshLUT(PairwiseLUT):
         bits = self.walsh_bits.to(dtype=dtype, device=device)
         output = self.slope_constant.to(dtype=dtype, device=device).unsqueeze(1)
         linear = self.slope_linear_coeff.to(dtype=dtype, device=device)
-        output = output + (bits.view(1, self.table_size, 1, self.comparisons) * linear.view(self.tables, 1, self.comparisons, self.comparisons)).sum(dim=-1)
+        output = output + (
+            bits.view(1, self.table_size, 1, self.comparisons)
+            * linear.view(self.tables, 1, self.comparisons, self.comparisons)
+        ).sum(dim=-1)
         if self.slope_pair_indices.numel() > 0:
             pairs = self.slope_pair_indices.to(device=device)
             pair_bits = bits[:, pairs[:, 0]] * bits[:, pairs[:, 1]]
@@ -465,12 +506,17 @@ class PairwiseWalshLUT(PairwiseLUT):
         prefix, routes = route.indices.shape[:-1], route.indices.shape[-1]
         items = max(1, route.indices.numel() // routes)
         flat_indices = route.indices.reshape(items, routes)
-        flat_coeff = self.materialize_slope_coeff(dtype=compute_dtype, device=route.indices.device).reshape(routes * self.table_size, self.comparisons)
+        flat_coeff = self.materialize_slope_coeff(dtype=compute_dtype, device=route.indices.device).reshape(
+            routes * self.table_size, self.comparisons
+        )
         margins = route.margins.reshape(items, routes, self.comparisons).to(dtype=compute_dtype)
         generators = _materialize_lut_payload(self.slope_generator, self.lut_dtype, dtype=compute_dtype, device=route.indices.device)
         generators = generators.reshape(routes, self.comparisons, self.output_dim)
         output = torch.zeros(items, self.output_dim, dtype=compute_dtype, device=route.indices.device)
-        chunk = _route_chunk_size(item_count=items, payload_width=self.output_dim * self.comparisons, compute_dtype=compute_dtype, route_count=routes, target_bytes=8 * 1024 * 1024)
+        chunk = _route_chunk_size(
+            item_count=items, payload_width=self.output_dim * self.comparisons,
+            compute_dtype=compute_dtype, route_count=routes, target_bytes=8 * 1024 * 1024,
+        )
         for start in range(0, routes, chunk):
             stop = min(start + chunk, routes)
             offsets = (torch.arange(start, stop, device=route.indices.device) * self.table_size).view(1, -1)
@@ -505,11 +551,16 @@ class PairwiseWalshLUT(PairwiseLUT):
         neighbor = neighbor_indices.reshape(items, routes)
         margins = route.margins.reshape(items, routes, self.comparisons).float()
         weight = ste_weight.reshape(items, routes, 1).float()
-        flat_coeff = self.materialize_slope_coeff(dtype=torch.float32, device=route.indices.device).reshape(routes * self.table_size, self.comparisons)
+        flat_coeff = self.materialize_slope_coeff(dtype=torch.float32, device=route.indices.device).reshape(
+            routes * self.table_size, self.comparisons
+        )
         generators = _materialize_lut_payload(self.slope_generator, self.lut_dtype, dtype=torch.float32, device=route.indices.device)
         generators = generators.reshape(routes, self.comparisons, self.output_dim)
         output = torch.zeros(items, self.output_dim, dtype=torch.float32, device=route.indices.device)
-        chunk = _route_chunk_size(item_count=items, payload_width=self.output_dim * self.comparisons, compute_dtype=torch.float32, route_count=routes, target_bytes=8 * 1024 * 1024)
+        chunk = _route_chunk_size(
+            item_count=items, payload_width=self.output_dim * self.comparisons,
+            compute_dtype=torch.float32, route_count=routes, target_bytes=8 * 1024 * 1024,
+        )
         for start in range(0, routes, chunk):
             stop = min(start + chunk, routes)
             offsets = (torch.arange(start, stop, device=route.indices.device) * self.table_size).view(1, -1)
@@ -543,7 +594,10 @@ class AbsDiffLUT(nn.Module):
         super().__init__()
         if width_init <= 0:
             raise ValueError("width_init must be positive")
-        self.spec = AbsDiffSpec(int(features), int(output_dim), int(tables), int(comparisons), bool(use_min_margin_ste), surrogate, bool(use_output_scaling))
+        self.spec = AbsDiffSpec(
+            int(features), int(output_dim), int(tables), int(comparisons),
+            bool(use_min_margin_ste), surrogate, bool(use_output_scaling),
+        )
         surrogate_gradient(torch.zeros((), dtype=torch.float32), self.surrogate)
         self._last_route: PairwiseRoute | None = None
         self._last_indices: Tensor | None = None
@@ -584,7 +638,11 @@ class AbsDiffLUT(nn.Module):
         return PairwiseRoute(((margins > 0).to(torch.long) * powers).sum(dim=-1), margins)
 
     def lookup(self, route: PairwiseRoute, *, compute_dtype: torch.dtype) -> Tensor:
-        return _sum_lut_rows(route.indices, self.lut.to(dtype=compute_dtype, device=route.indices.device), table_size=self.table_size, output_dim=self.output_dim, compute_dtype=compute_dtype)
+        return sum_lookup_rows(
+            self.lut.to(dtype=compute_dtype, device=route.indices.device),
+            route.indices,
+            accumulation_dtype=torch.float32,
+        ).to(compute_dtype)
 
     def ste_correction(self, route: PairwiseRoute) -> Tensor:
         lut = self.lut.to(dtype=torch.float32, device=route.indices.device)
@@ -593,8 +651,10 @@ class AbsDiffLUT(nn.Module):
             margin = route.margins.gather(dim=-1, index=bit.unsqueeze(-1)).squeeze(-1)
             neighbor = route.indices ^ (2**bit).long()
             ste = ste_heaviside(margin, self.surrogate) - (margin > 0).to(margin.dtype)
-            return _single_bit_ste_delta(route.indices, neighbor, ste, lut, table_size=self.table_size, output_dim=self.output_dim)
-        return _all_bits_ste_delta(route, self.powers, lut, table_size=self.table_size, output_dim=self.output_dim, surrogate=self.surrogate)
+            return weighted_neighbor_delta(lut, route.indices, neighbor, ste)
+        neighbor = route.indices.unsqueeze(-1) ^ self.powers.to(device=route.indices.device).view(*([1] * route.indices.ndim), -1)
+        ste = ste_heaviside(route.margins, self.surrogate) - (route.margins > 0).to(route.margins.dtype)
+        return weighted_neighbor_delta(lut, route.indices, neighbor, ste)
 
     def forward(self, query: Tensor, key: Tensor) -> Tensor:
         compute_dtype = _compute_dtype_for_lut(query, "fp32")
@@ -771,82 +831,15 @@ def _make_pairwise_anchors(input_dim: int, tables: int, comparisons: int, *, pol
     return torch.stack((a, b), dim=-1).view(tables, comparisons, 2)
 
 
-def _cache_pairwise_index(x: Tensor, anchors: Tensor, thresholds: Tensor, powers: Tensor) -> PairwiseRoute:
-    prefix = x.shape[:-1]
-    tables, comparisons, _ = anchors.shape
-    a = anchors[:, :, 0].flatten()
-    b = anchors[:, :, 1].flatten()
-    x_a = x[..., a].view(*prefix, tables, comparisons).float()
-    x_b = x[..., b].view(*prefix, tables, comparisons).float()
-    margins = x_a - x_b - thresholds.to(dtype=torch.float32, device=x.device)
-    powers = powers.to(device=x.device).view(*([1] * len(prefix)), 1, -1)
-    return PairwiseRoute(((margins > 0).to(torch.long) * powers).sum(dim=-1), margins)
-
-
-def _sum_lut_rows(indices: Tensor, lut: Tensor, *, table_size: int, output_dim: int, compute_dtype: torch.dtype) -> Tensor:
-    prefix, routes = indices.shape[:-1], indices.shape[-1]
-    items = max(1, indices.numel() // routes)
-    flat_indices = indices.reshape(items, routes)
-    flat_lut = lut.reshape(routes * table_size, output_dim)
-    output = torch.zeros(items, output_dim, device=indices.device, dtype=torch.float32)
-    chunk = _route_chunk_size(item_count=items, payload_width=output_dim, compute_dtype=compute_dtype, route_count=routes)
-    for start in range(0, routes, chunk):
-        stop = min(start + chunk, routes)
-        offsets = (torch.arange(start, stop, device=indices.device) * table_size).view(1, -1)
-        rows = (flat_indices[:, start:stop] + offsets).reshape(-1)
-        values = flat_lut.index_select(0, rows).view(items, stop - start, output_dim)
-        output = output + values.sum(dim=1, dtype=torch.float32)
-    return output.view(*prefix, output_dim).to(compute_dtype)
-
-
 def _apply_table_dropout(lut: Tensor, probability: float) -> Tensor:
     keep = 1.0 - float(probability)
     mask = torch.empty(lut.shape[0], device=lut.device, dtype=torch.float32).bernoulli_(keep).div_(keep)
     return lut * mask.to(dtype=lut.dtype).view(-1, 1, 1)
 
 
-def _single_bit_ste_delta(current_indices: Tensor, neighbor_indices: Tensor, ste_weight: Tensor, lut: Tensor, *, table_size: int, output_dim: int) -> Tensor:
-    prefix, routes = current_indices.shape[:-1], current_indices.shape[-1]
-    items = max(1, current_indices.numel() // routes)
-    current = current_indices.reshape(items, routes)
-    neighbor = neighbor_indices.reshape(items, routes)
-    weight = ste_weight.reshape(items, routes, 1).float()
-    flat_lut = lut.to(dtype=torch.float32, device=current_indices.device).reshape(routes * table_size, output_dim)
-    output = torch.zeros(items, output_dim, device=current_indices.device, dtype=torch.float32)
-    chunk = _route_chunk_size(item_count=items, payload_width=output_dim, compute_dtype=torch.float32, route_count=routes)
-    for start in range(0, routes, chunk):
-        stop = min(start + chunk, routes)
-        offsets = (torch.arange(start, stop, device=current_indices.device) * table_size).view(1, -1)
-        rows = (current[:, start:stop] + offsets).reshape(-1)
-        neighbor_rows = (neighbor[:, start:stop] + offsets).reshape(-1)
-        cur = flat_lut.index_select(0, rows).view(items, stop - start, output_dim)
-        nbr = flat_lut.index_select(0, neighbor_rows).view(items, stop - start, output_dim)
-        output = output + (weight[:, start:stop] * (nbr - cur)).sum(dim=1)
-    return output.view(*prefix, output_dim)
-
-
-def _all_bits_ste_delta(route: PairwiseRoute, powers: Tensor, lut: Tensor, *, table_size: int, output_dim: int, surrogate: str) -> Tensor:
-    prefix, routes = route.indices.shape[:-1], route.indices.shape[-1]
-    comparisons = route.margins.shape[-1]
-    items = max(1, route.indices.numel() // routes)
-    current = route.indices.reshape(items, routes)
-    neighbor = current.unsqueeze(-1) ^ powers.to(device=route.indices.device).view(1, 1, -1)
-    ste = ste_heaviside(route.margins, surrogate) - (route.margins > 0).to(route.margins.dtype)
-    ste = ste.reshape(items, routes, comparisons, 1).float()
-    flat_lut = lut.to(dtype=torch.float32, device=route.indices.device).reshape(routes * table_size, output_dim)
-    output = torch.zeros(items, output_dim, device=route.indices.device, dtype=torch.float32)
-    chunk = _route_chunk_size(item_count=items, payload_width=output_dim * (comparisons + 1), compute_dtype=torch.float32, route_count=routes, target_bytes=8 * 1024 * 1024)
-    for start in range(0, routes, chunk):
-        stop = min(start + chunk, routes)
-        offsets = (torch.arange(start, stop, device=route.indices.device) * table_size).view(1, -1)
-        rows = (current[:, start:stop] + offsets).reshape(-1)
-        cur = flat_lut.index_select(0, rows).view(items, stop - start, 1, output_dim)
-        neighbor_rows = (neighbor[:, start:stop] + offsets.unsqueeze(-1)).reshape(-1)
-        nbr = flat_lut.index_select(0, neighbor_rows).view(items, stop - start, comparisons, output_dim)
-        output = output + (ste[:, start:stop] * (nbr - cur)).sum(dim=(1, 2))
-    return output.view(*prefix, output_dim)
-
-
-def _route_chunk_size(*, item_count: int, payload_width: int, compute_dtype: torch.dtype, route_count: int, target_bytes: int = 16 * 1024 * 1024) -> int:
+def _route_chunk_size(
+    *, item_count: int, payload_width: int, compute_dtype: torch.dtype,
+    route_count: int, target_bytes: int = 16 * 1024 * 1024,
+) -> int:
     bytes_per_route = item_count * payload_width * torch.finfo(compute_dtype).bits // 8
     return max(1, min(route_count, target_bytes // max(1, bytes_per_route)))

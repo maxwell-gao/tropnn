@@ -12,6 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from tropnn.layers.hard_lookup import HardLookupRouter
+
 Address = Literal["flat", "tree"]
 Action = Literal["constant", "live"]
 ARMS = ("flat_constant", "tree_constant", "flat_live", "tree_live")
@@ -53,100 +55,40 @@ def sample_pair_anchors(count: int, dim: int, seed: int) -> Tensor:
     return torch.stack((left, right), dim=-1)
 
 
-def straight_through_bit(margin: Tensor, tau: float) -> Tensor:
-    if tau <= 0:
-        raise ValueError("tau must be positive")
-    hard = (margin >= 0).to(margin.dtype)
-    soft = torch.sigmoid(margin / tau)
-    return hard + soft - soft.detach()
+def _make_pair_page_regressor(
+    dim: int,
+    depth: int,
+    address: Address,
+    action: Action,
+    *,
+    anchor_seed: int,
+    row_seed: int,
+    tau: float,
+) -> HardLookupRouter:
+    """Construct experiment initialization around the shared router core."""
 
-
-def flat_leaf_probabilities(bits: Tensor) -> Tensor:
-    if bits.ndim != 2:
-        raise ValueError("flat bits must be [batch, depth]")
-    depth = bits.shape[1]
-    codes = torch.arange(2**depth, device=bits.device)
-    shifts = torch.arange(depth - 1, -1, -1, device=bits.device)
-    patterns = ((codes[:, None] >> shifts[None, :]) & 1).to(bits.dtype)
-    factors = bits[:, None, :] * patterns[None, :, :] + (1.0 - bits[:, None, :]) * (1.0 - patterns[None, :, :])
-    return factors.prod(dim=-1)
-
-
-def tree_leaf_probabilities(bits: Tensor, depth: int) -> Tensor:
-    if bits.ndim != 2 or bits.shape[1] != 2**depth - 1:
-        raise ValueError("tree bits do not match a complete binary tree")
-    mass = torch.ones((bits.shape[0], 1), device=bits.device, dtype=bits.dtype)
-    offset = 0
-    for level in range(depth):
-        width = 2**level
-        level_bits = bits[:, offset : offset + width]
-        mass = torch.stack((mass * (1.0 - level_bits), mass * level_bits), dim=-1).reshape(bits.shape[0], -1)
-        offset += width
-    return mass
-
-
-class PairPageRegressor(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        depth: int,
-        address: Address,
-        action: Action,
-        *,
-        anchor_seed: int,
-        row_seed: int,
-        tau: float = 1.0,
-    ) -> None:
-        super().__init__()
-        if address not in {"flat", "tree"} or action not in {"constant", "live"}:
-            raise ValueError("unknown factorial arm")
-        self.dim = dim
-        self.depth = depth
-        self.address = address
-        self.action = action
-        self.tau = tau
-        anchor_count = depth if address == "flat" else 2**depth - 1
-        self.register_buffer("anchors", sample_pair_anchors(anchor_count, dim, anchor_seed))
-        self.thresholds = nn.Parameter(torch.zeros(anchor_count))
-        generator = torch.Generator(device="cpu").manual_seed(row_seed)
-        initial_rows = torch.randn(2**depth, dim, generator=generator) * 0.01
-        self.rows = nn.Parameter(initial_rows)
-        if action == "live":
-            self.slopes = nn.Parameter(torch.zeros(2**depth, dim))
-        else:
-            self.register_parameter("slopes", None)
-
-    def _margins(self, x: Tensor) -> Tensor:
-        anchors = self.anchors
-        return x[:, anchors[:, 0]] - x[:, anchors[:, 1]] - self.thresholds
-
-    def leaf_probabilities(self, x: Tensor) -> Tensor:
-        bits = straight_through_bit(self._margins(x), self.tau)
-        if self.address == "flat":
-            return flat_leaf_probabilities(bits)
-        return tree_leaf_probabilities(bits, self.depth)
-
-    @torch.no_grad()
-    def hard_codes(self, x: Tensor) -> Tensor:
-        hard = self._margins(x) >= 0
-        if self.address == "flat":
-            code = torch.zeros(x.shape[0], dtype=torch.int64, device=x.device)
-            for column in range(self.depth):
-                code = 2 * code + hard[:, column].to(torch.int64)
-            return code
-        code = torch.zeros(x.shape[0], dtype=torch.int64, device=x.device)
-        for level in range(self.depth):
-            node = (2**level - 1) + code
-            branch = hard.gather(1, node[:, None]).squeeze(1).to(torch.int64)
-            code = 2 * code + branch
-        return code
-
-    def forward(self, x: Tensor) -> Tensor:
-        leaf = self.leaf_probabilities(x)
-        output = leaf @ self.rows
-        if self.slopes is not None:
-            output = output + (leaf @ self.slopes) * x
-        return output
+    support_count = depth if address == "flat" else 2**depth - 1
+    supports = sample_pair_anchors(support_count, dim, anchor_seed).unsqueeze(0)
+    threshold_count = depth if address == "flat" else 2**depth - 1
+    thresholds = torch.zeros(1, threshold_count)
+    generator = torch.Generator(device="cpu").manual_seed(row_seed)
+    rows = torch.randn(1, 2**depth, dim, generator=generator) * 0.01
+    slopes = torch.zeros_like(rows) if action == "live" else None
+    return HardLookupRouter(
+        dim,
+        dim,
+        depth=depth,
+        predicate="pair",
+        topology="flat" if address == "flat" else "adaptive",
+        support_layout="level" if address == "flat" else "node",
+        supports=supports,
+        thresholds=thresholds,
+        rows=rows,
+        surrogate="soft_product",
+        action="constant" if action == "constant" else "diagonal_live",
+        slopes=slopes,
+        tau=tau,
+    )
 
 
 def _metrics(prediction: Tensor, target: Tensor) -> tuple[float, float, float, float]:
@@ -165,12 +107,12 @@ def _route_health(codes: Tensor, rows: int) -> tuple[int, float, float]:
     return int(positive.sum()), entropy, float(probabilities.max())
 
 
-def _build_models(dim: int, depth: int, seed: int, tau: float, device: torch.device) -> dict[str, PairPageRegressor]:
-    models: dict[str, PairPageRegressor] = {}
+def _build_models(dim: int, depth: int, seed: int, tau: float, device: torch.device) -> dict[str, HardLookupRouter]:
+    models: dict[str, HardLookupRouter] = {}
     for address, anchor_seed, row_seed in (("flat", seed + 1_000, seed + 3_000), ("tree", seed + 2_000, seed + 4_000)):
         for action in ("constant", "live"):
             arm = f"{address}_{action}"
-            models[arm] = PairPageRegressor(
+            models[arm] = _make_pair_page_regressor(
                 dim,
                 depth,
                 address,  # type: ignore[arg-type]
@@ -182,7 +124,7 @@ def _build_models(dim: int, depth: int, seed: int, tau: float, device: torch.dev
     for address in ("flat", "tree"):
         constant = models[f"{address}_constant"]
         live = models[f"{address}_live"]
-        if not torch.equal(constant.anchors, live.anchors) or not torch.equal(constant.rows, live.rows):
+        if not torch.equal(constant.supports, live.supports) or not torch.equal(constant.rows, live.rows):
             raise AssertionError("matched constant/live initialization failed")
         with torch.no_grad():
             probe = torch.randn(32, dim, device=device)
@@ -234,7 +176,7 @@ def fit_seed(
             model = models[arm].eval()
             prediction = model(x_held)
             mse, nmse, r2, cosine = _metrics(prediction, target_held)
-            codes = model.hard_codes(x_held)
+            codes = model.hard_codes(x_held).squeeze(-1)
             observed, entropy, maximum_mass = _route_health(codes, 2**depth)
             results.append(
                 ArmResult(
