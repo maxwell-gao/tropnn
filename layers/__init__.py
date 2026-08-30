@@ -1,3 +1,4 @@
+from .accumulation import IndependentGroupSums, SumPyramid
 from .base import LUTModuleBase
 from .chamber_lifting import ChamberLiftingStage, ChamberLiftingTower, permutation_rank4
 from .comparator_margin import ComparatorTwoSidedMargin
@@ -29,6 +30,7 @@ from .pair_kernel import (
     quantize_relation_coefficients,
 )
 from .pairwise import PAIRWISE_ANCHOR_POLICIES, AbsDiffLUT, PairwiseLUT, PairwiseRoute, PairwiseWalshLUT
+from .product_chart import ProductChartAction, ProductChartCoordinates, ProductChartField, ProductChartSurrogate
 from .quantized_comparison_affine import (
     QuantizedComparisonAffineLedger,
     QuantizedComparisonAffineMode,
@@ -58,6 +60,10 @@ __all__ = [
     "HardLookupSpec",
     "ProductGridLookupRouter",
     "ProductGridRoute",
+    "ProductChartAction",
+    "ProductChartCoordinates",
+    "ProductChartField",
+    "ProductChartSurrogate",
     "FrozenMaddness",
     "LocalCounterfactualMaddness",
     "CoxeterLUT",
@@ -71,6 +77,7 @@ __all__ = [
     "GlobalChamberKernel",
     "IntegerRootCache",
     "IntrinsicS4Kernel",
+    "IndependentGroupSums",
     "LUTModuleBase",
     "FactorialOrdinalResidualBlock",
     "FactorialOrdinalResidualKind",
@@ -93,6 +100,7 @@ __all__ = [
     "RootIncidenceKernel",
     "S4ObjectFeatures",
     "SameTableFullKernel",
+    "SumPyramid",
     "SoftPQMaddness",
     "TernaryMarginAction",
     "TernaryMarginActionMode",

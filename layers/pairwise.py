@@ -46,7 +46,7 @@ class PairwiseSpec:
             raise ValueError(f"unsupported backend {self.backend!r}")
         if self.cpu_lut_dtype not in {"f32", "f16"}:
             raise ValueError("cpu_lut_dtype must be 'f32' or 'f16'")
-        if self.anchor_policy not in PAIRWISE_ANCHOR_POLICIES:
+        if self.anchor_policy != "explicit" and self.anchor_policy not in PAIRWISE_ANCHOR_POLICIES:
             raise ValueError(f"unsupported anchor policy {self.anchor_policy!r}")
         if self.lut_dtype not in {
             "fp32", "bf16", "fp16", "int8", "fp8", "int4", "int2", "ternary_int2",
@@ -132,6 +132,7 @@ class PairwiseLUT(LUTModuleBase):
         cpu_lut_dtype: Literal["f32", "f16"] = "f16",
         anchor_policy: str = "random",
         anchor_seed: int | None = None,
+        anchors: Tensor | None = None,
         lut_dtype: LutDType = "bf16",
         table_dropout: float = 0.0,
         slope_bank_rank: int = 0,
@@ -141,6 +142,9 @@ class PairwiseLUT(LUTModuleBase):
         del slope_bank_atom_init_std, slope_bank_coeff_init_std
         if int(slope_bank_rank) != 0:
             raise ValueError("PairwiseLUT no longer supports slope_bank_rank; use the plain payload LUT path")
+        if anchors is not None and anchor_policy != "random":
+            raise ValueError("explicit anchors cannot be combined with a non-default anchor_policy")
+        effective_anchor_policy = "explicit" if anchors is not None else anchor_policy
         spec = PairwiseSpec(
             int(input_dim),
             int(output_dim),
@@ -150,7 +154,7 @@ class PairwiseLUT(LUTModuleBase):
             bool(use_min_margin_ste),
             surrogate,
             cpu_lut_dtype,
-            anchor_policy,
+            effective_anchor_policy,
             seed if anchor_seed is None else int(anchor_seed),
             lut_dtype,
             bool(use_output_scaling),
@@ -171,10 +175,12 @@ class PairwiseLUT(LUTModuleBase):
         )
         self._use_min_margin_ste = spec.use_min_margin_ste
         self._zig_cache = _ZigLutCache(spec.cpu_lut_dtype)
-        self.register_buffer(
-            "anchors",
-            _make_pairwise_anchors(spec.input_dim, spec.tables, spec.comparisons, policy=spec.anchor_policy, seed=spec.anchor_seed),
+        anchor_values = (
+            _validated_explicit_anchors(anchors, spec.input_dim, spec.tables, spec.comparisons)
+            if anchors is not None
+            else _make_pairwise_anchors(spec.input_dim, spec.tables, spec.comparisons, policy=spec.anchor_policy, seed=spec.anchor_seed)
         )
+        self.register_buffer("anchors", anchor_values)
         self.register_buffer("powers", 2 ** torch.arange(spec.comparisons, dtype=torch.long))
         thresholds = torch.zeros(spec.tables, spec.comparisons)
         self.register_buffer("thresholds", thresholds) if fixed_zero_threshold else setattr(self, "thresholds", nn.Parameter(thresholds))
@@ -829,6 +835,20 @@ def _make_pairwise_anchors(input_dim: int, tables: int, comparisons: int, *, pol
 
     b = torch.where(a == b, (b + 1).remainder(input_dim), b)
     return torch.stack((a, b), dim=-1).view(tables, comparisons, 2)
+
+
+def _validated_explicit_anchors(anchors: Tensor, input_dim: int, tables: int, comparisons: int) -> Tensor:
+    if anchors.dtype not in {torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}:
+        raise TypeError("explicit anchors must use an integer dtype")
+    expected = (tables, comparisons, 2)
+    if tuple(anchors.shape) != expected:
+        raise ValueError(f"explicit anchors must have shape {expected}, got {tuple(anchors.shape)}")
+    values = anchors.detach().to(device="cpu", dtype=torch.long).contiguous().clone()
+    if bool(((values < 0) | (values >= input_dim)).any()):
+        raise ValueError(f"explicit anchors must be in [0, {input_dim})")
+    if bool((values[..., 0] == values[..., 1]).any()):
+        raise ValueError("explicit anchor endpoints must be different")
+    return values
 
 
 def _apply_table_dropout(lut: Tensor, probability: float) -> Tensor:
