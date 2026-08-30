@@ -6,6 +6,7 @@ import pytest
 import torch
 from tropnn import AbsDiffLUT, ComparatorTwoSidedMargin, PairwiseLUT, PairwiseWalshLUT
 from tropnn.backends.comparator_margin_triton import has_comparator_margin_triton
+from tropnn.backends.pairwise_tilelang import _pairwise_min_backward_torch
 from tropnn.backends.pairwise_zig import (
     has_pairwise_zig,
     pairwise_zig_forward,
@@ -16,6 +17,41 @@ from tropnn.backends.pairwise_zig import (
 from tropnn.examples.emnist import EmnistPairwiseWalshClassifier
 from tropnn.layers.surrogate import surrogate_gradient
 from tropnn.tools.emnist_payload_width import ComparatorGeneratorLayer
+
+
+def test_short_output_pairwise_ste_fallback_matches_torch_autograd() -> None:
+    torch.manual_seed(19)
+    layer = PairwiseLUT(
+        17,
+        8,
+        tables=3,
+        comparisons=4,
+        backend="torch",
+        seed=7,
+        lut_init_std=0.02,
+        lut_dtype="fp32",
+        use_output_scaling=False,
+    )
+    x = torch.randn(11, 1, 17, requires_grad=True)
+    grad_output = torch.randn(11, 1, 8)
+    output = layer(x)
+    output.backward(grad_output)
+    route = layer.route(x.detach())
+    closest = route.margins.abs().argmin(dim=-1).to(torch.uint8)
+
+    grad_latent, grad_thresholds = _pairwise_min_backward_torch(
+        grad_output.reshape(11, 8),
+        route.indices.reshape(11, 3),
+        route.margins.reshape(11, 3, 4),
+        closest.reshape(11, 3),
+        layer.anchors,
+        layer.lut.detach(),
+        in_features=17,
+        use_izhikevich_surrogate=False,
+    )
+
+    assert torch.allclose(grad_latent.reshape_as(x), x.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(grad_thresholds, layer.thresholds.grad, atol=1e-6, rtol=1e-6)
 
 
 def test_fast_sigmoid_odd_surrogate_has_lut_direction() -> None:

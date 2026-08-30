@@ -2317,6 +2317,53 @@ def _run_forward(
     return output.view(batch, steps, out_features), indices.view(batch, steps, tables), margins.view(batch, steps, tables, comparisons), rmins.view(batch, steps, tables), payload
 
 
+def _pairwise_min_backward_torch(
+    grad_output: Tensor,
+    indices: Tensor,
+    margins: Tensor,
+    rmins: Tensor,
+    anchors: Tensor,
+    lut: Tensor,
+    *,
+    in_features: int,
+    use_izhikevich_surrogate: bool,
+) -> tuple[Tensor, Tensor]:
+    """Exact vectorized fallback for short-output local-counterfactual STE.
+
+    TileLang's shared dot-product reduction is unsafe when only eight lanes of
+    a warp are live.  Routing, hard lookup, and payload gradients remain on the
+    fused backend; only the D<=8 input/threshold STE reduction uses this path.
+    """
+
+    item_count, tables = indices.shape
+    comparisons = margins.shape[-1]
+    table_ids = torch.arange(tables, device=indices.device).view(1, tables).expand(item_count, tables)
+    closest = rmins.to(torch.int64)
+    current = indices.to(torch.int64)
+    neighbor = torch.bitwise_xor(current, torch.bitwise_left_shift(torch.ones_like(closest), closest))
+    current_rows = lut[table_ids, current].to(torch.float32)
+    neighbor_rows = lut[table_ids, neighbor].to(torch.float32)
+    dot = ((neighbor_rows - current_rows) * grad_output[:, None, :].to(torch.float32)).sum(dim=-1)
+    selected_margin = margins.gather(-1, closest.unsqueeze(-1)).squeeze(-1)
+    if use_izhikevich_surrogate:
+        sigmoid = torch.sigmoid(selected_margin.abs().clamp(max=10.0))
+        sign = torch.where(selected_margin > 0, -torch.ones_like(selected_margin), torch.ones_like(selected_margin))
+        surrogate = sign * 2.0 * sigmoid * (1.0 - sigmoid)
+    else:
+        surrogate = -0.5 * torch.sign(selected_margin) / (1.0 + selected_margin.abs()).square()
+    grad_margin = dot * surrogate
+
+    selected_anchors = anchors[table_ids, closest]
+    grad_latent = torch.zeros((item_count, in_features), device=grad_output.device, dtype=torch.float32)
+    grad_latent.scatter_add_(1, selected_anchors[..., 0], grad_margin)
+    grad_latent.scatter_add_(1, selected_anchors[..., 1], -grad_margin)
+
+    threshold_offsets = table_ids * comparisons + closest
+    grad_thresholds = torch.zeros(tables * comparisons, device=grad_output.device, dtype=torch.float32)
+    grad_thresholds.scatter_add_(0, threshold_offsets.reshape(-1), -grad_margin.reshape(-1))
+    return grad_latent, grad_thresholds.view(tables, comparisons)
+
+
 class _PairwiseTileLangFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -2408,7 +2455,18 @@ class _PairwiseTileLangFunction(torch.autograd.Function):
 
         if ctx.lut_dtype in {"fp32", "bf16", "fp16", "binary01_bf16"}:
             payload_dtype_name = _float_payload_dtype_name(ctx.lut_dtype)
-            if ctx.use_min_margin_ste:
+            if ctx.use_min_margin_ste and out_features <= 8:
+                grad_latent, grad_thresholds = _pairwise_min_backward_torch(
+                    grad_flat,
+                    indices_kernel,
+                    margins_flat,
+                    rmins_flat,
+                    anchors_contig,
+                    payload_data,
+                    in_features=in_features,
+                    use_izhikevich_surrogate=ctx.use_izhikevich_surrogate,
+                )
+            elif ctx.use_min_margin_ste:
                 ste_kernel = _pairwise_min_backward_kernel(
                     item_count,
                     in_features,
@@ -2436,7 +2494,9 @@ class _PairwiseTileLangFunction(torch.autograd.Function):
                     ctx.use_izhikevich_surrogate,
                     ctx.target,
                 )
-            if ctx.use_min_margin_ste:
+            if ctx.use_min_margin_ste and out_features <= 8:
+                pass
+            elif ctx.use_min_margin_ste:
                 ste_kernel(grad_flat, indices_kernel, margins_flat, rmins_flat, anchors_contig, payload_data, grad_latent, grad_thresholds)
             else:
                 ste_kernel(grad_flat, indices_kernel, margins_flat, anchors_contig, payload_data, grad_latent, grad_thresholds)
@@ -2544,7 +2604,7 @@ class _PairwiseTileLangFunction(torch.autograd.Function):
                     ctx.use_izhikevich_surrogate,
                     ctx.target,
                 )
-                ste_kernel(grad_flat, indices_kernel, margins_flat, anchors_contig, payload_data, payload_scales, payload_codebook, grad_latent, grad_thresholds)
+                ste_kernel(grad_flat, indices_kernel, margins_flat, rmins_flat, anchors_contig, payload_data, payload_scales, payload_codebook, grad_latent, grad_thresholds)
 
         return grad_latent.view(batch, steps, in_features).to(ctx.latent_input_dtype), None, grad_thresholds, grad_lut.to(dtype=ctx.lut_input_dtype), None, None, None, None, None, None
 
