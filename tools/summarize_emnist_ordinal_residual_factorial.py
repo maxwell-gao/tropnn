@@ -32,18 +32,18 @@ def summarize(root: Path) -> dict[str, object]:
     lc = metric("live_canonical", "final_held_ce")
     lr = metric("live_relabel", "final_held_ce")
     live_gain = [a - b for a, b in zip(cc, lc)]
-    live_geometry_gain = [a - b for a, b in zip(lr, lc)]
-    constant_geometry_gain = [a - b for a, b in zip(cr, cc)]
-    interaction = [live - constant for live, constant in zip(live_geometry_gain, constant_geometry_gain)]
+    live_alignment_gain = [a - b for a, b in zip(lr, lc)]
+    constant_alignment_gain = [a - b for a, b in zip(cr, cc)]
+    interaction = [live - constant for live, constant in zip(live_alignment_gain, constant_alignment_gain)]
     effective = metric("live_canonical", "held_effective_chambers_mean")
     gate = {
         "live_beats_constant_all_seeds": all(value > 0 for value in live_gain),
         "live_minus_constant_mean_ce_gain": mean(live_gain),
         "live_minus_constant_mean_ce_gain_at_least_0p02": mean(live_gain) >= 0.02,
-        "live_canonical_beats_live_relabel_all_seeds": all(value > 0 for value in live_geometry_gain),
-        "live_canonical_vs_relabel_mean_ce_gain": mean(live_geometry_gain),
-        "live_canonical_vs_relabel_mean_ce_gain_at_least_0p01": mean(live_geometry_gain) >= 0.01,
-        "constant_canonical_vs_relabel_mean_ce_gain": mean(constant_geometry_gain),
+        "live_canonical_beats_live_relabel_all_seeds": all(value > 0 for value in live_alignment_gain),
+        "live_canonical_vs_relabel_mean_ce_gain": mean(live_alignment_gain),
+        "live_canonical_vs_relabel_mean_ce_gain_at_least_0p01": mean(live_alignment_gain) >= 0.01,
+        "constant_canonical_vs_relabel_mean_ce_gain": mean(constant_alignment_gain),
         "factorial_interaction_mean": mean(interaction),
         "factorial_interaction_positive": mean(interaction) > 0,
         "effective_chambers_at_least_8_all_seeds": all(value >= 8 for value in effective),
