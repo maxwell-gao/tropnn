@@ -3,6 +3,17 @@ from .base import LUTModuleBase
 from .chamber_lifting import ChamberLiftingStage, ChamberLiftingTower, permutation_rank4
 from .comparator_margin import ComparatorTwoSidedMargin
 from .coxeter import CoxeterLUT, CoxeterRoute, K4FullLUT
+from .fwht_code_merge import (
+    CodeMergeRoute,
+    DirectCodeMergeLUT,
+    DirectPairCodeEncoder,
+    FWHTCodeMergeLUT,
+    FWHTFlatPairLUT,
+    FWHTPairCodeEncoder,
+    PairCodeMergeLUT,
+    PairCodeRoute,
+    make_disjoint_pair_supports,
+)
 from .hard_lookup import HardLookupRoute, HardLookupRouter, HardLookupSpec, ProductGridLookupRouter, ProductGridRoute
 from .hash_selected_sparse_hinge import HashSelectedSparseHinge
 from .hash_shared_sparse_hinge import HashSharedSelectionMode, HashSharedSparseHinge
@@ -52,6 +63,12 @@ __all__ = [
     "ChamberLiftingTower",
     "ComparatorTwoSidedMargin",
     "CompiledMaddness",
+    "CodeMergeRoute",
+    "DirectCodeMergeLUT",
+    "DirectPairCodeEncoder",
+    "FWHTCodeMergeLUT",
+    "FWHTFlatPairLUT",
+    "FWHTPairCodeEncoder",
     "HashSelectedSparseHinge",
     "HashSharedSelectionMode",
     "HashSharedSparseHinge",
@@ -85,6 +102,8 @@ __all__ = [
     "OrdinalResidualKind",
     "PAIRWISE_ANCHOR_POLICIES",
     "PairwiseLinear",
+    "PairCodeRoute",
+    "PairCodeMergeLUT",
     "PairwiseLUT",
     "PairwiseRoute",
     "PairwiseWalshLinear",
@@ -112,4 +131,5 @@ __all__ = [
     "s4_diffusion_features",
     "s4_gauge_maps",
     "s4_tables",
+    "make_disjoint_pair_supports",
 ]
